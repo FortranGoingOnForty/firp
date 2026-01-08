@@ -754,6 +754,105 @@ impl VM {
                     }
                 }
 
+                OpCode::MethodCall => {
+                    // Type-bound procedure call with virtual dispatch
+                    // Stack: [args..., object, arg_count]
+                    // Operand: index of binding name in constants
+
+                    let name_idx = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "MethodCall requires binding name index".to_string(),
+                        location,
+                    })?;
+
+                    // Get the binding name from constants
+                    let binding_name = {
+                        let chunk = self.chunk.as_ref().unwrap();
+                        match chunk.constants.get(name_idx) {
+                            Some(Value::Character(s)) => s.clone(),
+                            _ => return Err(RuntimeError::InvalidInstruction {
+                                message: "MethodCall binding name not found".to_string(),
+                                location,
+                            }),
+                        }
+                    };
+
+                    // Pop arg count from stack
+                    let arg_count = match self.pop(location)? {
+                        Value::Integer(n) => n as usize,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Expected integer arg count for MethodCall".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // The object is the first argument (at bottom of args on stack)
+                    // Peek at it to get the type info without removing it
+                    let stack_len = self.stack.len();
+                    if stack_len < arg_count {
+                        return Err(RuntimeError::StackUnderflow { location });
+                    }
+                    let object_idx = stack_len - arg_count;
+
+                    // The object might be a Reference (for pass-by-reference) - dereference it
+                    let type_index = match &self.stack[object_idx] {
+                        Value::Instance { type_index, .. } => *type_index,
+                        Value::Reference(var_idx) => {
+                            // Dereference to get the actual instance
+                            let actual_value = self.variables.get(*var_idx)
+                                .and_then(|v| v.as_ref())
+                                .ok_or(RuntimeError::InvalidVariable {
+                                    index: *var_idx,
+                                    location,
+                                })?;
+                            match actual_value {
+                                Value::Instance { type_index, .. } => *type_index,
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: format!("MethodCall requires an instance, got {:?}", actual_value),
+                                    location,
+                                }),
+                            }
+                        }
+                        _ => return Err(RuntimeError::TypeError {
+                            message: format!("MethodCall requires an instance, got {:?}", self.stack[object_idx]),
+                            location,
+                        }),
+                    };
+
+                    // Resolve the actual procedure name and address
+                    let proc_address = {
+                        let chunk = self.chunk.as_ref().unwrap();
+                        // Resolve the actual procedure name from the type's procedures map
+                        let proc_name = chunk.resolve_procedure(type_index, &binding_name)
+                            .ok_or_else(|| RuntimeError::InvalidInstruction {
+                                message: format!("No method '{}' found on type", binding_name),
+                                location,
+                            })?;
+
+                        // Get the procedure address
+                        chunk.get_procedure_address(&proc_name)
+                            .ok_or_else(|| RuntimeError::InvalidProcedure {
+                                index: 0,
+                                location,
+                            })?
+                    };
+
+                    // Check call stack depth
+                    if self.call_stack.len() >= MAX_CALL_DEPTH {
+                        return Err(RuntimeError::CallStackOverflow { location });
+                    }
+
+                    // Create call frame with return address
+                    let frame = CallFrame {
+                        return_address: self.ip + 1,
+                        locals_base: self.variables.len(),
+                        arg_count: 0,
+                    };
+                    self.call_stack.push(frame);
+
+                    // Jump to procedure
+                    self.ip = proc_address;
+                }
+
                 OpCode::AllocArray => {
                     // Stack contains: num_dims, lower1, upper1, lower2, upper2, ...
                     let var_index = operand.ok_or(RuntimeError::InvalidInstruction {

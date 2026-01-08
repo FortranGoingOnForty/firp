@@ -1083,6 +1083,16 @@ impl SemanticAnalyzer {
                 Ok(())
             }
 
+            Statement::MethodCall { object, arguments, .. } => {
+                // Type-bound procedure call
+                // Check the object and all arguments
+                self.check_expression(object)?;
+                for arg in arguments {
+                    self.check_expression(&arg.value)?;
+                }
+                Ok(())
+            }
+
             Statement::Return { value, .. } => {
                 // TODO: Full implementation in Sprint 08
                 if let Some(val) = value {

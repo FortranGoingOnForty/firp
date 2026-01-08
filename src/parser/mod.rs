@@ -1889,7 +1889,25 @@ impl Parser {
 
         let name = self.expect_identifier()?;
 
-        // Parse optional argument list
+        // Check if this is a method call (obj%method)
+        if self.check(&TokenType::Percent) {
+            self.advance();
+            let method_name = self.expect_identifier()?;
+
+            // Parse argument list (must have parentheses for method calls)
+            self.expect(&TokenType::LeftParen, "(")?;
+            let arguments = self.parse_argument_list()?;
+            self.expect(&TokenType::RightParen, ")")?;
+
+            return Ok(Statement::MethodCall {
+                object: Expr::Identifier(name, location),
+                method_name,
+                arguments,
+                location,
+            });
+        }
+
+        // Parse optional argument list for regular calls
         let arguments = if self.check(&TokenType::LeftParen) {
             self.advance();
             let args = self.parse_argument_list()?;

@@ -110,6 +110,9 @@ pub enum OpCode {
     Call,
     /// Return from a subroutine/function
     Return,
+    /// Call a type-bound procedure (operand = binding name index in constants)
+    /// Expects: args on stack with object as first arg, then arg_count as second operand
+    MethodCall,
 
     // Array operations
     /// Allocate array storage (operand = variable index, expects dims on stack)
@@ -636,6 +639,7 @@ impl fmt::Display for OpCode {
             OpCode::Nop => write!(f, "Nop"),
             OpCode::Call => write!(f, "Call"),
             OpCode::Return => write!(f, "Return"),
+            OpCode::MethodCall => write!(f, "MethodCall"),
             OpCode::AllocArray => write!(f, "AllocArray"),
             OpCode::LoadArrayElem => write!(f, "LoadArrayElem"),
             OpCode::StoreArrayElem => write!(f, "StoreArrayElem"),
@@ -671,10 +675,14 @@ impl ArrayDim {
 pub struct RuntimeTypeDef {
     /// Type name
     pub name: String,
-    /// Component names in order
+    /// Component names in order (includes inherited components at the front)
     pub components: Vec<String>,
     /// Default values for each component (None if no default)
     pub defaults: Vec<Option<Value>>,
+    /// Index of parent type (for EXTENDS inheritance)
+    pub parent_type: Option<usize>,
+    /// Type-bound procedures: binding_name -> procedure_name
+    pub procedures: HashMap<String, String>,
 }
 
 impl RuntimeTypeDef {
@@ -683,6 +691,19 @@ impl RuntimeTypeDef {
             name,
             components: Vec::new(),
             defaults: Vec::new(),
+            parent_type: None,
+            procedures: HashMap::new(),
+        }
+    }
+
+    /// Create a new type that extends a parent type
+    pub fn with_parent(name: String, parent_idx: usize) -> Self {
+        Self {
+            name,
+            components: Vec::new(),
+            defaults: Vec::new(),
+            parent_type: Some(parent_idx),
+            procedures: HashMap::new(),
         }
     }
 
@@ -691,8 +712,18 @@ impl RuntimeTypeDef {
         self.defaults.push(default);
     }
 
+    /// Add a type-bound procedure binding
+    pub fn add_procedure(&mut self, binding_name: String, procedure_name: String) {
+        self.procedures.insert(binding_name, procedure_name);
+    }
+
     pub fn component_index(&self, name: &str) -> Option<usize> {
         self.components.iter().position(|c| c == name)
+    }
+
+    /// Get the procedure name for a binding (checks this type only)
+    pub fn get_procedure(&self, binding_name: &str) -> Option<&String> {
+        self.procedures.get(binding_name)
     }
 }
 
@@ -1052,6 +1083,64 @@ impl Chunk {
         self.types.get(index)
     }
 
+    /// Resolve a component index through the inheritance chain
+    /// Returns the component index within the type's components vector
+    pub fn resolve_component_index(&self, type_index: usize, component_name: &str) -> Option<usize> {
+        let type_def = self.types.get(type_index)?;
+
+        // Check this type's components first (includes inherited ones)
+        if let Some(idx) = type_def.component_index(component_name) {
+            return Some(idx);
+        }
+
+        None
+    }
+
+    /// Resolve a procedure through the inheritance chain
+    /// Returns the procedure name for a given binding name
+    pub fn resolve_procedure(&self, type_index: usize, binding_name: &str) -> Option<String> {
+        let mut current_type = type_index;
+
+        loop {
+            let type_def = self.types.get(current_type)?;
+
+            // Check this type's procedures
+            if let Some(proc_name) = type_def.get_procedure(binding_name) {
+                return Some(proc_name.clone());
+            }
+
+            // Check parent type
+            if let Some(parent_idx) = type_def.parent_type {
+                current_type = parent_idx;
+            } else {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Check if a type is a descendant of another type (for polymorphism)
+    pub fn is_subtype_of(&self, type_index: usize, potential_parent: usize) -> bool {
+        if type_index == potential_parent {
+            return true;
+        }
+
+        let mut current = type_index;
+        while let Some(type_def) = self.types.get(current) {
+            if let Some(parent_idx) = type_def.parent_type {
+                if parent_idx == potential_parent {
+                    return true;
+                }
+                current = parent_idx;
+            } else {
+                break;
+            }
+        }
+
+        false
+    }
+
     /// Register an operator interface (for operator overloading)
     pub fn register_operator_interface(&mut self, op: OverloadableOperator, proc_name: String) {
         let op_key = format!("{:?}", op);
@@ -1389,10 +1478,37 @@ impl Compiler {
                     // No symbol export needed
                 }
                 Declaration::DerivedType(type_def) => {
-                    // Register derived type definition
-                    let mut runtime_type = RuntimeTypeDef::new(type_def.name.clone());
+                    // Register derived type definition, handling EXTENDS inheritance
+                    let mut runtime_type = if let Some(parent_name) = &type_def.extends {
+                        if let Some(parent_idx) = self.chunk.get_type_index(parent_name) {
+                            let mut rt = RuntimeTypeDef::with_parent(type_def.name.clone(), parent_idx);
+                            // Copy parent's components and procedures
+                            if let Some(parent_def) = self.chunk.get_type(parent_idx) {
+                                for (comp, default) in parent_def.components.iter()
+                                    .zip(parent_def.defaults.iter())
+                                {
+                                    rt.add_component(comp.clone(), default.clone());
+                                }
+                                for (binding, proc) in &parent_def.procedures {
+                                    rt.add_procedure(binding.clone(), proc.clone());
+                                }
+                            }
+                            rt
+                        } else {
+                            // Parent type not found - create without inheritance
+                            RuntimeTypeDef::new(type_def.name.clone())
+                        }
+                    } else {
+                        RuntimeTypeDef::new(type_def.name.clone())
+                    };
+
                     for component in &type_def.components {
                         runtime_type.add_component(component.name.clone(), None);
+                    }
+                    for proc in &type_def.procedures {
+                        let actual_name = proc.procedure_name.clone()
+                            .unwrap_or_else(|| proc.binding_name.clone());
+                        runtime_type.add_procedure(proc.binding_name.clone(), actual_name);
                     }
                     self.chunk.add_type(runtime_type);
                 }
@@ -1781,12 +1897,45 @@ impl Compiler {
                 Ok(())
             }
             Declaration::DerivedType(type_def) => {
-                // Register the derived type definition
-                let mut runtime_type = RuntimeTypeDef::new(type_def.name.clone());
+                // Register the derived type definition, handling EXTENDS inheritance
+                let mut runtime_type = if let Some(parent_name) = &type_def.extends {
+                    // Look up parent type index
+                    if let Some(parent_idx) = self.chunk.get_type_index(parent_name) {
+                        let mut rt = RuntimeTypeDef::with_parent(type_def.name.clone(), parent_idx);
 
+                        // Copy parent's components first (inherited components come first)
+                        if let Some(parent_def) = self.chunk.get_type(parent_idx) {
+                            for (comp, default) in parent_def.components.iter()
+                                .zip(parent_def.defaults.iter())
+                            {
+                                rt.add_component(comp.clone(), default.clone());
+                            }
+                            // Copy parent's procedures (can be overridden)
+                            for (binding, proc) in &parent_def.procedures {
+                                rt.add_procedure(binding.clone(), proc.clone());
+                            }
+                        }
+                        rt
+                    } else {
+                        return Err(CompileError::InvalidOperation {
+                            message: format!("Unknown parent type: {}", parent_name),
+                            location: type_def.location,
+                        });
+                    }
+                } else {
+                    RuntimeTypeDef::new(type_def.name.clone())
+                };
+
+                // Add this type's own components
                 for component in &type_def.components {
-                    // Add component with its name (defaults are not supported yet)
                     runtime_type.add_component(component.name.clone(), None);
+                }
+
+                // Register type-bound procedures (may override parent's)
+                for proc in &type_def.procedures {
+                    let actual_name = proc.procedure_name.clone()
+                        .unwrap_or_else(|| proc.binding_name.clone());
+                    runtime_type.add_procedure(proc.binding_name.clone(), actual_name);
                 }
 
                 self.chunk.add_type(runtime_type);
@@ -2009,6 +2158,29 @@ impl Compiler {
 
                 // Emit call instruction with procedure address
                 self.chunk.emit_with_operand(OpCode::Call, proc_address, *location);
+                Ok(())
+            }
+
+            Statement::MethodCall { object, method_name, arguments, location } => {
+                // Type-bound procedure call: CALL obj%method(args)
+                // The object is passed as the first argument (PASS attribute)
+
+                // First, compile the object (this will be the "self" argument)
+                self.compile_call_argument(object)?;
+
+                // Then compile all explicit arguments
+                for arg in arguments {
+                    self.compile_call_argument(&arg.value)?;
+                }
+
+                // Push arg count (including the object) onto the stack
+                let arg_count = arguments.len() + 1; // +1 for the object itself
+                let count_idx = self.chunk.add_constant(Value::Integer(arg_count as i64));
+                self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                // Store the binding name as a constant and emit MethodCall
+                let name_idx = self.chunk.add_constant(Value::Character(method_name.clone()));
+                self.chunk.emit_with_operand(OpCode::MethodCall, name_idx, *location);
                 Ok(())
             }
 
@@ -3107,19 +3279,15 @@ impl Compiler {
                     self.compile_expression(&arg.value)?;
                 }
 
-                // Look up the procedure associated with this method
-                // For now, we look for the procedure by the method name directly
-                // TODO: Look up from type-bound procedure registry
-                if let Some(func_address) = self.chunk.get_procedure_address(method_name) {
-                    self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
-                    Ok(())
-                } else {
-                    // Try with the method name as is
-                    Err(CompileError::InvalidOperation {
-                        message: format!("Unknown method: {}", method_name),
-                        location: *location,
-                    })
-                }
+                // Push arg count (including the object) onto the stack
+                let arg_count = arguments.len() + 1; // +1 for the object itself
+                let count_idx = self.chunk.add_constant(Value::Integer(arg_count as i64));
+                self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                // Store the binding name as a constant and emit MethodCall
+                let name_idx = self.chunk.add_constant(Value::Character(method_name.clone()));
+                self.chunk.emit_with_operand(OpCode::MethodCall, name_idx, *location);
+                Ok(())
             }
 
             Expr::ArraySection { name, subscripts, location } => {

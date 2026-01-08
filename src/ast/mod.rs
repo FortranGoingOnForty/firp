@@ -465,6 +465,13 @@ pub enum Statement {
         arguments: Vec<Argument>,
         location: SourceLocation,
     },
+    /// Method call statement: CALL obj%method(args)
+    MethodCall {
+        object: Expr,
+        method_name: String,
+        arguments: Vec<Argument>,
+        location: SourceLocation,
+    },
     /// RETURN statement
     Return {
         value: Option<Expr>,
