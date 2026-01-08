@@ -375,6 +375,10 @@ pub enum CompileError {
         message: String,
         location: SourceLocation,
     },
+    InvalidOperation {
+        message: String,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for CompileError {
@@ -386,6 +390,9 @@ impl fmt::Display for CompileError {
             CompileError::InternalError { message, location } => {
                 write!(f, "Internal compiler error at {}: {}", location, message)
             }
+            CompileError::InvalidOperation { message, location } => {
+                write!(f, "Invalid operation at {}: {}", location, message)
+            }
         }
     }
 }
@@ -394,15 +401,33 @@ impl std::error::Error for CompileError {}
 
 pub type CompileResult<T> = Result<T, CompileError>;
 
+/// Information about an active loop during compilation
+#[derive(Debug, Clone)]
+struct LoopContext {
+    /// Instruction offset where the loop condition/start is
+    #[allow(dead_code)]
+    loop_start: usize,
+    /// List of EXIT jump instruction offsets that need to be patched to loop end
+    exit_jumps: Vec<usize>,
+    /// List of CYCLE jump instruction offsets that need to be patched to continue point
+    cycle_jumps: Vec<usize>,
+    /// Optional loop name for named EXIT/CYCLE (reserved for future use)
+    #[allow(dead_code)]
+    name: Option<String>,
+}
+
 /// Bytecode compiler that transforms AST to bytecode
 pub struct Compiler {
     chunk: Chunk,
+    /// Stack of active loops for EXIT/CYCLE handling
+    loop_stack: Vec<LoopContext>,
 }
 
 impl Compiler {
     pub fn new() -> Self {
         Self {
             chunk: Chunk::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -533,16 +558,33 @@ impl Compiler {
             }
 
             Statement::Exit { location } => {
-                // Exit is compiled as an unconditional jump
-                // The target will be patched by the enclosing loop
-                self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
-                Ok(())
+                // Exit jumps to end of innermost loop
+                if let Some(loop_ctx) = self.loop_stack.last_mut() {
+                    // Emit jump with placeholder, record for patching
+                    let jump_idx = self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
+                    loop_ctx.exit_jumps.push(jump_idx);
+                    Ok(())
+                } else {
+                    Err(CompileError::InvalidOperation {
+                        message: "EXIT statement outside of loop".to_string(),
+                        location: *location,
+                    })
+                }
             }
 
             Statement::Cycle { location } => {
-                // Cycle is compiled as an unconditional jump back to loop start
-                self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
-                Ok(())
+                // Cycle jumps to loop continuation (increment/condition check)
+                if let Some(loop_ctx) = self.loop_stack.last_mut() {
+                    // Emit jump with placeholder, record for patching
+                    let jump_idx = self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
+                    loop_ctx.cycle_jumps.push(jump_idx);
+                    Ok(())
+                } else {
+                    Err(CompileError::InvalidOperation {
+                        message: "CYCLE statement outside of loop".to_string(),
+                        location: *location,
+                    })
+                }
             }
 
             Statement::Continue { location } => {
@@ -627,21 +669,47 @@ impl Compiler {
         self.compile_expression(start)?;
         self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
 
-        // Loop start
+        // Loop start (condition check)
         let loop_start = self.chunk.current_offset();
 
-        // Check condition: variable <= end
+        // Determine if step is negative (compile-time check for literal steps)
+        // For runtime-determined steps, we'd need more complex logic
+        // For now, we check at compile time if step is a negative literal
+        let is_negative_step = match step {
+            Some(Expr::IntegerLiteral(n, _)) => *n < 0,
+            Some(Expr::UnaryOp { op: UnaryOperator::Minus, operand, .. }) => {
+                matches!(operand.as_ref(), Expr::IntegerLiteral(_, _))
+            }
+            _ => false,
+        };
+
+        // Check condition: variable <= end (or >= for negative step)
         self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
         self.compile_expression(end)?;
-        self.chunk.emit(OpCode::LessEqual, location);
+        if is_negative_step {
+            self.chunk.emit(OpCode::GreaterEqual, location);
+        } else {
+            self.chunk.emit(OpCode::LessEqual, location);
+        }
 
         // Jump out if condition is false
         let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Push loop context
+        self.loop_stack.push(LoopContext {
+            loop_start,
+            exit_jumps: Vec::new(),
+            cycle_jumps: Vec::new(),
+            name: None,
+        });
 
         // Compile body
         for stmt in body {
             self.compile_statement(stmt)?;
         }
+
+        // Continue target is the increment section (where CYCLE should go)
+        let continue_target = self.chunk.current_offset();
 
         // Increment loop variable
         self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
@@ -658,8 +726,21 @@ impl Compiler {
         // Jump back to loop start
         self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
 
-        // Patch exit jump
-        self.chunk.patch_jump(exit_jump, self.chunk.current_offset());
+        // Loop end - patch condition exit jump
+        let loop_end = self.chunk.current_offset();
+        self.chunk.patch_jump(exit_jump, loop_end);
+
+        // Pop loop context and patch EXIT/CYCLE jumps
+        if let Some(loop_ctx) = self.loop_stack.pop() {
+            // Patch EXIT jumps to loop end
+            for exit_jump_idx in loop_ctx.exit_jumps {
+                self.chunk.patch_jump(exit_jump_idx, loop_end);
+            }
+            // Patch CYCLE jumps to continue target (increment section)
+            for cycle_jump_idx in loop_ctx.cycle_jumps {
+                self.chunk.patch_jump(cycle_jump_idx, continue_target);
+            }
+        }
 
         Ok(())
     }
@@ -677,6 +758,14 @@ impl Compiler {
         self.compile_expression(condition)?;
         let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
 
+        // Push loop context
+        self.loop_stack.push(LoopContext {
+            loop_start,
+            exit_jumps: Vec::new(),
+            cycle_jumps: Vec::new(),
+            name: None,
+        });
+
         // Compile body
         for stmt in body {
             self.compile_statement(stmt)?;
@@ -685,8 +774,21 @@ impl Compiler {
         // Jump back to loop start
         self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
 
-        // Patch exit jump
-        self.chunk.patch_jump(exit_jump, self.chunk.current_offset());
+        // Loop end
+        let loop_end = self.chunk.current_offset();
+        self.chunk.patch_jump(exit_jump, loop_end);
+
+        // Pop loop context and patch EXIT/CYCLE jumps
+        if let Some(loop_ctx) = self.loop_stack.pop() {
+            // Patch EXIT jumps to loop end
+            for exit_jump_idx in loop_ctx.exit_jumps {
+                self.chunk.patch_jump(exit_jump_idx, loop_end);
+            }
+            // For DO WHILE, CYCLE jumps back to condition check (loop_start)
+            for cycle_jump_idx in loop_ctx.cycle_jumps {
+                self.chunk.patch_jump(cycle_jump_idx, loop_start);
+            }
+        }
 
         Ok(())
     }
@@ -699,6 +801,14 @@ impl Compiler {
     ) -> CompileResult<()> {
         let loop_start = self.chunk.current_offset();
 
+        // Push loop context
+        self.loop_stack.push(LoopContext {
+            loop_start,
+            exit_jumps: Vec::new(),
+            cycle_jumps: Vec::new(),
+            name: None,
+        });
+
         // Compile body
         for stmt in body {
             self.compile_statement(stmt)?;
@@ -706,6 +816,21 @@ impl Compiler {
 
         // Jump back to loop start
         self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
+
+        // Loop end
+        let loop_end = self.chunk.current_offset();
+
+        // Pop loop context and patch EXIT/CYCLE jumps
+        if let Some(loop_ctx) = self.loop_stack.pop() {
+            // Patch EXIT jumps to loop end
+            for exit_jump_idx in loop_ctx.exit_jumps {
+                self.chunk.patch_jump(exit_jump_idx, loop_end);
+            }
+            // For infinite loops, CYCLE jumps back to loop start
+            for cycle_jump_idx in loop_ctx.cycle_jumps {
+                self.chunk.patch_jump(cycle_jump_idx, loop_start);
+            }
+        }
 
         Ok(())
     }
@@ -749,16 +874,26 @@ impl Compiler {
                 }
                 CaseSelector::Range(start, end) => {
                     // Check if selector >= start AND selector <= end
-                    self.chunk.emit(OpCode::Dup, location);
+                    // Stack after initial Dup at line 852: [..., selector, selector_copy]
+                    // We need another copy for the second comparison
+                    self.chunk.emit(OpCode::Dup, location);  // [..., sel, copy1, copy2]
+
+                    // First comparison: copy2 >= start
                     self.compile_expression(start)?;
-                    self.chunk.emit(OpCode::GreaterEqual, location);
+                    self.chunk.emit(OpCode::GreaterEqual, location); // [..., sel, copy1, bool_ge]
 
-                    // Swap and check <= end
-                    self.chunk.emit(OpCode::Dup, location);
+                    // Store bool_ge in temp variable (since we can't swap on stack)
+                    let temp_idx = self.chunk.add_variable("__range_temp".to_string());
+                    self.chunk.emit_with_operand(OpCode::StoreVar, temp_idx, location);
+                    // Stack: [..., sel, copy1]
+
+                    // Second comparison: copy1 <= end
                     self.compile_expression(end)?;
-                    self.chunk.emit(OpCode::LessEqual, location);
+                    self.chunk.emit(OpCode::LessEqual, location); // [..., sel, bool_le]
 
-                    self.chunk.emit(OpCode::And, location);
+                    // Load back bool_ge and AND the results
+                    self.chunk.emit_with_operand(OpCode::LoadVar, temp_idx, location);
+                    self.chunk.emit(OpCode::And, location); // [..., sel, (bool_ge AND bool_le)]
                 }
             }
 

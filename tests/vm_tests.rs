@@ -514,3 +514,230 @@ fn test_trace_mode() {
 
     assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(42)));
 }
+
+#[test]
+fn test_exit_statement() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 1, 100
+            if (i > 5) exit
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Sum of 1 to 5 = 15, then exits
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(15)));
+    assert_eq!(vm.get_variable("I"), Some(&firp::bytecode::Value::Integer(6)));
+}
+
+#[test]
+fn test_cycle_statement() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 1, 10
+            if (i == 5) cycle
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Sum of 1 to 10 = 55, minus 5 = 50 (skipping i=5)
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(50)));
+}
+
+#[test]
+fn test_multiple_cycle() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 1, 10
+            if (i == 3) cycle
+            if (i == 7) cycle
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Sum of 1 to 10 = 55, minus 3 and 7 = 45
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(45)));
+}
+
+#[test]
+fn test_exit_and_cycle_combined() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 1, 100
+            if (i == 3) cycle
+            if (i > 7) exit
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // 1 + 2 + 4 + 5 + 6 + 7 = 25 (skipping 3, exit at 8)
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(25)));
+}
+
+#[test]
+fn test_infinite_loop_with_exit() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i
+
+          i = 0
+          do
+            if (i >= 10) exit
+            i = i + 1
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.get_variable("I"), Some(&firp::bytecode::Value::Integer(10)));
+}
+
+#[test]
+fn test_do_loop_negative_step() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 10, 1, -1
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Sum of 10 down to 1 = 55
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(55)));
+}
+
+#[test]
+fn test_do_loop_negative_step_by_two() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 0
+          do i = 10, 1, -2
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // 10 + 8 + 6 + 4 + 2 = 30
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(30)));
+}
+
+#[test]
+fn test_do_loop_zero_iterations() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, sum
+
+          sum = 100
+          do i = 10, 5
+            sum = sum + i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Loop body never executes, sum stays at 100
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(100)));
+}
+
+#[test]
+fn test_nested_loops_with_exit() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, j, count
+
+          count = 0
+          do i = 1, 5
+            do j = 1, 10
+              count = count + 1
+              if (j > 3) exit
+            end do
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Inner loop exits after j=4 each time, so 4 iterations * 5 outer = 20
+    assert_eq!(vm.get_variable("COUNT"), Some(&firp::bytecode::Value::Integer(20)));
+}
+
+#[test]
+fn test_sprint07_success_criteria() {
+    // The exact program from Sprint 07 success criteria
+    let source = r#"
+        program control_test
+          implicit none
+          integer :: i, sum, product
+
+          sum = 0
+          do i = 1, 10
+            if (i == 5) cycle
+            sum = sum + i
+          end do
+
+          product = 1
+          i = 1
+          do while (i <= 5)
+            product = product * i
+            i = i + 1
+          end do
+
+          select case (sum)
+            case (1:20)
+              print *, 'Small sum'
+            case (21:50)
+              print *, 'Medium sum'
+            case default
+              print *, 'Large sum'
+          end select
+        end program control_test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+
+    // sum = 1+2+3+4+6+7+8+9+10 = 50 (skipping 5 via CYCLE)
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(50)));
+
+    // product = 1*2*3*4*5 = 120
+    assert_eq!(vm.get_variable("PRODUCT"), Some(&firp::bytecode::Value::Integer(120)));
+
+    // Output should be "Medium sum" (sum=50 is in 21:50 range)
+    let output = vm.output();
+    assert_eq!(output.len(), 1);
+    assert!(output[0].contains("Medium sum"));
+}
