@@ -385,23 +385,37 @@ impl Parser {
                 break;
             }
 
-            // Parse RECURSIVE prefix (optional)
-            let is_recursive = if self.check(&TokenType::Recursive) {
-                self.advance();
-                true
-            } else {
-                false
-            };
+            // Parse procedure prefixes (PURE, ELEMENTAL, RECURSIVE)
+            let mut is_pure = false;
+            let mut is_elemental = false;
+            let mut is_recursive = false;
+
+            // Parse prefixes in any order
+            loop {
+                if self.check(&TokenType::Pure) {
+                    self.advance();
+                    is_pure = true;
+                } else if self.check(&TokenType::Elemental) {
+                    self.advance();
+                    is_elemental = true;
+                    is_pure = true; // ELEMENTAL implies PURE
+                } else if self.check(&TokenType::Recursive) {
+                    self.advance();
+                    is_recursive = true;
+                } else {
+                    break;
+                }
+            }
 
             // Parse SUBROUTINE or FUNCTION
             if self.check(&TokenType::Subroutine) {
-                procedures.push(Procedure::Subroutine(self.parse_subroutine()?));
+                procedures.push(Procedure::Subroutine(self.parse_subroutine_with_attrs(is_pure, is_elemental)?));
             } else if self.check(&TokenType::Function) {
-                procedures.push(Procedure::Function(self.parse_function(is_recursive)?));
-            } else if is_recursive {
-                // RECURSIVE without FUNCTION is an error
+                procedures.push(Procedure::Function(self.parse_function_with_attrs(is_recursive, is_pure, is_elemental)?));
+            } else if is_recursive || is_pure || is_elemental {
+                // Prefix without procedure is an error
                 return Err(ParseError::UnexpectedToken {
-                    expected: "FUNCTION after RECURSIVE".to_string(),
+                    expected: "SUBROUTINE or FUNCTION after prefix".to_string(),
                     found: self.peek().token_type.clone(),
                     location: self.current_location(),
                 });
@@ -418,8 +432,8 @@ impl Parser {
         Ok(procedures)
     }
 
-    /// Parse a subroutine definition
-    fn parse_subroutine(&mut self) -> ParseResult<SubroutineDef> {
+    /// Parse a subroutine definition with attributes
+    fn parse_subroutine_with_attrs(&mut self, is_pure: bool, is_elemental: bool) -> ParseResult<SubroutineDef> {
         let location = self.current_location();
         self.expect(&TokenType::Subroutine, "SUBROUTINE")?;
 
@@ -471,14 +485,21 @@ impl Parser {
         Ok(SubroutineDef {
             name,
             parameters,
+            is_pure,
+            is_elemental,
             declarations,
             body,
             location,
         })
     }
 
-    /// Parse a function definition
-    fn parse_function(&mut self, is_recursive: bool) -> ParseResult<FunctionDef> {
+    /// Parse a subroutine definition (no attributes)
+    fn parse_subroutine(&mut self) -> ParseResult<SubroutineDef> {
+        self.parse_subroutine_with_attrs(false, false)
+    }
+
+    /// Parse a function definition with all attributes
+    fn parse_function_with_attrs(&mut self, is_recursive: bool, is_pure: bool, is_elemental: bool) -> ParseResult<FunctionDef> {
         let location = self.current_location();
 
         // Optional return type prefix
@@ -552,10 +573,17 @@ impl Parser {
             return_type,
             result_name,
             is_recursive,
+            is_pure,
+            is_elemental,
             declarations,
             body,
             location,
         })
+    }
+
+    /// Parse a function definition (backward compatibility)
+    fn parse_function(&mut self, is_recursive: bool) -> ParseResult<FunctionDef> {
+        self.parse_function_with_attrs(is_recursive, false, false)
     }
 
     /// Parse parameter names (just identifiers for now)

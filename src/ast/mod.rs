@@ -136,6 +136,8 @@ pub enum Procedure {
 pub struct SubroutineDef {
     pub name: String,
     pub parameters: Vec<Parameter>,
+    pub is_pure: bool,
+    pub is_elemental: bool,
     pub declarations: Vec<Declaration>,
     pub body: Vec<Statement>,
     pub location: SourceLocation,
@@ -150,6 +152,8 @@ pub struct FunctionDef {
     /// RESULT variable name (defaults to function name)
     pub result_name: Option<String>,
     pub is_recursive: bool,
+    pub is_pure: bool,
+    pub is_elemental: bool,
     pub declarations: Vec<Declaration>,
     pub body: Vec<Statement>,
     pub location: SourceLocation,

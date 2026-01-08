@@ -704,3 +704,77 @@ fn test_present_intrinsic() {
     let output = get_output(&result.unwrap());
     assert!(output.contains("present"), "Expected 'present' in output, got: {}", output);
 }
+
+// =====================================================================
+// PURE & ELEMENTAL Procedure Tests
+// =====================================================================
+
+#[test]
+fn test_pure_function() {
+    let source = r#"
+        PROGRAM test_pure
+          IMPLICIT NONE
+          INTEGER :: result
+
+          result = double_val(21)
+          PRINT *, result
+
+        CONTAINS
+          PURE FUNCTION double_val(x) RESULT(y)
+            INTEGER, INTENT(IN) :: x
+            INTEGER :: y
+            y = x * 2
+          END FUNCTION double_val
+        END PROGRAM test_pure
+    "#;
+
+    let result = compile_and_run(source);
+    assert!(result.is_ok(), "Should compile and run: {:?}", result.err());
+    let output = get_output(&result.unwrap());
+    assert!(output.contains("42"), "Expected 42, got: {}", output);
+}
+
+#[test]
+fn test_pure_subroutine() {
+    let source = r#"
+        PROGRAM test_pure_sub
+          IMPLICIT NONE
+
+          CALL greet()
+
+        CONTAINS
+          PURE SUBROUTINE greet()
+            ! A pure subroutine with no side effects
+          END SUBROUTINE greet
+        END PROGRAM test_pure_sub
+    "#;
+
+    let result = compile_and_run(source);
+    assert!(result.is_ok(), "Should compile and run: {:?}", result.err());
+}
+
+#[test]
+fn test_elemental_function() {
+    let source = r#"
+        PROGRAM test_elemental
+          IMPLICIT NONE
+          INTEGER :: x, y
+
+          x = 5
+          y = triple(x)
+          PRINT *, y
+
+        CONTAINS
+          ELEMENTAL FUNCTION triple(a) RESULT(b)
+            INTEGER, INTENT(IN) :: a
+            INTEGER :: b
+            b = a * 3
+          END FUNCTION triple
+        END PROGRAM test_elemental
+    "#;
+
+    let result = compile_and_run(source);
+    assert!(result.is_ok(), "Should compile and run: {:?}", result.err());
+    let output = get_output(&result.unwrap());
+    assert!(output.contains("15"), "Expected 15, got: {}", output);
+}
