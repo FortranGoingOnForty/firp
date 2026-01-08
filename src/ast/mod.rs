@@ -2,15 +2,84 @@
 
 use crate::lexer::SourceLocation;
 
+/// A compilation unit containing modules and/or a program
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompilationUnit {
+    /// Module definitions (parsed before the main program)
+    pub modules: Vec<ModuleDef>,
+    /// Main program (optional - file might only contain modules)
+    pub program: Option<Program>,
+}
+
 /// Root AST node representing a complete Fortran program
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub name: Option<String>,
+    /// USE statements
+    pub uses: Vec<UseStatement>,
     pub declarations: Vec<Declaration>,
     pub statements: Vec<Statement>,
     /// Contained procedures (after CONTAINS)
     pub procedures: Vec<Procedure>,
     pub location: SourceLocation,
+}
+
+/// Module definition
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleDef {
+    pub name: String,
+    /// Default visibility (PUBLIC or PRIVATE)
+    pub default_visibility: Visibility,
+    /// USE statements
+    pub uses: Vec<UseStatement>,
+    /// Module-level declarations
+    pub declarations: Vec<Declaration>,
+    /// PUBLIC/PRIVATE statements for specific symbols
+    pub visibility_stmts: Vec<VisibilityStmt>,
+    /// Module procedures (after CONTAINS)
+    pub procedures: Vec<Procedure>,
+    pub location: SourceLocation,
+}
+
+/// Visibility specifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Visibility::Public
+    }
+}
+
+/// Visibility statement: PUBLIC :: name1, name2 or PRIVATE :: name1, name2
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisibilityStmt {
+    pub visibility: Visibility,
+    /// Names affected (empty means set default visibility)
+    pub names: Vec<String>,
+    pub location: SourceLocation,
+}
+
+/// USE statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseStatement {
+    /// Module name to use
+    pub module_name: String,
+    /// ONLY clause items (None = import all)
+    pub only: Option<Vec<UseItem>>,
+    pub location: SourceLocation,
+}
+
+/// Item in USE statement (can be renamed)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseItem {
+    /// Local name (after renaming, or original if not renamed)
+    pub local_name: String,
+    /// Original name from module (None if not renamed)
+    pub original_name: Option<String>,
 }
 
 /// A procedure (subroutine or function)

@@ -65,6 +65,25 @@ impl Parser {
         }
     }
 
+    /// Parse a complete compilation unit (modules + program)
+    pub fn parse_compilation_unit(&mut self) -> ParseResult<CompilationUnit> {
+        let mut modules = Vec::new();
+
+        // Parse any modules first
+        while self.check(&TokenType::Module) {
+            modules.push(self.parse_module()?);
+        }
+
+        // Parse program if present
+        let program = if !self.is_at_end() {
+            Some(self.parse_program()?)
+        } else {
+            None
+        };
+
+        Ok(CompilationUnit { modules, program })
+    }
+
     /// Parse a complete Fortran program
     pub fn parse_program(&mut self) -> ParseResult<Program> {
         let location = self.current_location();
@@ -78,9 +97,15 @@ impl Parser {
             None
         };
 
+        let mut uses = Vec::new();
         let mut declarations = Vec::new();
         let mut statements = Vec::new();
         let mut procedures = Vec::new();
+
+        // Parse USE statements first (must come before declarations)
+        while self.check(&TokenType::Use) {
+            uses.push(self.parse_use_statement()?);
+        }
 
         // Parse declarations and statements until END, CONTAINS, or EOF
         loop {
@@ -124,9 +149,224 @@ impl Parser {
 
         Ok(Program {
             name,
+            uses,
             declarations,
             statements,
             procedures,
+            location,
+        })
+    }
+
+    /// Parse a Fortran module
+    pub fn parse_module(&mut self) -> ParseResult<ModuleDef> {
+        let location = self.current_location();
+
+        // Expect MODULE keyword
+        self.expect(&TokenType::Module, "MODULE")?;
+        let name = self.expect_identifier()?;
+
+        let mut default_visibility = Visibility::Public;
+        let mut uses = Vec::new();
+        let mut declarations = Vec::new();
+        let mut visibility_stmts = Vec::new();
+        let mut procedures = Vec::new();
+
+        // Parse module body: USE statements, declarations, PUBLIC/PRIVATE, CONTAINS
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for CONTAINS
+            if self.check(&TokenType::Contains) {
+                self.advance();
+                procedures = self.parse_procedures()?;
+                break;
+            }
+
+            // Check for END MODULE
+            if self.check(&TokenType::End) {
+                break;
+            }
+
+            // Parse USE statements
+            if self.check(&TokenType::Use) {
+                uses.push(self.parse_use_statement()?);
+                continue;
+            }
+
+            // Parse PUBLIC/PRIVATE statements
+            if self.check(&TokenType::Public) || self.check(&TokenType::Private) {
+                let vis_stmt = self.parse_visibility_statement()?;
+                // If no names, this sets default visibility
+                if vis_stmt.names.is_empty() {
+                    default_visibility = vis_stmt.visibility;
+                }
+                visibility_stmts.push(vis_stmt);
+                continue;
+            }
+
+            // Parse declarations
+            if self.is_declaration_start() {
+                declarations.push(self.parse_declaration()?);
+                continue;
+            }
+
+            // Skip unknown tokens (shouldn't happen in well-formed code)
+            break;
+        }
+
+        // Expect END MODULE
+        if self.check(&TokenType::End) {
+            self.advance();
+            if self.check(&TokenType::Module) {
+                self.advance();
+                // Optional module name
+                if let TokenType::Identifier(_) = self.peek().token_type {
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(ModuleDef {
+            name,
+            default_visibility,
+            uses,
+            declarations,
+            visibility_stmts,
+            procedures,
+            location,
+        })
+    }
+
+    /// Parse a USE statement
+    fn parse_use_statement(&mut self) -> ParseResult<UseStatement> {
+        let location = self.current_location();
+
+        self.expect(&TokenType::Use, "USE")?;
+        let module_name = self.expect_identifier()?;
+
+        // Check for ONLY clause
+        let only = if self.check(&TokenType::Comma) {
+            self.advance();
+            if self.check(&TokenType::Only) {
+                self.advance();
+                self.expect(&TokenType::Colon, ":")?;
+
+                // Parse list of items
+                let mut items = Vec::new();
+                loop {
+                    let first_name = self.expect_identifier()?;
+
+                    // Check for renaming: local_name => original_name
+                    if self.check(&TokenType::Arrow) {
+                        self.advance();
+                        let original = self.expect_identifier()?;
+                        items.push(UseItem {
+                            local_name: first_name,
+                            original_name: Some(original),
+                        });
+                    } else {
+                        items.push(UseItem {
+                            local_name: first_name.clone(),
+                            original_name: None,
+                        });
+                    }
+
+                    if self.check(&TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                Some(items)
+            } else {
+                // Renaming without ONLY: USE mod, local => original
+                let mut items = Vec::new();
+                loop {
+                    let first_name = self.expect_identifier()?;
+
+                    if self.check(&TokenType::Arrow) {
+                        self.advance();
+                        let original = self.expect_identifier()?;
+                        items.push(UseItem {
+                            local_name: first_name,
+                            original_name: Some(original),
+                        });
+                    } else {
+                        items.push(UseItem {
+                            local_name: first_name.clone(),
+                            original_name: None,
+                        });
+                    }
+
+                    if self.check(&TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                Some(items)
+            }
+        } else {
+            None
+        };
+
+        Ok(UseStatement {
+            module_name,
+            only,
+            location,
+        })
+    }
+
+    /// Parse a PUBLIC or PRIVATE statement
+    fn parse_visibility_statement(&mut self) -> ParseResult<VisibilityStmt> {
+        let location = self.current_location();
+
+        let visibility = if self.check(&TokenType::Public) {
+            self.advance();
+            Visibility::Public
+        } else if self.check(&TokenType::Private) {
+            self.advance();
+            Visibility::Private
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "PUBLIC or PRIVATE".to_string(),
+                found: self.peek().token_type.clone(),
+                location,
+            });
+        };
+
+        let mut names = Vec::new();
+
+        // Check for :: and list of names
+        if self.check(&TokenType::DoubleColon) {
+            self.advance();
+            loop {
+                names.push(self.expect_identifier()?);
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        } else if self.check(&TokenType::Colon) {
+            // Single colon also acceptable in some cases
+            self.advance();
+            loop {
+                names.push(self.expect_identifier()?);
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        // If neither :: nor names, this just sets default visibility
+
+        Ok(VisibilityStmt {
+            visibility,
+            names,
             location,
         })
     }
