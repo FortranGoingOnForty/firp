@@ -1,0 +1,16 @@
+[package]
+name = "firp"
+version = "0.1.0"
+edition = "2021"
+authors = ["FortranGoingOnForty"]
+description = "A Modern Fortran Interpreter"
+license = "MIT"
+repository = "https://github.com/FortranGoingOnForty/firp"
+
+[[bin]]
+name = "firp"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
