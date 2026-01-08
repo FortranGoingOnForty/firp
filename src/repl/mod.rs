@@ -28,6 +28,12 @@ pub struct Repl {
     input_buffer: String,
     /// Whether we're in multi-line input mode
     in_multiline: bool,
+    /// Accumulated declarations for persistent state
+    accumulated_decls: Vec<String>,
+    /// Accumulated statements for persistent state
+    accumulated_stmts: Vec<String>,
+    /// Previous output line count (to show only new output)
+    prev_output_count: usize,
 }
 
 impl Repl {
@@ -43,6 +49,9 @@ impl Repl {
             show_bytecode: false,
             input_buffer: String::new(),
             in_multiline: false,
+            accumulated_decls: Vec::new(),
+            accumulated_stmts: Vec::new(),
+            prev_output_count: 0,
         })
     }
 
@@ -226,6 +235,9 @@ impl Repl {
     fn clear_state(&mut self) {
         self.variables.clear();
         self.vm = VM::new();
+        self.accumulated_decls.clear();
+        self.accumulated_stmts.clear();
+        self.prev_output_count = 0;
     }
 
     /// Reset REPL completely
@@ -235,6 +247,9 @@ impl Repl {
         self.compiler = Compiler::new();
         self.input_buffer.clear();
         self.in_multiline = false;
+        self.accumulated_decls.clear();
+        self.accumulated_stmts.clear();
+        self.prev_output_count = 0;
     }
 
     /// Load and execute a file
@@ -252,7 +267,14 @@ impl Repl {
 
     /// Show bytecode for a statement
     fn show_bytecode_for(&mut self, input: &str) {
-        match self.compile_input(input) {
+        let source = if self.is_program_unit(input) {
+            input.to_string()
+        } else {
+            let is_decl = self.is_declaration(input);
+            self.build_program(input, is_decl)
+        };
+
+        match self.compile_program_source(&source) {
             Ok(chunk) => {
                 println!("{}", chunk.disassemble("input"));
             }
@@ -330,34 +352,71 @@ impl Repl {
         depth <= 0
     }
 
-    /// Compile input to bytecode
-    fn compile_input(&mut self, input: &str) -> Result<Chunk, String> {
-        // Check if input contains a program unit (PROGRAM, MODULE, SUBROUTINE, FUNCTION)
+    /// Check if input looks like a declaration (vs a statement)
+    fn is_declaration(&self, input: &str) -> bool {
+        let upper = input.trim().to_uppercase();
+        // Declarations start with type specs or declaration keywords
+        upper.starts_with("INTEGER")
+            || upper.starts_with("REAL")
+            || upper.starts_with("DOUBLE")
+            || upper.starts_with("COMPLEX")
+            || upper.starts_with("LOGICAL")
+            || upper.starts_with("CHARACTER")
+            || upper.starts_with("TYPE ")
+            || upper.starts_with("TYPE(")
+            || upper.starts_with("CLASS(")
+            || upper.starts_with("IMPLICIT")
+            || upper.starts_with("PARAMETER")
+    }
+
+    /// Check if input is a full program unit
+    fn is_program_unit(&self, input: &str) -> bool {
         let upper = input.to_uppercase();
-        let has_program_unit = upper.contains("PROGRAM ")
-            || upper.contains("MODULE ")
-            || upper.contains("SUBROUTINE ")
-            || upper.contains("FUNCTION ");
+        upper.contains("PROGRAM ") && upper.contains("END PROGRAM")
+            || upper.contains("MODULE ") && upper.contains("END MODULE")
+            || upper.contains("SUBROUTINE ") && upper.contains("END SUBROUTINE")
+            || upper.contains("FUNCTION ") && upper.contains("END FUNCTION")
+    }
 
-        if has_program_unit {
-            // Compile directly without wrapping
-            let mut lexer = Lexer::new(input);
-            let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
+    /// Build a complete program from accumulated state plus new input
+    fn build_program(&self, new_input: &str, is_decl: bool) -> String {
+        let mut program = String::from("PROGRAM _repl_\n  IMPLICIT NONE\n");
 
-            if tokens.is_empty() {
-                return Err("Empty input".to_string());
-            }
-
-            let mut parser = Parser::new(tokens);
-            let program = parser.parse_program().map_err(|e| format!("Parse error: {}", e))?;
-
-            let mut compiler = Compiler::new();
-            return compiler.compile(&program).map_err(|e| format!("Compile error: {}", e));
+        // Add all accumulated declarations
+        for decl in &self.accumulated_decls {
+            program.push_str("  ");
+            program.push_str(decl);
+            program.push('\n');
         }
 
-        // Wrap simple statements in a program
-        let wrapped = format!("PROGRAM _repl_\n{}\nEND PROGRAM _repl_", input);
-        let mut lexer = Lexer::new(&wrapped);
+        // Add new declaration if applicable
+        if is_decl && !new_input.trim().is_empty() {
+            program.push_str("  ");
+            program.push_str(new_input.trim());
+            program.push('\n');
+        }
+
+        // Add all accumulated statements
+        for stmt in &self.accumulated_stmts {
+            program.push_str("  ");
+            program.push_str(stmt);
+            program.push('\n');
+        }
+
+        // Add new statement if applicable
+        if !is_decl && !new_input.trim().is_empty() {
+            program.push_str("  ");
+            program.push_str(new_input.trim());
+            program.push('\n');
+        }
+
+        program.push_str("END PROGRAM _repl_\n");
+        program
+    }
+
+    /// Compile input to bytecode
+    fn compile_program_source(&mut self, source: &str) -> Result<Chunk, String> {
+        let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
 
         if tokens.is_empty() {
@@ -373,36 +432,76 @@ impl Repl {
 
     /// Execute input and print results
     fn execute_input(&mut self, input: &str) {
-        // Compile
-        let chunk = match self.compile_input(input) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("Error: {}", e);
-                return;
-            }
-        };
-
-        // Show bytecode if enabled
-        if self.show_bytecode {
-            println!("--- Bytecode ---");
-            println!("{}", chunk.disassemble("repl"));
-            println!("----------------");
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
         }
 
-        // Execute
-        let mut vm = VM::new();
-        match vm.run(chunk) {
-            Ok(()) => {
-                // Print any output
-                for line in vm.output() {
-                    println!("{}", line);
+        // Check if this is a complete program unit
+        if self.is_program_unit(input) {
+            // Execute as standalone program
+            match self.compile_program_source(input) {
+                Ok(chunk) => {
+                    if self.show_bytecode {
+                        println!("--- Bytecode ---");
+                        println!("{}", chunk.disassemble("program"));
+                        println!("----------------");
+                    }
+                    let mut vm = VM::new();
+                    match vm.run(chunk) {
+                        Ok(()) => {
+                            for line in vm.output() {
+                                println!("{}", line);
+                            }
+                        }
+                        Err(e) => println!("Runtime error: {}", e),
+                    }
+                }
+                Err(e) => println!("Error: {}", e),
+            }
+            return;
+        }
+
+        // Determine if this is a declaration or statement
+        let is_decl = self.is_declaration(trimmed);
+
+        // Build program with accumulated state plus new input
+        let source = self.build_program(trimmed, is_decl);
+
+        // Try to compile
+        match self.compile_program_source(&source) {
+            Ok(chunk) => {
+                if self.show_bytecode {
+                    println!("--- Bytecode ---");
+                    println!("{}", chunk.disassemble("repl"));
+                    println!("----------------");
                 }
 
-                // If there's a result value on the stack, print it
-                // (for expression evaluation)
+                // Execute
+                let mut vm = VM::new();
+                match vm.run(chunk) {
+                    Ok(()) => {
+                        // Only print new output (skip output from previous statements)
+                        let output = vm.output();
+                        for line in output.iter().skip(self.prev_output_count) {
+                            println!("{}", line);
+                        }
+
+                        // Update state on success
+                        if is_decl {
+                            self.accumulated_decls.push(trimmed.to_string());
+                        } else {
+                            self.accumulated_stmts.push(trimmed.to_string());
+                        }
+                        self.prev_output_count = output.len();
+                    }
+                    Err(e) => {
+                        println!("Runtime error: {}", e);
+                    }
+                }
             }
             Err(e) => {
-                println!("Runtime error: {}", e);
+                println!("Error: {}", e);
             }
         }
     }
