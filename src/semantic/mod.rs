@@ -667,6 +667,11 @@ impl SemanticAnalyzer {
                 // For now, we accept it without additional checks
                 Ok(())
             }
+            Declaration::Interface(_interface) => {
+                // TODO: Register interface in symbol table for operator overloading
+                // For now, we accept it without additional checks
+                Ok(())
+            }
         }
     }
 

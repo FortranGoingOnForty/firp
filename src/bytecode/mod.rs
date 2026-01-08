@@ -665,6 +665,12 @@ pub struct Chunk {
     pub types: Vec<RuntimeTypeDef>,
     /// Type name to index mapping
     pub type_indices: HashMap<String, usize>,
+    /// Operator overloading interfaces (operator -> list of procedure names)
+    pub operator_interfaces: HashMap<String, Vec<String>>,
+    /// Assignment interfaces (list of procedure names)
+    pub assignment_interfaces: Vec<String>,
+    /// Generic interfaces (generic name -> list of procedure names)
+    pub generic_interfaces: HashMap<String, Vec<String>>,
 }
 
 impl Chunk {
@@ -745,6 +751,34 @@ impl Chunk {
     /// Get type definition by index
     pub fn get_type(&self, index: usize) -> Option<&RuntimeTypeDef> {
         self.types.get(index)
+    }
+
+    /// Register an operator interface (for operator overloading)
+    pub fn register_operator_interface(&mut self, op: OverloadableOperator, proc_name: String) {
+        let op_key = format!("{:?}", op);
+        self.operator_interfaces
+            .entry(op_key)
+            .or_insert_with(Vec::new)
+            .push(proc_name);
+    }
+
+    /// Register an assignment interface
+    pub fn register_assignment_interface(&mut self, proc_name: String) {
+        self.assignment_interfaces.push(proc_name);
+    }
+
+    /// Register a generic interface
+    pub fn register_generic_interface(&mut self, generic_name: String, proc_name: String) {
+        self.generic_interfaces
+            .entry(generic_name)
+            .or_insert_with(Vec::new)
+            .push(proc_name);
+    }
+
+    /// Get operator interface procedures for a given operator
+    pub fn get_operator_procedures(&self, op: &OverloadableOperator) -> Option<&Vec<String>> {
+        let op_key = format!("{:?}", op);
+        self.operator_interfaces.get(&op_key)
     }
 
     /// Patch a jump instruction with the actual target
@@ -1035,6 +1069,10 @@ impl Compiler {
                         runtime_type.add_component(component.name.clone(), None);
                     }
                     self.chunk.add_type(runtime_type);
+                }
+                Declaration::Interface(interface) => {
+                    // Register interface for operator overloading
+                    self.compile_interface(interface)?;
                 }
             }
         }
@@ -1362,7 +1400,46 @@ impl Compiler {
                 self.chunk.add_type(runtime_type);
                 Ok(())
             }
+            Declaration::Interface(interface) => {
+                // Register interface for operator overloading
+                self.compile_interface(interface)
+            }
         }
+    }
+
+    /// Compile an interface block for operator overloading
+    fn compile_interface(&mut self, interface: &InterfaceBlock) -> CompileResult<()> {
+        // Register the operator/assignment interface for later use during expression compilation
+        match &interface.kind {
+            InterfaceKind::Operator(op) => {
+                // Store operator -> procedure mapping
+                for proc in &interface.procedures {
+                    if let Some(proc_name) = &proc.module_procedure {
+                        self.chunk.register_operator_interface(op.clone(), proc_name.clone());
+                    }
+                }
+            }
+            InterfaceKind::Assignment => {
+                // Store assignment interface
+                for proc in &interface.procedures {
+                    if let Some(proc_name) = &proc.module_procedure {
+                        self.chunk.register_assignment_interface(proc_name.clone());
+                    }
+                }
+            }
+            InterfaceKind::Generic(name) => {
+                // Store generic interface
+                for proc in &interface.procedures {
+                    if let Some(proc_name) = &proc.module_procedure {
+                        self.chunk.register_generic_interface(name.clone(), proc_name.clone());
+                    }
+                }
+            }
+            InterfaceKind::Abstract => {
+                // Abstract interfaces don't need runtime registration
+            }
+        }
+        Ok(())
     }
 
     /// Compile a statement

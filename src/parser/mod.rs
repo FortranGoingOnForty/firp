@@ -630,6 +630,11 @@ impl Parser {
             return Ok(Declaration::ImplicitNone { location });
         }
 
+        // INTERFACE block (for operator overloading and generic interfaces)
+        if self.check(&TokenType::Interface) {
+            return self.parse_interface_block();
+        }
+
         // Check for TYPE definition (TYPE :: name or TYPE, EXTENDS(...) :: name)
         // This is different from TYPE(name) :: var declarations
         if self.check(&TokenType::Type) {
@@ -992,6 +997,165 @@ impl Parser {
             nopass,
             location,
         })
+    }
+
+    /// Parse an INTERFACE block
+    fn parse_interface_block(&mut self) -> ParseResult<Declaration> {
+        let location = self.current_location();
+
+        self.expect(&TokenType::Interface, "INTERFACE")?;
+
+        // Determine interface kind
+        let kind = if self.check(&TokenType::Operator) {
+            // INTERFACE OPERATOR(+)
+            self.advance();
+            self.expect(&TokenType::LeftParen, "(")?;
+            let op = self.parse_overloadable_operator()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            InterfaceKind::Operator(op)
+        } else if self.check(&TokenType::Assignment) {
+            // INTERFACE ASSIGNMENT(=)
+            self.advance();
+            self.expect(&TokenType::LeftParen, "(")?;
+            self.expect(&TokenType::Equal, "=")?;
+            self.expect(&TokenType::RightParen, ")")?;
+            InterfaceKind::Assignment
+        } else if let TokenType::Identifier(name) = &self.peek().token_type {
+            // INTERFACE generic_name
+            let generic_name = name.clone();
+            self.advance();
+            InterfaceKind::Generic(generic_name)
+        } else {
+            // Abstract interface
+            InterfaceKind::Abstract
+        };
+
+        // Parse procedures in the interface
+        let mut procedures = Vec::new();
+
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END INTERFACE
+            if self.check(&TokenType::End) {
+                self.advance();
+                if self.check(&TokenType::Interface) {
+                    self.advance();
+                    // Optional operator/name after END INTERFACE
+                    if self.check(&TokenType::Operator) {
+                        self.advance();
+                        if self.check(&TokenType::LeftParen) {
+                            self.advance();
+                            // Skip the operator
+                            while !self.check(&TokenType::RightParen) && !self.is_at_end() {
+                                self.advance();
+                            }
+                            if self.check(&TokenType::RightParen) {
+                                self.advance();
+                            }
+                        }
+                    } else if self.check(&TokenType::Assignment) {
+                        self.advance();
+                        if self.check(&TokenType::LeftParen) {
+                            self.advance();
+                            if self.check(&TokenType::Equal) {
+                                self.advance();
+                            }
+                            if self.check(&TokenType::RightParen) {
+                                self.advance();
+                            }
+                        }
+                    } else if let TokenType::Identifier(_) = self.peek().token_type {
+                        self.advance();
+                    }
+                }
+                break;
+            }
+
+            // Parse MODULE PROCEDURE name
+            if self.check(&TokenType::Module) {
+                self.advance();
+                self.expect(&TokenType::Procedure, "PROCEDURE")?;
+
+                // Parse procedure name(s)
+                loop {
+                    let proc_name = self.expect_identifier()?;
+                    procedures.push(InterfaceProcedure {
+                        module_procedure: Some(proc_name),
+                        procedure_def: None,
+                        location: self.current_location(),
+                    });
+
+                    if self.check(&TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            } else if self.check(&TokenType::Procedure) {
+                // Just PROCEDURE name (alternate syntax)
+                self.advance();
+                loop {
+                    let proc_name = self.expect_identifier()?;
+                    procedures.push(InterfaceProcedure {
+                        module_procedure: Some(proc_name),
+                        procedure_def: None,
+                        location: self.current_location(),
+                    });
+
+                    if self.check(&TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // Skip other content (inline function definitions etc.)
+                self.advance();
+            }
+        }
+
+        Ok(Declaration::Interface(InterfaceBlock {
+            kind,
+            procedures,
+            location,
+        }))
+    }
+
+    /// Parse an overloadable operator
+    fn parse_overloadable_operator(&mut self) -> ParseResult<OverloadableOperator> {
+        let op = match &self.peek().token_type {
+            TokenType::Plus => OverloadableOperator::Add,
+            TokenType::Minus => OverloadableOperator::Subtract,
+            TokenType::Star => OverloadableOperator::Multiply,
+            TokenType::Slash => OverloadableOperator::Divide,
+            TokenType::Power => OverloadableOperator::Power,
+            TokenType::EqualEqual => OverloadableOperator::Equal,
+            TokenType::NotEqual => OverloadableOperator::NotEqual,
+            TokenType::Less => OverloadableOperator::Less,
+            TokenType::LessEqual => OverloadableOperator::LessEqual,
+            TokenType::Greater => OverloadableOperator::Greater,
+            TokenType::GreaterEqual => OverloadableOperator::GreaterEqual,
+            TokenType::And => OverloadableOperator::And,
+            TokenType::Or => OverloadableOperator::Or,
+            TokenType::Not => OverloadableOperator::Not,
+            TokenType::Eqv => OverloadableOperator::Eqv,
+            TokenType::Neqv => OverloadableOperator::Neqv,
+            TokenType::Identifier(name) if name.starts_with('.') && name.ends_with('.') => {
+                OverloadableOperator::UserDefined(name.clone())
+            }
+            _ => {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "operator".to_string(),
+                    found: self.peek().token_type.clone(),
+                    location: self.current_location(),
+                });
+            }
+        };
+        self.advance();
+        Ok(op)
     }
 
     /// Parse a statement

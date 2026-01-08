@@ -293,6 +293,69 @@ pub enum Declaration {
     },
     /// Derived type definition
     DerivedType(DerivedTypeDef),
+    /// Interface block (for operator overloading and generic interfaces)
+    Interface(InterfaceBlock),
+}
+
+/// Interface block for operator overloading or generic procedures
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceBlock {
+    /// Interface kind: operator, assignment, or generic name
+    pub kind: InterfaceKind,
+    /// Procedures in this interface
+    pub procedures: Vec<InterfaceProcedure>,
+    pub location: SourceLocation,
+}
+
+/// Kind of interface block
+#[derive(Debug, Clone, PartialEq)]
+pub enum InterfaceKind {
+    /// INTERFACE OPERATOR(+), OPERATOR(-), etc.
+    Operator(OverloadableOperator),
+    /// INTERFACE ASSIGNMENT(=)
+    Assignment,
+    /// INTERFACE generic_name (generic interface)
+    Generic(String),
+    /// Abstract interface (no name)
+    Abstract,
+}
+
+/// Operators that can be overloaded
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverloadableOperator {
+    // Arithmetic
+    Add,        // +
+    Subtract,   // -
+    Multiply,   // *
+    Divide,     // /
+    Power,      // **
+    // Relational
+    Equal,      // == or .EQ.
+    NotEqual,   // /= or .NE.
+    Less,       // < or .LT.
+    LessEqual,  // <= or .LE.
+    Greater,    // > or .GT.
+    GreaterEqual, // >= or .GE.
+    // Logical
+    And,        // .AND.
+    Or,         // .OR.
+    Not,        // .NOT. (unary)
+    Eqv,        // .EQV.
+    Neqv,       // .NEQV.
+    // Concatenation
+    Concat,     // //
+    // User-defined (e.g., .DOT., .CROSS.)
+    UserDefined(String),
+}
+
+/// Procedure in an interface block
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceProcedure {
+    /// MODULE PROCEDURE name (reference to existing procedure)
+    pub module_procedure: Option<String>,
+    /// Inline procedure definition (less common)
+    pub procedure_def: Option<Box<Procedure>>,
+    pub location: SourceLocation,
 }
 
 /// Assignment target (left-hand side of assignment)
