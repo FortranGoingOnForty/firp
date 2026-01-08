@@ -1330,3 +1330,136 @@ fn test_read_in_loop() {
     ).expect("Should run successfully");
     assert_eq!(vm.get_variable("TOTAL"), Some(&firp::bytecode::Value::Integer(60)));
 }
+
+// File I/O tests
+
+#[test]
+fn test_file_write_and_read() {
+    use std::fs;
+
+    let test_file = "/tmp/firp_test_write_read.txt";
+
+    // Clean up any existing file
+    let _ = fs::remove_file(test_file);
+
+    // Write to file
+    let write_source = format!(r#"
+        program write_test
+          implicit none
+          integer :: x
+          x = 42
+          open(unit=10, file='{}')
+          write(10, *) x
+          close(10)
+        end program write_test
+    "#, test_file);
+
+    compile_and_run(&write_source).expect("Write should succeed");
+
+    // Verify file exists and has content
+    let content = fs::read_to_string(test_file).expect("File should exist");
+    assert!(content.trim() == "42");
+
+    // Read from file
+    let read_source = format!(r#"
+        program read_test
+          implicit none
+          integer :: y
+          open(unit=10, file='{}')
+          read(10, *) y
+          close(10)
+        end program read_test
+    "#, test_file);
+
+    let vm = compile_and_run(&read_source).expect("Read should succeed");
+    assert_eq!(vm.get_variable("Y"), Some(&firp::bytecode::Value::Integer(42)));
+
+    // Clean up
+    let _ = fs::remove_file(test_file);
+}
+
+#[test]
+fn test_file_multiple_values() {
+    use std::fs;
+
+    let test_file = "/tmp/firp_test_multi.txt";
+    let _ = fs::remove_file(test_file);
+
+    // Write multiple values
+    let write_source = format!(r#"
+        program multi_write
+          implicit none
+          integer :: i
+          open(unit=20, file='{}')
+          do i = 1, 5
+            write(20, *) i * 10
+          end do
+          close(20)
+        end program multi_write
+    "#, test_file);
+
+    compile_and_run(&write_source).expect("Write should succeed");
+
+    // Read them back and sum
+    let read_source = format!(r#"
+        program multi_read
+          implicit none
+          integer :: i, val, total
+          total = 0
+          open(unit=20, file='{}')
+          do i = 1, 5
+            read(20, *) val
+            total = total + val
+          end do
+          close(20)
+        end program multi_read
+    "#, test_file);
+
+    let vm = compile_and_run(&read_source).expect("Read should succeed");
+    // 10 + 20 + 30 + 40 + 50 = 150
+    assert_eq!(vm.get_variable("TOTAL"), Some(&firp::bytecode::Value::Integer(150)));
+
+    let _ = fs::remove_file(test_file);
+}
+
+#[test]
+fn test_file_real_values() {
+    use std::fs;
+
+    let test_file = "/tmp/firp_test_real.txt";
+    let _ = fs::remove_file(test_file);
+
+    // Write real values
+    let write_source = format!(r#"
+        program real_write
+          implicit none
+          real :: x
+          x = 3.14
+          open(unit=30, file='{}')
+          write(30, *) x
+          close(30)
+        end program real_write
+    "#, test_file);
+
+    compile_and_run(&write_source).expect("Write should succeed");
+
+    // Read it back
+    let read_source = format!(r#"
+        program real_read
+          implicit none
+          real :: y
+          open(unit=30, file='{}')
+          read(30, *) y
+          close(30)
+        end program real_read
+    "#, test_file);
+
+    let vm = compile_and_run(&read_source).expect("Read should succeed");
+    if let Some(firp::bytecode::Value::Real(val)) = vm.get_variable("Y") {
+        assert!((val - 3.14).abs() < 0.001);
+    } else {
+        panic!("Expected real value");
+    }
+
+    let _ = fs::remove_file(test_file);
+}

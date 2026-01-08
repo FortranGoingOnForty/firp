@@ -8,7 +8,7 @@ use crate::lexer::SourceLocation;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, Write};
 
 /// Maximum stack size
 const STACK_SIZE: usize = 256;
@@ -135,10 +135,110 @@ impl std::error::Error for RuntimeError {}
 
 pub type VMResult<T> = Result<T, RuntimeError>;
 
+/// File action mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAction {
+    Read,
+    Write,
+    ReadWrite,
+}
+
 /// File handle wrapper for Fortran I/O
-pub enum FileHandle {
-    Reader(BufReader<File>),
-    Writer(BufWriter<File>),
+pub struct FileHandle {
+    /// Path to the file
+    path: String,
+    /// Action mode
+    action: FileAction,
+    /// The underlying file (reopened as needed)
+    file: Option<File>,
+    /// Read buffer for line-by-line reading
+    read_buffer: Vec<String>,
+    /// Current position in read buffer
+    read_pos: usize,
+}
+
+impl FileHandle {
+    /// Create a new file handle
+    pub fn new(path: String, action: FileAction) -> io::Result<Self> {
+        let file = match action {
+            FileAction::Read => OpenOptions::new().read(true).open(&path)?,
+            FileAction::Write => OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?,
+            FileAction::ReadWrite => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)?,
+        };
+
+        Ok(Self {
+            path,
+            action,
+            file: Some(file),
+            read_buffer: Vec::new(),
+            read_pos: 0,
+        })
+    }
+
+    /// Check if file can be read
+    pub fn can_read(&self) -> bool {
+        matches!(self.action, FileAction::Read | FileAction::ReadWrite)
+    }
+
+    /// Check if file can be written
+    pub fn can_write(&self) -> bool {
+        matches!(self.action, FileAction::Write | FileAction::ReadWrite)
+    }
+
+    /// Write a line to the file
+    pub fn write_line(&mut self, line: &str) -> io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            writeln!(file, "{}", line)?;
+            file.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Read the next line from the file
+    pub fn read_line(&mut self) -> io::Result<Option<String>> {
+        // Load file into buffer on first read
+        if self.read_buffer.is_empty() && self.read_pos == 0 {
+            self.load_file_contents()?;
+        }
+
+        if self.read_pos < self.read_buffer.len() {
+            let line = self.read_buffer[self.read_pos].clone();
+            self.read_pos += 1;
+            Ok(Some(line))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load entire file contents into buffer for reading
+    fn load_file_contents(&mut self) -> io::Result<()> {
+        use std::io::BufRead;
+
+        // Reopen file for reading from beginning
+        let file = OpenOptions::new().read(true).open(&self.path)?;
+        let reader = BufReader::new(file);
+
+        self.read_buffer = reader.lines().collect::<io::Result<Vec<String>>>()?;
+        self.read_pos = 0;
+        Ok(())
+    }
+
+    /// Flush and close the file
+    pub fn close(&mut self) -> io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            file.flush()?;
+        }
+        self.file = None;
+        Ok(())
+    }
 }
 
 /// Virtual Machine for executing bytecode
@@ -489,19 +589,14 @@ impl VM {
                         }),
                     };
 
-                    // Open file for reading/writing
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .open(&filename)
+                    // Open file for reading and writing (default action)
+                    let handle = FileHandle::new(filename.clone(), FileAction::ReadWrite)
                         .map_err(|e| RuntimeError::IoError {
                             message: format!("Cannot open '{}': {}", filename, e),
                             location,
                         })?;
 
-                    // Store as writer by default (can be used for both)
-                    self.file_handles.insert(unit, FileHandle::Writer(BufWriter::new(file)));
+                    self.file_handles.insert(unit, handle);
                     self.ip += 1;
                 }
 
@@ -515,12 +610,9 @@ impl VM {
                         }),
                     };
 
-                    // Remove and drop file handle (closes file)
-                    if let Some(handle) = self.file_handles.remove(&unit) {
-                        // Flush if writer
-                        if let FileHandle::Writer(mut w) = handle {
-                            let _ = w.flush();
-                        }
+                    // Remove and close file handle
+                    if let Some(mut handle) = self.file_handles.remove(&unit) {
+                        let _ = handle.close();
                     }
                     self.ip += 1;
                 }
@@ -549,14 +641,20 @@ impl VM {
                     let line = output.join(" ");
 
                     // Write to file
-                    if let Some(FileHandle::Writer(ref mut writer)) = self.file_handles.get_mut(&unit) {
-                        writeln!(writer, "{}", line).map_err(|e| RuntimeError::IoError {
+                    if let Some(handle) = self.file_handles.get_mut(&unit) {
+                        if !handle.can_write() {
+                            return Err(RuntimeError::IoError {
+                                message: format!("Unit {} not open for writing", unit),
+                                location,
+                            });
+                        }
+                        handle.write_line(&line).map_err(|e| RuntimeError::IoError {
                             message: format!("Write error: {}", e),
                             location,
                         })?;
                     } else {
                         return Err(RuntimeError::IoError {
-                            message: format!("Unit {} not open for writing", unit),
+                            message: format!("Unit {} not open", unit),
                             location,
                         });
                     }
@@ -575,7 +673,7 @@ impl VM {
                         }),
                     };
 
-                    // Read from file - need to reopen for reading
+                    // Read from file
                     let value = self.read_from_file(unit, location)?;
                     self.set_variable_by_index(var_index, value, location)?;
                     self.ip += 1;
@@ -827,13 +925,31 @@ impl VM {
 
     /// Read a value from a file
     fn read_from_file(&mut self, unit: i64, location: SourceLocation) -> VMResult<Value> {
-        // For file reading, we need a Reader. The current implementation stores Writers.
-        // In a production system, we'd track read/write mode separately.
-        // For now, return an error if file isn't properly opened for reading.
-        Err(RuntimeError::IoError {
-            message: format!("Unit {} not open for reading (file I/O needs separate read mode)", unit),
-            location,
-        })
+        if let Some(handle) = self.file_handles.get_mut(&unit) {
+            if !handle.can_read() {
+                return Err(RuntimeError::IoError {
+                    message: format!("Unit {} not open for reading", unit),
+                    location,
+                });
+            }
+
+            match handle.read_line() {
+                Ok(Some(line)) => self.parse_value(&line),
+                Ok(None) => Err(RuntimeError::IoError {
+                    message: format!("End of file on unit {}", unit),
+                    location,
+                }),
+                Err(e) => Err(RuntimeError::IoError {
+                    message: format!("Read error on unit {}: {}", unit, e),
+                    location,
+                }),
+            }
+        } else {
+            Err(RuntimeError::IoError {
+                message: format!("Unit {} not open", unit),
+                location,
+            })
+        }
     }
 
     /// Parse a string value into the appropriate type
