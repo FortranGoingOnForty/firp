@@ -841,6 +841,161 @@ impl VM {
                     self.push(result, location)?;
                     self.ip += 1;
                 }
+
+                OpCode::CreateInstance => {
+                    // operand = type index
+                    let type_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "CreateInstance requires type index operand".to_string(),
+                        location,
+                    })?;
+
+                    // Pop the argument count from stack
+                    let arg_count = match self.pop(location)? {
+                        Value::Integer(n) => n as usize,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "CreateInstance expected argument count".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Get the type definition
+                    let chunk = self.chunk.as_ref().ok_or(RuntimeError::InvalidInstruction {
+                        message: "No chunk loaded".to_string(),
+                        location,
+                    })?;
+                    let type_def = chunk.get_type(type_index).ok_or(RuntimeError::TypeError {
+                        message: format!("Unknown type index: {}", type_index),
+                        location,
+                    })?;
+
+                    let num_components = type_def.components.len();
+
+                    // Pop arguments (component values) in reverse order
+                    let mut components = vec![Value::Integer(0); num_components];
+                    for i in (0..arg_count.min(num_components)).rev() {
+                        components[i] = self.pop(location)?;
+                    }
+
+                    // Create the instance
+                    let instance = Value::Instance {
+                        type_index,
+                        components,
+                    };
+
+                    self.push(instance, location)?;
+                    self.ip += 1;
+                }
+
+                OpCode::LoadComponent => {
+                    // operand = constant index for component name
+                    let name_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "LoadComponent requires component name index".to_string(),
+                        location,
+                    })?;
+
+                    // Get component name from constants
+                    let chunk = self.chunk.as_ref().ok_or(RuntimeError::InvalidInstruction {
+                        message: "No chunk loaded".to_string(),
+                        location,
+                    })?;
+                    let comp_name = match chunk.constants.get(name_index) {
+                        Some(Value::Character(s)) => s.clone(),
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "LoadComponent expected string component name".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop the instance from stack
+                    let instance = self.pop(location)?;
+
+                    match instance {
+                        Value::Instance { type_index, components } => {
+                            // Get the type definition to find component index
+                            let chunk = self.chunk.as_ref().ok_or(RuntimeError::InvalidInstruction {
+                                message: "No chunk loaded".to_string(),
+                                location,
+                            })?;
+                            let type_def = chunk.get_type(type_index).ok_or(RuntimeError::TypeError {
+                                message: format!("Unknown type index: {}", type_index),
+                                location,
+                            })?;
+
+                            let comp_idx = type_def.component_index(&comp_name).ok_or(RuntimeError::TypeError {
+                                message: format!("Unknown component: {}", comp_name),
+                                location,
+                            })?;
+
+                            let value = components.get(comp_idx).cloned().unwrap_or(Value::Integer(0));
+                            self.push(value, location)?;
+                        }
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "LoadComponent requires instance on stack".to_string(),
+                            location,
+                        }),
+                    }
+                    self.ip += 1;
+                }
+
+                OpCode::StoreComponent => {
+                    // operand = constant index for component name
+                    let name_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "StoreComponent requires component name index".to_string(),
+                        location,
+                    })?;
+
+                    // Get component name from constants
+                    let chunk = self.chunk.as_ref().ok_or(RuntimeError::InvalidInstruction {
+                        message: "No chunk loaded".to_string(),
+                        location,
+                    })?;
+                    let comp_name = match chunk.constants.get(name_index) {
+                        Some(Value::Character(s)) => s.clone(),
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "StoreComponent expected string component name".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop the instance from stack
+                    let instance = self.pop(location)?;
+
+                    // Pop the value to store
+                    let value = self.pop(location)?;
+
+                    match instance {
+                        Value::Instance { type_index, mut components } => {
+                            // Get the type definition to find component index
+                            let chunk = self.chunk.as_ref().ok_or(RuntimeError::InvalidInstruction {
+                                message: "No chunk loaded".to_string(),
+                                location,
+                            })?;
+                            let type_def = chunk.get_type(type_index).ok_or(RuntimeError::TypeError {
+                                message: format!("Unknown type index: {}", type_index),
+                                location,
+                            })?;
+
+                            let comp_idx = type_def.component_index(&comp_name).ok_or(RuntimeError::TypeError {
+                                message: format!("Unknown component: {}", comp_name),
+                                location,
+                            })?;
+
+                            // Update the component
+                            if comp_idx < components.len() {
+                                components[comp_idx] = value;
+                            }
+
+                            // Push the modified instance back
+                            let new_instance = Value::Instance { type_index, components };
+                            self.push(new_instance, location)?;
+                        }
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "StoreComponent requires instance on stack".to_string(),
+                            location,
+                        }),
+                    }
+                    self.ip += 1;
+                }
             }
         }
 
@@ -1745,6 +1900,7 @@ impl VM {
             Value::Real(r) => *r != 0.0,
             Value::Character(s) => !s.is_empty(),
             Value::Array { elements, .. } => !elements.is_empty(),
+            Value::Instance { .. } => true, // Instances are always truthy
         }
     }
 
@@ -1755,6 +1911,7 @@ impl VM {
             Value::Logical(b) => if *b { 1.0 } else { 0.0 },
             Value::Character(_) => 0.0,
             Value::Array { .. } => 0.0, // Arrays can't be converted to real
+            Value::Instance { .. } => 0.0, // Instances can't be converted to real
         }
     }
 

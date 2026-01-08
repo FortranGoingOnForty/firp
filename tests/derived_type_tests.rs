@@ -1,8 +1,10 @@
-//! Tests for Fortran derived type parsing
+//! Tests for Fortran derived type parsing and execution
 
 use firp::ast::*;
+use firp::bytecode::Compiler;
 use firp::lexer::Lexer;
 use firp::parser::Parser;
+use firp::vm::VM;
 
 fn parse_module(source: &str) -> Result<ModuleDef, Box<dyn std::error::Error>> {
     let mut lexer = Lexer::new(source);
@@ -16,6 +18,26 @@ fn parse_program(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
     let tokens = lexer.tokenize()?;
     let mut parser = Parser::new(tokens);
     Ok(parser.parse_program()?)
+}
+
+fn compile_and_run(source: &str) -> Result<VM, String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
+
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().map_err(|e| format!("Parser error: {}", e))?;
+
+    let mut compiler = Compiler::new();
+    let chunk = compiler.compile(&program).map_err(|e| format!("Compile error: {}", e))?;
+
+    let mut vm = VM::new();
+    vm.run(chunk).map_err(|e| format!("Runtime error: {}", e))?;
+
+    Ok(vm)
+}
+
+fn get_output(vm: &VM) -> String {
+    vm.output().join("\n")
 }
 
 // =====================================================================
@@ -384,4 +406,122 @@ fn test_sprint14_parsing_success_criteria() {
 
     // Check for create_point function
     assert_eq!(module.procedures.len(), 1);
+}
+
+// =====================================================================
+// Execution Tests for Derived Types
+// =====================================================================
+
+#[test]
+fn test_execute_type_constructor() {
+    let source = r#"
+        PROGRAM test_constructor
+          IMPLICIT NONE
+          TYPE :: Point
+            REAL :: x
+            REAL :: y
+          END TYPE Point
+
+          TYPE(Point) :: p
+          p = Point(3.0, 4.0)
+          PRINT *, p%x
+          PRINT *, p%y
+        END PROGRAM test_constructor
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("3"), "Output should contain x value: {}", output);
+    assert!(output.contains("4"), "Output should contain y value: {}", output);
+}
+
+#[test]
+fn test_execute_component_assignment() {
+    let source = r#"
+        PROGRAM test_comp_assign
+          IMPLICIT NONE
+          TYPE :: Counter
+            INTEGER :: value
+          END TYPE Counter
+
+          TYPE(Counter) :: c
+          c%value = 42
+          PRINT *, c%value
+        END PROGRAM test_comp_assign
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("42"), "Output should contain 42: {}", output);
+}
+
+#[test]
+fn test_execute_component_in_expression() {
+    let source = r#"
+        PROGRAM test_expr
+          IMPLICIT NONE
+          TYPE :: Point
+            REAL :: x
+            REAL :: y
+          END TYPE Point
+
+          TYPE(Point) :: p
+          REAL :: sum
+          p = Point(10.0, 20.0)
+          sum = p%x + p%y
+          PRINT *, sum
+        END PROGRAM test_expr
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("30"), "Output should contain sum 30: {}", output);
+}
+
+#[test]
+fn test_execute_multiple_instances() {
+    let source = r#"
+        PROGRAM test_multi_inst
+          IMPLICIT NONE
+          TYPE :: Point
+            REAL :: x
+            REAL :: y
+          END TYPE Point
+
+          TYPE(Point) :: p1, p2
+          p1 = Point(1.0, 2.0)
+          p2 = Point(3.0, 4.0)
+          PRINT *, p1%x
+          PRINT *, p2%x
+        END PROGRAM test_multi_inst
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("1"), "Output should contain p1%x: {}", output);
+    assert!(output.contains("3"), "Output should contain p2%x: {}", output);
+}
+
+#[test]
+fn test_execute_modify_component() {
+    let source = r#"
+        PROGRAM test_modify
+          IMPLICIT NONE
+          TYPE :: Point
+            REAL :: x
+            REAL :: y
+          END TYPE Point
+
+          TYPE(Point) :: p
+          p = Point(1.0, 2.0)
+          p%x = 100.0
+          PRINT *, p%x
+          PRINT *, p%y
+        END PROGRAM test_modify
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("100"), "Output should contain modified x: {}", output);
+    assert!(output.contains("2"), "Output should contain original y: {}", output);
 }

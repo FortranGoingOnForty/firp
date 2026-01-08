@@ -118,6 +118,14 @@ pub enum OpCode {
     // Intrinsic function operations
     /// Call an intrinsic function (operand = Intrinsic enum value, expects args on stack)
     CallIntrinsic,
+
+    // Derived type operations
+    /// Create a new instance of a derived type (operand = type index)
+    CreateInstance,
+    /// Load component from instance (operand = component index, expects instance on stack)
+    LoadComponent,
+    /// Store value to component (operand = component index, expects value and instance on stack)
+    StoreComponent,
 }
 
 /// Intrinsic functions available in Fortran
@@ -343,6 +351,9 @@ impl fmt::Display for OpCode {
             OpCode::LoadArrayElem => write!(f, "LoadArrayElem"),
             OpCode::StoreArrayElem => write!(f, "StoreArrayElem"),
             OpCode::CallIntrinsic => write!(f, "CallIntrinsic"),
+            OpCode::CreateInstance => write!(f, "CreateInstance"),
+            OpCode::LoadComponent => write!(f, "LoadComponent"),
+            OpCode::StoreComponent => write!(f, "StoreComponent"),
         }
     }
 }
@@ -364,6 +375,36 @@ impl ArrayDim {
     }
 }
 
+/// Runtime derived type definition
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeTypeDef {
+    /// Type name
+    pub name: String,
+    /// Component names in order
+    pub components: Vec<String>,
+    /// Default values for each component (None if no default)
+    pub defaults: Vec<Option<Value>>,
+}
+
+impl RuntimeTypeDef {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            components: Vec::new(),
+            defaults: Vec::new(),
+        }
+    }
+
+    pub fn add_component(&mut self, name: String, default: Option<Value>) {
+        self.components.push(name);
+        self.defaults.push(default);
+    }
+
+    pub fn component_index(&self, name: &str) -> Option<usize> {
+        self.components.iter().position(|c| c == name)
+    }
+}
+
 /// Runtime value types
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -376,6 +417,13 @@ pub enum Value {
         elements: Vec<Value>,
         dims: Vec<ArrayDim>,
     },
+    /// Instance of a derived type
+    Instance {
+        /// Index into the type registry
+        type_index: usize,
+        /// Component values in order matching type definition
+        components: Vec<Value>,
+    },
 }
 
 impl Value {
@@ -386,6 +434,7 @@ impl Value {
             Value::Logical(_) => "LOGICAL",
             Value::Character(_) => "CHARACTER",
             Value::Array { .. } => "ARRAY",
+            Value::Instance { .. } => "DERIVED TYPE",
         }
     }
 
@@ -516,6 +565,16 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Instance { type_index, components } => {
+                write!(f, "Instance(type={}, ", type_index)?;
+                for (i, comp) in components.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", comp)?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -602,6 +661,10 @@ pub struct Chunk {
     pub variables: Vec<String>, // Variable names by index
     /// Procedure entry points (name -> instruction address)
     pub procedures: HashMap<String, usize>,
+    /// Derived type definitions
+    pub types: Vec<RuntimeTypeDef>,
+    /// Type name to index mapping
+    pub type_indices: HashMap<String, usize>,
 }
 
 impl Chunk {
@@ -663,6 +726,25 @@ impl Chunk {
     /// Get procedure entry address by name
     pub fn get_procedure_address(&self, name: &str) -> Option<usize> {
         self.procedures.get(name).copied()
+    }
+
+    /// Register a derived type definition
+    pub fn add_type(&mut self, type_def: RuntimeTypeDef) -> usize {
+        let name = type_def.name.clone();
+        let index = self.types.len();
+        self.types.push(type_def);
+        self.type_indices.insert(name, index);
+        index
+    }
+
+    /// Get type definition by name
+    pub fn get_type_index(&self, name: &str) -> Option<usize> {
+        self.type_indices.get(name).copied()
+    }
+
+    /// Get type definition by index
+    pub fn get_type(&self, index: usize) -> Option<&RuntimeTypeDef> {
+        self.types.get(index)
     }
 
     /// Patch a jump instruction with the actual target
@@ -946,9 +1028,13 @@ impl Compiler {
                 Declaration::ImplicitNone { .. } => {
                     // No symbol export needed
                 }
-                Declaration::DerivedType(_) => {
-                    // TODO: Register derived type definition
-                    // For now, just skip it
+                Declaration::DerivedType(type_def) => {
+                    // Register derived type definition
+                    let mut runtime_type = RuntimeTypeDef::new(type_def.name.clone());
+                    for component in &type_def.components {
+                        runtime_type.add_component(component.name.clone(), None);
+                    }
+                    self.chunk.add_type(runtime_type);
                 }
             }
         }
@@ -1191,7 +1277,7 @@ impl Compiler {
     /// Compile a declaration
     fn compile_declaration(&mut self, decl: &Declaration) -> CompileResult<()> {
         match decl {
-            Declaration::Variable { entities, location, .. } => {
+            Declaration::Variable { type_spec, entities, location, .. } => {
                 for entity in entities {
                     // Allocate variable slot
                     let var_index = self.chunk.add_variable(entity.name.clone());
@@ -1225,8 +1311,30 @@ impl Compiler {
                         self.compile_expression(init_expr)?;
                         self.chunk
                             .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                    } else if let TypeSpec::Derived { name, .. } = type_spec {
+                        // Derived type without initialization - create a default instance
+                        if let Some(type_index) = self.chunk.get_type_index(name) {
+                            // Get the number of components
+                            let num_components = self.chunk.types[type_index].components.len();
+
+                            // Push default values (0) for each component
+                            for _ in 0..num_components {
+                                let zero_idx = self.chunk.add_constant(Value::Integer(0));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                            }
+
+                            // Push argument count
+                            let count_idx = self.chunk.add_constant(Value::Integer(num_components as i64));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                            // Create the instance
+                            self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
+
+                            // Store to variable
+                            self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                        }
                     }
-                    // Scalars without initialization don't need bytecode
+                    // Primitive scalars without initialization don't need bytecode
                 }
                 Ok(())
             }
@@ -1242,9 +1350,16 @@ impl Compiler {
                     .emit_with_operand(OpCode::StoreVar, var_index, *location);
                 Ok(())
             }
-            Declaration::DerivedType(_) => {
-                // TODO: Store derived type definition for later use
-                // For now, no bytecode needed
+            Declaration::DerivedType(type_def) => {
+                // Register the derived type definition
+                let mut runtime_type = RuntimeTypeDef::new(type_def.name.clone());
+
+                for component in &type_def.components {
+                    // Add component with its name (defaults are not supported yet)
+                    runtime_type.add_component(component.name.clone(), None);
+                }
+
+                self.chunk.add_type(runtime_type);
                 Ok(())
             }
         }
@@ -1253,8 +1368,33 @@ impl Compiler {
     /// Compile a statement
     fn compile_statement(&mut self, stmt: &Statement) -> CompileResult<()> {
         match stmt {
-            Statement::Assignment { target, indices, value, location, .. } => {
-                if let Some(idx_exprs) = indices {
+            Statement::Assignment { target, indices, components, value, location } => {
+                if !components.is_empty() {
+                    // Component assignment: obj%comp = value or obj%comp1%comp2 = value
+                    // Compile the value first
+                    self.compile_expression(value)?;
+
+                    // Load the base object
+                    let var_index = self.chunk.add_variable(target.clone());
+                    self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+
+                    // For chained access like obj%a%b, we need to navigate to the parent
+                    // and store in the final component
+                    for (i, comp) in components.iter().enumerate() {
+                        if i < components.len() - 1 {
+                            // Navigate to intermediate component
+                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
+                            self.chunk.emit_with_operand(OpCode::LoadComponent, comp_idx, *location);
+                        } else {
+                            // Store into final component
+                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
+                            self.chunk.emit_with_operand(OpCode::StoreComponent, comp_idx, *location);
+                        }
+                    }
+
+                    // Store the modified instance back
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                } else if let Some(idx_exprs) = indices {
                     // Array element assignment: arr(i, j, ...) = value
                     // Stack order for StoreArrayElem: value, index1, index2, ..., num_indices (top)
 
@@ -1961,6 +2101,22 @@ impl Compiler {
 
                     // Emit LoadArrayElem
                     self.chunk.emit_with_operand(OpCode::LoadArrayElem, var_index, *location);
+                } else if self.chunk.get_type_index(name).is_some() {
+                    // This is a type constructor (structure constructor)
+                    let type_index = self.chunk.get_type_index(name).unwrap();
+
+                    // Push all arguments (component values) onto the stack
+                    for arg in arguments {
+                        self.compile_expression(arg)?;
+                    }
+
+                    // Push number of arguments
+                    let arg_count = arguments.len();
+                    let count_idx = self.chunk.add_constant(Value::Integer(arg_count as i64));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                    // Emit CreateInstance with type index
+                    self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
                 } else {
                     // Unknown identifier - could be a function not yet compiled or an error
                     return Err(CompileError::InvalidOperation {
@@ -1992,27 +2148,39 @@ impl Compiler {
             }
 
             Expr::ComponentAccess { object, component, location } => {
-                // TODO: Full implementation - compile object, then access component
-                // For now, this is a placeholder that will error at runtime
+                // Compile the object expression (puts instance on stack)
                 self.compile_expression(object)?;
-                // We'd need a LoadComponent opcode and component index
-                // For now, emit a placeholder error
-                return Err(CompileError::InvalidOperation {
-                    message: format!("Component access '%{}' not yet implemented", component),
-                    location: *location,
-                });
+
+                // Store component name as constant for runtime lookup
+                let comp_idx = self.chunk.add_constant(Value::Character(component.clone()));
+
+                // Emit LoadComponent with component name index
+                self.chunk.emit_with_operand(OpCode::LoadComponent, comp_idx, *location);
+                Ok(())
             }
 
             Expr::TypeConstructor { type_name, arguments, location } => {
-                // TODO: Full implementation - create derived type instance
-                // For now, compile arguments but error out
+                // Look up the type definition
+                let type_index = self.chunk.get_type_index(type_name).ok_or_else(|| {
+                    CompileError::InvalidOperation {
+                        message: format!("Unknown derived type: {}", type_name),
+                        location: *location,
+                    }
+                })?;
+
+                // Push all arguments (component values) onto the stack
                 for arg in arguments {
                     self.compile_expression(arg)?;
                 }
-                return Err(CompileError::InvalidOperation {
-                    message: format!("Type constructor '{}' not yet implemented", type_name),
-                    location: *location,
-                });
+
+                // Push number of arguments
+                let arg_count = arguments.len();
+                let count_idx = self.chunk.add_constant(Value::Integer(arg_count as i64));
+                self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                // Emit CreateInstance with type index
+                self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
+                Ok(())
             }
         }
     }
