@@ -5,6 +5,7 @@
 pub mod lexer;
 pub mod parser;
 pub mod ast;
+pub mod semantic;
 pub mod bytecode;
 pub mod vm;
 pub mod runtime;
