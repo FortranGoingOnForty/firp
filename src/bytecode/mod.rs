@@ -934,6 +934,8 @@ pub struct ModuleRegistry {
     modules: HashMap<String, Vec<ModuleSymbol>>,
     /// Map of module name -> operator interfaces (operator key -> procedure names)
     module_interfaces: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Map of module name -> generic interfaces (generic name -> procedure names)
+    module_generic_interfaces: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl ModuleRegistry {
@@ -966,6 +968,16 @@ impl ModuleRegistry {
     /// Get operator interfaces from a module
     pub fn get_module_interfaces(&self, module_name: &str) -> Option<&HashMap<String, Vec<String>>> {
         self.module_interfaces.get(module_name)
+    }
+
+    /// Register generic interfaces for a module
+    pub fn register_generic_interfaces(&mut self, module_name: String, interfaces: HashMap<String, Vec<String>>) {
+        self.module_generic_interfaces.insert(module_name, interfaces);
+    }
+
+    /// Get generic interfaces from a module
+    pub fn get_module_generic_interfaces(&self, module_name: &str) -> Option<&HashMap<String, Vec<String>>> {
+        self.module_generic_interfaces.get(module_name)
     }
 }
 
@@ -1103,6 +1115,14 @@ impl Compiler {
             );
         }
 
+        // Register module generic interfaces
+        if !self.chunk.generic_interfaces.is_empty() {
+            self.module_registry.register_generic_interfaces(
+                module.name.clone(),
+                self.chunk.generic_interfaces.clone()
+            );
+        }
+
         Ok(())
     }
 
@@ -1194,6 +1214,18 @@ impl Compiler {
                 for proc_name in proc_names {
                     self.chunk.operator_interfaces
                         .entry(op_key.clone())
+                        .or_insert_with(Vec::new)
+                        .push(proc_name);
+                }
+            }
+        }
+
+        // Import generic interfaces from the module
+        if let Some(interfaces) = self.module_registry.get_module_generic_interfaces(&use_stmt.module_name).cloned() {
+            for (generic_name, proc_names) in interfaces {
+                for proc_name in proc_names {
+                    self.chunk.generic_interfaces
+                        .entry(generic_name.clone())
                         .or_insert_with(Vec::new)
                         .push(proc_name);
                 }
@@ -2246,6 +2278,31 @@ impl Compiler {
                     // Emit call instruction with function address
                     // The function will leave its return value on the stack
                     self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                } else if let Some(procedures) = self.chunk.generic_interfaces.get(name).cloned() {
+                    // This is a generic interface call
+                    // For now, we use the first registered procedure
+                    // (proper type-based resolution would require type inference)
+                    if let Some(proc_name) = procedures.first() {
+                        // Compile arguments
+                        for arg in arguments {
+                            self.compile_expression(arg)?;
+                        }
+
+                        // Look up the specific procedure address
+                        if let Some(func_address) = self.chunk.get_procedure_address(proc_name) {
+                            self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                        } else {
+                            return Err(CompileError::InvalidOperation {
+                                message: format!("Procedure {} for generic interface {} not found", proc_name, name),
+                                location: *location,
+                            });
+                        }
+                    } else {
+                        return Err(CompileError::InvalidOperation {
+                            message: format!("No procedures registered for generic interface {}", name),
+                            location: *location,
+                        });
+                    }
                 } else if self.chunk.has_variable(name) {
                     // This is array access (variable exists but not a procedure)
                     // Push each index FIRST

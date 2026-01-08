@@ -670,3 +670,78 @@ fn test_execute_operator_overloading() {
     assert!(output.contains("4"), "Output should contain v3%x = 4: {}", output);
     assert!(output.contains("6"), "Output should contain v3%y = 6: {}", output);
 }
+
+#[test]
+fn test_parse_generic_interface() {
+    let source = r#"
+        MODULE math_ops
+          IMPLICIT NONE
+
+          INTERFACE add
+            MODULE PROCEDURE add_int
+            MODULE PROCEDURE add_real
+          END INTERFACE add
+
+        CONTAINS
+
+          FUNCTION add_int(a, b) RESULT(c)
+            INTEGER :: a, b, c
+            c = a + b
+          END FUNCTION add_int
+
+          FUNCTION add_real(x, y) RESULT(z)
+            REAL :: x, y, z
+            z = x + y
+          END FUNCTION add_real
+
+        END MODULE math_ops
+    "#;
+
+    let module = parse_module(source).expect("Should parse successfully");
+    assert_eq!(module.name, "MATH_OPS");
+
+    // Check for the generic interface declaration
+    let interface = module.declarations.iter()
+        .find_map(|d| match d {
+            Declaration::Interface(i) => Some(i),
+            _ => None,
+        })
+        .expect("Should have an interface declaration");
+
+    match &interface.kind {
+        InterfaceKind::Generic(name) => assert_eq!(name, "ADD"),
+        _ => panic!("Expected Generic interface"),
+    }
+    assert_eq!(interface.procedures.len(), 2);
+}
+
+#[test]
+fn test_execute_generic_interface() {
+    let source = r#"
+        PROGRAM test_generic
+          IMPLICIT NONE
+
+          INTERFACE add
+            MODULE PROCEDURE add_int
+          END INTERFACE add
+
+          INTEGER :: x, y, result
+          x = 10
+          y = 20
+          result = add(x, y)
+          PRINT *, result
+
+        CONTAINS
+
+          FUNCTION add_int(a, b) RESULT(c)
+            INTEGER :: a, b, c
+            c = a + b
+          END FUNCTION add_int
+
+        END PROGRAM test_generic
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("30"), "Output should contain 30: {}", output);
+}
