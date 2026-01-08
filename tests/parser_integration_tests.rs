@@ -570,3 +570,190 @@ fn test_parse_array_with_negative_lower_bound() {
         panic!("Expected Variable declaration");
     }
 }
+
+// Sprint 10: I/O Tests
+
+#[test]
+fn test_parse_write_statement_simple() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          x = 42
+          write(*, *) x
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    assert_eq!(program.statements.len(), 2);
+
+    match &program.statements[1] {
+        Statement::Write { unit, format, values, .. } => {
+            assert!(unit.is_none()); // * means stdout
+            assert!(matches!(format, Some(FormatSpec::ListDirected)));
+            assert_eq!(values.len(), 1);
+        }
+        _ => panic!("Expected Write statement"),
+    }
+}
+
+#[test]
+fn test_parse_write_statement_with_format() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          write(*, '(I5)') x
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Write { format, .. } => {
+            assert!(matches!(format, Some(FormatSpec::String(s)) if s == "(I5)"));
+        }
+        _ => panic!("Expected Write statement"),
+    }
+}
+
+#[test]
+fn test_parse_write_statement_with_unit() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          write(10, *) x
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Write { unit, format, .. } => {
+            assert!(unit.is_some());
+            if let Some(Expr::IntegerLiteral(n, _)) = unit {
+                assert_eq!(*n, 10);
+            } else {
+                panic!("Expected integer literal for unit");
+            }
+            assert!(matches!(format, Some(FormatSpec::ListDirected)));
+        }
+        _ => panic!("Expected Write statement"),
+    }
+}
+
+#[test]
+fn test_parse_read_statement() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x, y
+          read(*, *) x, y
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Read { unit, format, variables, .. } => {
+            assert!(unit.is_none()); // * means stdin
+            assert!(matches!(format, Some(FormatSpec::ListDirected)));
+            assert_eq!(variables.len(), 2);
+            assert_eq!(variables[0], "X");
+            assert_eq!(variables[1], "Y");
+        }
+        _ => panic!("Expected Read statement"),
+    }
+}
+
+#[test]
+fn test_parse_open_statement() {
+    let source = r#"
+        program test
+          implicit none
+          open(unit=10, file='data.txt', status='old')
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Open { unit, file, status, .. } => {
+            if let Expr::IntegerLiteral(n, _) = unit {
+                assert_eq!(*n, 10);
+            } else {
+                panic!("Expected integer literal for unit");
+            }
+            assert!(file.is_some());
+            assert_eq!(status.as_deref(), Some("old"));
+        }
+        _ => panic!("Expected Open statement"),
+    }
+}
+
+#[test]
+fn test_parse_close_statement() {
+    let source = r#"
+        program test
+          implicit none
+          close(10)
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Close { unit, .. } => {
+            if let Expr::IntegerLiteral(n, _) = unit {
+                assert_eq!(*n, 10);
+            } else {
+                panic!("Expected integer literal for unit");
+            }
+        }
+        _ => panic!("Expected Close statement"),
+    }
+}
+
+#[test]
+fn test_parse_write_with_multiple_values() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: a, b, c
+          write(*, *) a, b, c
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Write { values, .. } => {
+            assert_eq!(values.len(), 3);
+        }
+        _ => panic!("Expected Write statement"),
+    }
+}
+
+#[test]
+fn test_parse_open_with_action() {
+    let source = r#"
+        program test
+          implicit none
+          open(unit=20, file='output.txt', status='new', action='write')
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    match &program.statements[0] {
+        Statement::Open { unit, status, action, .. } => {
+            if let Expr::IntegerLiteral(n, _) = unit {
+                assert_eq!(*n, 20);
+            }
+            assert_eq!(status.as_deref(), Some("new"));
+            assert_eq!(action.as_deref(), Some("write"));
+        }
+        _ => panic!("Expected Open statement"),
+    }
+}

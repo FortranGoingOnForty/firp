@@ -266,6 +266,12 @@ impl Lexer {
             "KIND" => TokenType::Kind,
             "STAT" => TokenType::Stat,
             "OPTIONAL" => TokenType::Optional,
+            "UNIT" => TokenType::Unit,
+            "FILE" => TokenType::File,
+            "STATUS" => TokenType::Status,
+            "ACTION" => TokenType::Action,
+            "IOSTAT" => TokenType::Iostat,
+            "IOMSG" => TokenType::Iomsg,
             _ => TokenType::Identifier(ident.to_string()),
         }
     }

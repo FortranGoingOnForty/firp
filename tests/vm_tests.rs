@@ -6,6 +6,10 @@ use firp::parser::Parser;
 use firp::vm::VM;
 
 fn compile_and_run(source: &str) -> Result<VM, String> {
+    compile_and_run_with_input(source, vec![])
+}
+
+fn compile_and_run_with_input(source: &str, input: Vec<String>) -> Result<VM, String> {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
 
@@ -16,6 +20,7 @@ fn compile_and_run(source: &str) -> Result<VM, String> {
     let chunk = compiler.compile(&program).map_err(|e| format!("Compile error: {}", e))?;
 
     let mut vm = VM::new();
+    vm.set_input(input);
     vm.run(chunk).map_err(|e| format!("Runtime error: {}", e))?;
 
     Ok(vm)
@@ -1128,4 +1133,200 @@ fn test_sprint09_success_criteria() {
     let vm = compile_and_run(source).expect("Should run successfully");
     // Sum of squares: 1+4+9+16+25+36+49+64+81+100 = 385
     assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(385)));
+}
+
+// Sprint 10: I/O Tests
+
+#[test]
+fn test_write_statement_simple() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          x = 42
+          write(*, *) x
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // WRITE(*, *) outputs to the same buffer as PRINT
+    assert_eq!(vm.output().len(), 1);
+    assert_eq!(vm.output()[0], "42");
+}
+
+#[test]
+fn test_write_statement_multiple_values() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: a, b, c
+          a = 1
+          b = 2
+          c = 3
+          write(*, *) a, b, c
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.output().len(), 1);
+    assert_eq!(vm.output()[0], "1 2 3");
+}
+
+#[test]
+fn test_read_statement() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          read(*, *) x
+        end program test
+    "#;
+
+    // Provide input via input buffer
+    let vm = compile_and_run_with_input(source, vec!["42".to_string()])
+        .expect("Should run successfully");
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(42)));
+}
+
+#[test]
+fn test_read_multiple_values() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x, y
+          read(*, *) x
+          read(*, *) y
+        end program test
+    "#;
+
+    let vm = compile_and_run_with_input(source, vec!["10".to_string(), "20".to_string()])
+        .expect("Should run successfully");
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(10)));
+    assert_eq!(vm.get_variable("Y"), Some(&firp::bytecode::Value::Integer(20)));
+}
+
+#[test]
+fn test_read_real_value() {
+    let source = r#"
+        program test
+          implicit none
+          real :: x
+          read(*, *) x
+        end program test
+    "#;
+
+    let vm = compile_and_run_with_input(source, vec!["3.14".to_string()])
+        .expect("Should run successfully");
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Real(3.14)));
+}
+
+#[test]
+fn test_sprint10_io_success_criteria() {
+    // Sprint 10 success criteria: Basic I/O operations
+    let source = r#"
+        PROGRAM io_test
+          IMPLICIT NONE
+          INTEGER :: x, y
+
+          x = 100
+          y = 200
+
+          ! WRITE statement (to stdout)
+          WRITE(*, *) x, y
+
+        END PROGRAM io_test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.output().len(), 1);
+    assert_eq!(vm.output()[0], "100 200");
+}
+
+#[test]
+fn test_read_logical_values() {
+    let source = r#"
+        program test
+          implicit none
+          logical :: flag
+          read(*, *) flag
+        end program test
+    "#;
+
+    // Test .TRUE. format
+    let vm = compile_and_run_with_input(source, vec![".TRUE.".to_string()])
+        .expect("Should run successfully");
+    assert_eq!(vm.get_variable("FLAG"), Some(&firp::bytecode::Value::Logical(true)));
+}
+
+#[test]
+fn test_read_and_compute() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: a, b, sum
+          read(*, *) a
+          read(*, *) b
+          sum = a + b
+        end program test
+    "#;
+
+    let vm = compile_and_run_with_input(source, vec!["15".to_string(), "27".to_string()])
+        .expect("Should run successfully");
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(42)));
+}
+
+#[test]
+fn test_write_expressions() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: x
+          x = 5
+          write(*, *) x * 2, x + 10
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.output().len(), 1);
+    assert_eq!(vm.output()[0], "10 15");
+}
+
+#[test]
+fn test_multiple_write_statements() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i
+          do i = 1, 3
+            write(*, *) i
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.output().len(), 3);
+    assert_eq!(vm.output()[0], "1");
+    assert_eq!(vm.output()[1], "2");
+    assert_eq!(vm.output()[2], "3");
+}
+
+#[test]
+fn test_read_in_loop() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: i, total, val
+          total = 0
+          do i = 1, 3
+            read(*, *) val
+            total = total + val
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run_with_input(
+        source,
+        vec!["10".to_string(), "20".to_string(), "30".to_string()]
+    ).expect("Should run successfully");
+    assert_eq!(vm.get_variable("TOTAL"), Some(&firp::bytecode::Value::Integer(60)));
 }

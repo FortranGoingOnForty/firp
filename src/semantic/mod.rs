@@ -978,6 +978,43 @@ impl SemanticAnalyzer {
                 }
                 Ok(())
             }
+
+            Statement::Write { values, unit, .. } => {
+                // Type check unit expression if present
+                if let Some(u) = unit {
+                    self.check_expression(u)?;
+                }
+                // Type check all output expressions
+                for expr in values {
+                    self.check_expression(expr)?;
+                }
+                Ok(())
+            }
+
+            Statement::Read { unit, .. } => {
+                // Type check unit expression if present
+                if let Some(u) = unit {
+                    self.check_expression(u)?;
+                }
+                // TODO: Check that variables exist and are not constants
+                Ok(())
+            }
+
+            Statement::Open { unit, file, .. } => {
+                // Type check unit expression
+                self.check_expression(unit)?;
+                // Type check file expression if present
+                if let Some(f) = file {
+                    self.check_expression(f)?;
+                }
+                Ok(())
+            }
+
+            Statement::Close { unit, .. } => {
+                // Type check unit expression
+                self.check_expression(unit)?;
+                Ok(())
+            }
         }
     }
 

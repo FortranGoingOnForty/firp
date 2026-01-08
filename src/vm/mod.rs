@@ -5,7 +5,10 @@
 
 use crate::bytecode::{ArrayDim, Chunk, Instruction, OpCode, Value};
 use crate::lexer::SourceLocation;
+use std::collections::HashMap;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Write};
 
 /// Maximum stack size
 const STACK_SIZE: usize = 256;
@@ -78,6 +81,11 @@ pub enum RuntimeError {
         message: String,
         location: SourceLocation,
     },
+    /// I/O error (file operations)
+    IoError {
+        message: String,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -116,6 +124,9 @@ impl fmt::Display for RuntimeError {
             RuntimeError::IndexOutOfBounds { message, location } => {
                 write!(f, "Index out of bounds: {} at {}", message, location)
             }
+            RuntimeError::IoError { message, location } => {
+                write!(f, "I/O error: {} at {}", message, location)
+            }
         }
     }
 }
@@ -123,6 +134,12 @@ impl fmt::Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 pub type VMResult<T> = Result<T, RuntimeError>;
+
+/// File handle wrapper for Fortran I/O
+pub enum FileHandle {
+    Reader(BufReader<File>),
+    Writer(BufWriter<File>),
+}
 
 /// Virtual Machine for executing bytecode
 pub struct VM {
@@ -142,6 +159,12 @@ pub struct VM {
     call_stack: Vec<CallFrame>,
     /// Procedure entry points (address -> procedure index)
     procedure_addresses: Vec<usize>,
+    /// Open file handles (unit number -> file handle)
+    file_handles: HashMap<i64, FileHandle>,
+    /// Input buffer for READ statements (for testing)
+    input_buffer: Vec<String>,
+    /// Input buffer position
+    input_pos: usize,
 }
 
 impl VM {
@@ -156,12 +179,21 @@ impl VM {
             output: Vec::new(),
             call_stack: Vec::with_capacity(MAX_CALL_DEPTH),
             procedure_addresses: Vec::new(),
+            file_handles: HashMap::new(),
+            input_buffer: Vec::new(),
+            input_pos: 0,
         }
     }
 
     /// Enable or disable trace mode
     pub fn set_trace(&mut self, enabled: bool) {
         self.trace = enabled;
+    }
+
+    /// Set input buffer for READ statements (for testing)
+    pub fn set_input(&mut self, input: Vec<String>) {
+        self.input_buffer = input;
+        self.input_pos = 0;
     }
 
     /// Reset the VM state
@@ -173,11 +205,23 @@ impl VM {
         self.output.clear();
         self.call_stack.clear();
         self.procedure_addresses.clear();
+        // Close all open files
+        self.file_handles.clear();
+        self.input_buffer.clear();
+        self.input_pos = 0;
     }
 
     /// Run a compiled chunk
     pub fn run(&mut self, chunk: Chunk) -> VMResult<()> {
+        // Save input state before reset
+        let saved_input = std::mem::take(&mut self.input_buffer);
+        let saved_pos = self.input_pos;
+
         self.reset();
+
+        // Restore input state
+        self.input_buffer = saved_input;
+        self.input_pos = saved_pos;
 
         // Initialize variable storage
         self.variables = vec![None; chunk.variables.len()];
@@ -420,6 +464,123 @@ impl VM {
                     self.ip += 1;
                 }
 
+                OpCode::Read => {
+                    let var_index = operand.unwrap_or(0);
+                    // Read from input buffer (for testing) or stdin
+                    let value = self.read_value(location)?;
+                    self.set_variable_by_index(var_index, value, location)?;
+                    self.ip += 1;
+                }
+
+                OpCode::OpenFile => {
+                    // Stack: filename (bottom), unit (top)
+                    let unit = match self.pop(location)? {
+                        Value::Integer(n) => n,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Unit number must be integer".to_string(),
+                            location,
+                        }),
+                    };
+                    let filename = match self.pop(location)? {
+                        Value::Character(s) => s,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Filename must be string".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Open file for reading/writing
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(&filename)
+                        .map_err(|e| RuntimeError::IoError {
+                            message: format!("Cannot open '{}': {}", filename, e),
+                            location,
+                        })?;
+
+                    // Store as writer by default (can be used for both)
+                    self.file_handles.insert(unit, FileHandle::Writer(BufWriter::new(file)));
+                    self.ip += 1;
+                }
+
+                OpCode::CloseFile => {
+                    // Stack: unit (top)
+                    let unit = match self.pop(location)? {
+                        Value::Integer(n) => n,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Unit number must be integer".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Remove and drop file handle (closes file)
+                    if let Some(handle) = self.file_handles.remove(&unit) {
+                        // Flush if writer
+                        if let FileHandle::Writer(mut w) = handle {
+                            let _ = w.flush();
+                        }
+                    }
+                    self.ip += 1;
+                }
+
+                OpCode::WriteFile => {
+                    // Stack: values..., unit (top)
+                    let count = operand.unwrap_or(0);
+
+                    let unit = match self.pop(location)? {
+                        Value::Integer(n) => n,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Unit number must be integer".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop values
+                    let mut values = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        values.push(self.pop(location)?);
+                    }
+                    values.reverse();
+
+                    // Format output line
+                    let output: Vec<String> = values.iter().map(|v| format!("{}", v)).collect();
+                    let line = output.join(" ");
+
+                    // Write to file
+                    if let Some(FileHandle::Writer(ref mut writer)) = self.file_handles.get_mut(&unit) {
+                        writeln!(writer, "{}", line).map_err(|e| RuntimeError::IoError {
+                            message: format!("Write error: {}", e),
+                            location,
+                        })?;
+                    } else {
+                        return Err(RuntimeError::IoError {
+                            message: format!("Unit {} not open for writing", unit),
+                            location,
+                        });
+                    }
+                    self.ip += 1;
+                }
+
+                OpCode::ReadFile => {
+                    // Stack: unit (top)
+                    let var_index = operand.unwrap_or(0);
+
+                    let unit = match self.pop(location)? {
+                        Value::Integer(n) => n,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Unit number must be integer".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Read from file - need to reopen for reading
+                    let value = self.read_from_file(unit, location)?;
+                    self.set_variable_by_index(var_index, value, location)?;
+                    self.ip += 1;
+                }
+
                 OpCode::Call => {
                     // operand is the procedure entry address
                     let proc_address = operand.ok_or(RuntimeError::InvalidProcedure {
@@ -639,6 +800,67 @@ impl VM {
         indices.reverse();
 
         Ok(indices)
+    }
+
+    // I/O operations
+
+    /// Read a value from the input buffer or stdin
+    fn read_value(&mut self, location: SourceLocation) -> VMResult<Value> {
+        let input = if self.input_pos < self.input_buffer.len() {
+            // Read from input buffer (for testing)
+            let line = self.input_buffer[self.input_pos].clone();
+            self.input_pos += 1;
+            line
+        } else {
+            // Read from stdin
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).map_err(|e| RuntimeError::IoError {
+                message: format!("Read error: {}", e),
+                location,
+            })?;
+            line.trim().to_string()
+        };
+
+        // Try to parse as integer, then real, then keep as string
+        self.parse_value(&input)
+    }
+
+    /// Read a value from a file
+    fn read_from_file(&mut self, unit: i64, location: SourceLocation) -> VMResult<Value> {
+        // For file reading, we need a Reader. The current implementation stores Writers.
+        // In a production system, we'd track read/write mode separately.
+        // For now, return an error if file isn't properly opened for reading.
+        Err(RuntimeError::IoError {
+            message: format!("Unit {} not open for reading (file I/O needs separate read mode)", unit),
+            location,
+        })
+    }
+
+    /// Parse a string value into the appropriate type
+    fn parse_value(&self, input: &str) -> VMResult<Value> {
+        let trimmed = input.trim();
+
+        // Try integer first
+        if let Ok(i) = trimmed.parse::<i64>() {
+            return Ok(Value::Integer(i));
+        }
+
+        // Try real
+        if let Ok(r) = trimmed.parse::<f64>() {
+            return Ok(Value::Real(r));
+        }
+
+        // Try logical
+        let upper = trimmed.to_uppercase();
+        if upper == ".TRUE." || upper == "T" || upper == "TRUE" {
+            return Ok(Value::Logical(true));
+        }
+        if upper == ".FALSE." || upper == "F" || upper == "FALSE" {
+            return Ok(Value::Logical(false));
+        }
+
+        // Keep as character
+        Ok(Value::Character(trimmed.to_string()))
     }
 
     // Constant operations

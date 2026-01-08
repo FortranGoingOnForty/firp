@@ -255,6 +255,59 @@ pub enum Statement {
         value: Option<Expr>,
         location: SourceLocation,
     },
+    /// WRITE statement: WRITE(unit, fmt) values
+    Write {
+        /// Unit number (None = stdout, Some(expr) = file unit)
+        unit: Option<Expr>,
+        /// Format specification (None = list-directed)
+        format: Option<FormatSpec>,
+        /// Values to write
+        values: Vec<Expr>,
+        location: SourceLocation,
+    },
+    /// READ statement: READ(unit, fmt) variables
+    Read {
+        /// Unit number (None = stdin, Some(expr) = file unit)
+        unit: Option<Expr>,
+        /// Format specification (None = list-directed)
+        format: Option<FormatSpec>,
+        /// Variables to read into
+        variables: Vec<String>,
+        location: SourceLocation,
+    },
+    /// OPEN statement: OPEN(UNIT=n, FILE='name', ...)
+    Open {
+        /// Unit number
+        unit: Expr,
+        /// File name
+        file: Option<Expr>,
+        /// STATUS: OLD, NEW, REPLACE, SCRATCH, UNKNOWN
+        status: Option<String>,
+        /// ACTION: READ, WRITE, READWRITE
+        action: Option<String>,
+        /// IOSTAT variable for error code
+        iostat: Option<String>,
+        location: SourceLocation,
+    },
+    /// CLOSE statement: CLOSE(UNIT=n)
+    Close {
+        /// Unit number
+        unit: Expr,
+        /// IOSTAT variable for error code
+        iostat: Option<String>,
+        location: SourceLocation,
+    },
+}
+
+/// Format specification for I/O
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatSpec {
+    /// List-directed (free format): *
+    ListDirected,
+    /// Inline format string: '(I5, F10.2)'
+    String(String),
+    /// Label reference to FORMAT statement
+    Label(i64),
 }
 
 /// Case clause for SELECT CASE

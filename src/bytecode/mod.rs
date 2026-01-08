@@ -82,8 +82,18 @@ pub enum OpCode {
     Dup,
 
     // I/O operations
-    /// Print values
+    /// Print values to stdout (operand = count of values)
     Print,
+    /// Read value from stdin into variable (operand = variable index)
+    Read,
+    /// Open a file (operand = unit number, expects filename on stack)
+    OpenFile,
+    /// Close a file (operand = unit number)
+    CloseFile,
+    /// Write values to file (operand = count of values, expects unit on stack)
+    WriteFile,
+    /// Read value from file into variable (operand = variable index, expects unit on stack)
+    ReadFile,
 
     // Program control
     /// Halt execution
@@ -137,6 +147,11 @@ impl fmt::Display for OpCode {
             OpCode::Pop => write!(f, "Pop"),
             OpCode::Dup => write!(f, "Dup"),
             OpCode::Print => write!(f, "Print"),
+            OpCode::Read => write!(f, "Read"),
+            OpCode::OpenFile => write!(f, "OpenFile"),
+            OpCode::CloseFile => write!(f, "CloseFile"),
+            OpCode::WriteFile => write!(f, "WriteFile"),
+            OpCode::ReadFile => write!(f, "ReadFile"),
             OpCode::Halt => write!(f, "Halt"),
             OpCode::Nop => write!(f, "Nop"),
             OpCode::Call => write!(f, "Call"),
@@ -520,7 +535,7 @@ impl Chunk {
                             format!("{:4}", op)
                         }
                     }
-                    OpCode::LoadVar | OpCode::StoreVar => {
+                    OpCode::LoadVar | OpCode::StoreVar | OpCode::Read => {
                         if let Some(name) = self.variables.get(op) {
                             format!("{:4} ; {}", op, name)
                         } else {
@@ -947,6 +962,81 @@ impl Compiler {
 
                 // Emit return instruction
                 self.chunk.emit(OpCode::Return, *location);
+                Ok(())
+            }
+
+            Statement::Write { unit, values, location, .. } => {
+                match unit {
+                    None => {
+                        // WRITE(*, *) - write to stdout (same as PRINT)
+                        for value in values {
+                            self.compile_expression(value)?;
+                        }
+                        self.chunk
+                            .emit_with_operand(OpCode::Print, values.len(), *location);
+                    }
+                    Some(unit_expr) => {
+                        // WRITE(unit, *) - write to file
+                        // First compile and push all values
+                        for value in values {
+                            self.compile_expression(value)?;
+                        }
+                        // Then compile unit expression (pushed last, on top)
+                        self.compile_expression(unit_expr)?;
+                        // Emit WriteFile with value count
+                        self.chunk
+                            .emit_with_operand(OpCode::WriteFile, values.len(), *location);
+                    }
+                }
+                Ok(())
+            }
+
+            Statement::Read { unit, variables, location, .. } => {
+                match unit {
+                    None => {
+                        // READ(*, *) - read from stdin
+                        for var_name in variables {
+                            let var_index = self.chunk.add_variable(var_name.clone());
+                            self.chunk.emit_with_operand(OpCode::Read, var_index, *location);
+                        }
+                    }
+                    Some(unit_expr) => {
+                        // READ(unit, *) - read from file
+                        for var_name in variables {
+                            // Push unit expression for each read
+                            self.compile_expression(unit_expr)?;
+                            let var_index = self.chunk.add_variable(var_name.clone());
+                            self.chunk.emit_with_operand(OpCode::ReadFile, var_index, *location);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            Statement::Open { unit, file, location, .. } => {
+                // Push filename if provided, otherwise empty string
+                if let Some(file_expr) = file {
+                    self.compile_expression(file_expr)?;
+                } else {
+                    // No filename - push empty string (scratch file)
+                    let idx = self.chunk.add_constant(Value::Character(String::new()));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, idx, *location);
+                }
+
+                // Compile unit expression to get the unit number
+                self.compile_expression(unit)?;
+
+                // Emit OpenFile
+                self.chunk.emit(OpCode::OpenFile, *location);
+                Ok(())
+            }
+
+            Statement::Close { unit, location, .. } => {
+                // Compile unit expression
+                self.compile_expression(unit)?;
+
+                // Emit CloseFile
+                self.chunk.emit(OpCode::CloseFile, *location);
                 Ok(())
             }
         }

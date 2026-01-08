@@ -614,6 +614,26 @@ impl Parser {
             return self.parse_print_statement();
         }
 
+        // WRITE statement
+        if self.check(&TokenType::Write) {
+            return self.parse_write_statement();
+        }
+
+        // READ statement
+        if self.check(&TokenType::Read) {
+            return self.parse_read_statement();
+        }
+
+        // OPEN statement
+        if self.check(&TokenType::Open) {
+            return self.parse_open_statement();
+        }
+
+        // CLOSE statement
+        if self.check(&TokenType::Close) {
+            return self.parse_close_statement();
+        }
+
         // Assignment: identifier = expression or arr(i) = expression
         // Check if this could be an identifier (including keywords used as identifiers)
         let is_identifier_like = matches!(
@@ -702,6 +722,298 @@ impl Parser {
             values,
             location,
         })
+    }
+
+    /// Parse WRITE statement: WRITE(unit, fmt) values
+    /// Supports: WRITE(*, *) x, y
+    ///           WRITE(10, '(I5)') x
+    ///           WRITE(UNIT=10, FMT='(I5)') x
+    fn parse_write_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Write, "WRITE")?;
+
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse unit and format specifiers
+        let (unit, format) = self.parse_io_control_list()?;
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Parse optional expression list
+        let mut values = Vec::new();
+        if self.is_expression_start() {
+            loop {
+                values.push(self.parse_expression()?);
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(Statement::Write {
+            unit,
+            format,
+            values,
+            location,
+        })
+    }
+
+    /// Parse READ statement: READ(unit, fmt) variables
+    /// Supports: READ(*, *) x, y
+    ///           READ(10, '(I5)') x
+    fn parse_read_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Read, "READ")?;
+
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse unit and format specifiers
+        let (unit, format) = self.parse_io_control_list()?;
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Parse variable list
+        let mut variables = Vec::new();
+        if self.is_identifier_start() {
+            loop {
+                variables.push(self.expect_identifier()?);
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(Statement::Read {
+            unit,
+            format,
+            variables,
+            location,
+        })
+    }
+
+    /// Parse I/O control list: (unit, fmt) or (UNIT=n, FMT='...')
+    fn parse_io_control_list(&mut self) -> ParseResult<(Option<Expr>, Option<FormatSpec>)> {
+        let mut unit: Option<Expr> = None;
+        let mut format: Option<FormatSpec> = None;
+
+        // Check for keyword style: UNIT=, FMT=
+        if self.check(&TokenType::Unit) {
+            // UNIT= keyword style
+            while !self.check(&TokenType::RightParen) {
+                if self.check(&TokenType::Unit) {
+                    self.advance();
+                    self.expect(&TokenType::Equal, "=")?;
+                    if self.check(&TokenType::Star) {
+                        self.advance();
+                        // UNIT=* means stdout
+                        unit = None;
+                    } else {
+                        unit = Some(self.parse_expression()?);
+                    }
+                } else if self.check(&TokenType::Format) {
+                    self.advance();
+                    self.expect(&TokenType::Equal, "=")?;
+                    format = Some(self.parse_format_spec()?);
+                } else if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    // Skip unknown specifiers
+                    self.advance();
+                }
+            }
+        } else {
+            // Positional style: (unit, fmt)
+            // First position: unit (* for console)
+            if self.check(&TokenType::Star) {
+                self.advance();
+                unit = None; // * means stdout/stdin
+            } else {
+                unit = Some(self.parse_expression()?);
+            }
+
+            // Optional second position: format
+            if self.check(&TokenType::Comma) {
+                self.advance();
+                if !self.check(&TokenType::RightParen) {
+                    format = Some(self.parse_format_spec()?);
+                }
+            }
+        }
+
+        Ok((unit, format))
+    }
+
+    /// Parse format specification: * or '(I5, F10.2)' or label
+    fn parse_format_spec(&mut self) -> ParseResult<FormatSpec> {
+        if self.check(&TokenType::Star) {
+            self.advance();
+            Ok(FormatSpec::ListDirected)
+        } else if let TokenType::StringLiteral(s) = &self.peek().token_type.clone() {
+            let s = s.clone();
+            self.advance();
+            Ok(FormatSpec::String(s))
+        } else if let TokenType::IntegerLiteral(s) = &self.peek().token_type.clone() {
+            let label = s.parse::<i64>().map_err(|_| ParseError::InvalidNumber {
+                value: s.clone(),
+                location: self.current_location(),
+            })?;
+            self.advance();
+            Ok(FormatSpec::Label(label))
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "format specification (*, string, or label)".to_string(),
+                found: self.peek().token_type.clone(),
+                location: self.current_location(),
+            })
+        }
+    }
+
+    /// Parse OPEN statement: OPEN(UNIT=n, FILE='name', STATUS='OLD', ...)
+    fn parse_open_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Open, "OPEN")?;
+
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        let mut unit: Option<Expr> = None;
+        let mut file: Option<Expr> = None;
+        let mut status: Option<String> = None;
+        let mut action: Option<String> = None;
+        let mut iostat: Option<String> = None;
+
+        // Parse keyword arguments
+        loop {
+            if self.check(&TokenType::RightParen) {
+                break;
+            }
+
+            if self.check(&TokenType::Unit) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                unit = Some(self.parse_expression()?);
+            } else if self.check(&TokenType::File) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                file = Some(self.parse_expression()?);
+            } else if self.check(&TokenType::Status) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                if let TokenType::StringLiteral(s) = &self.peek().token_type.clone() {
+                    status = Some(s.clone());
+                    self.advance();
+                }
+            } else if self.check(&TokenType::Action) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                if let TokenType::StringLiteral(s) = &self.peek().token_type.clone() {
+                    action = Some(s.clone());
+                    self.advance();
+                }
+            } else if self.check(&TokenType::Iostat) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                iostat = Some(self.expect_identifier()?);
+            } else if self.is_expression_start() {
+                // First positional arg is unit
+                if unit.is_none() {
+                    unit = Some(self.parse_expression()?);
+                }
+            }
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Unit is required
+        let unit = unit.ok_or_else(|| ParseError::UnexpectedToken {
+            expected: "unit number".to_string(),
+            found: TokenType::RightParen,
+            location,
+        })?;
+
+        Ok(Statement::Open {
+            unit,
+            file,
+            status,
+            action,
+            iostat,
+            location,
+        })
+    }
+
+    /// Parse CLOSE statement: CLOSE(UNIT=n) or CLOSE(n)
+    fn parse_close_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Close, "CLOSE")?;
+
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        let mut unit: Option<Expr> = None;
+        let mut iostat: Option<String> = None;
+
+        // Parse arguments
+        loop {
+            if self.check(&TokenType::RightParen) {
+                break;
+            }
+
+            if self.check(&TokenType::Unit) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                unit = Some(self.parse_expression()?);
+            } else if self.check(&TokenType::Iostat) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                iostat = Some(self.expect_identifier()?);
+            } else if self.is_expression_start() {
+                // Positional unit arg
+                if unit.is_none() {
+                    unit = Some(self.parse_expression()?);
+                }
+            }
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Unit is required
+        let unit = unit.ok_or_else(|| ParseError::UnexpectedToken {
+            expected: "unit number".to_string(),
+            found: TokenType::RightParen,
+            location,
+        })?;
+
+        Ok(Statement::Close {
+            unit,
+            iostat,
+            location,
+        })
+    }
+
+    /// Check if current token could start an identifier
+    fn is_identifier_start(&self) -> bool {
+        matches!(
+            self.peek().token_type,
+            TokenType::Identifier(_)
+                | TokenType::Result
+                | TokenType::Stat
+                | TokenType::Kind
+                | TokenType::Len
+        )
     }
 
     /// Parse CALL statement: CALL subroutine(args)
