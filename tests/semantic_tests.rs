@@ -405,7 +405,6 @@ fn test_select_case_type_mismatch() {
 }
 
 #[test]
-#[ignore] // TODO: Parser doesn't support PARAMETER attribute syntax yet
 fn test_parameter_constant() {
     let source = r#"
         program test
@@ -421,7 +420,6 @@ fn test_parameter_constant() {
 }
 
 #[test]
-#[ignore] // TODO: Parser doesn't support PARAMETER attribute syntax yet
 fn test_assignment_to_parameter() {
     let source = r#"
         program test

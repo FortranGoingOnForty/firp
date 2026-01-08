@@ -389,9 +389,35 @@ impl Parser {
         // Type declarations
         let type_spec = self.parse_type_spec()?;
 
+        // Check for attributes (e.g., INTEGER, PARAMETER :: ...)
+        let mut is_parameter = false;
+        if self.check(&TokenType::Comma) {
+            self.advance();
+            // Parse attribute
+            if self.check(&TokenType::Parameter) {
+                self.advance();
+                is_parameter = true;
+            }
+            // Could add more attributes here (INTENT, DIMENSION, etc.)
+        }
+
         // Check for :: (optional but common in modern Fortran)
         if self.check(&TokenType::DoubleColon) {
             self.advance();
+        }
+
+        // If PARAMETER attribute, parse as parameter declaration
+        if is_parameter {
+            let name = self.expect_identifier()?;
+            self.expect(&TokenType::Equal, "=")?;
+            let value = self.parse_expression()?;
+
+            return Ok(Declaration::Parameter {
+                type_spec,
+                name,
+                value,
+                location,
+            });
         }
 
         // Parse variable names
