@@ -82,6 +82,48 @@ pub struct UseItem {
     pub original_name: Option<String>,
 }
 
+/// Derived type definition (user-defined type/struct)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedTypeDef {
+    /// Type name
+    pub name: String,
+    /// Parent type name if EXTENDS(parent_type)
+    pub extends: Option<String>,
+    /// Component declarations
+    pub components: Vec<TypeComponent>,
+    /// Type-bound procedures (after CONTAINS)
+    pub procedures: Vec<TypeBoundProcedure>,
+    pub location: SourceLocation,
+}
+
+/// A component within a derived type
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeComponent {
+    /// Component name
+    pub name: String,
+    /// Type of the component
+    pub type_spec: TypeSpec,
+    /// Array dimensions (None for scalars)
+    pub array_spec: Option<ArraySpec>,
+    /// Default initialization value
+    pub init: Option<Expr>,
+    pub location: SourceLocation,
+}
+
+/// Type-bound procedure binding
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeBoundProcedure {
+    /// Binding name (how it's called on the type)
+    pub binding_name: String,
+    /// Procedure name it refers to (after =>)
+    pub procedure_name: Option<String>,
+    /// PASS attribute (which argument gets the object)
+    pub pass_arg: Option<String>,
+    /// NOPASS if explicitly no pass
+    pub nopass: bool,
+    pub location: SourceLocation,
+}
+
 /// A procedure (subroutine or function)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Procedure {
@@ -139,6 +181,8 @@ pub enum TypeSpec {
     Complex { kind: Option<String> },
     Logical { kind: Option<String> },
     Character { len: Option<Box<Expr>>, kind: Option<String> },
+    /// Derived type: TYPE(type_name) or CLASS(type_name)
+    Derived { name: String, is_class: bool },
 }
 
 impl TypeSpec {
@@ -247,16 +291,31 @@ pub enum Declaration {
         value: Expr,
         location: SourceLocation,
     },
+    /// Derived type definition
+    DerivedType(DerivedTypeDef),
+}
+
+/// Assignment target (left-hand side of assignment)
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignmentTarget {
+    /// Simple variable: x
+    Variable(String),
+    /// Array element: arr(i) or arr(i, j)
+    ArrayElement { name: String, indices: Vec<Expr> },
+    /// Component access: obj%component (can be chained)
+    Component { object: Box<AssignmentTarget>, component: String },
 }
 
 /// Statements
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// Assignment: x = expr or arr(i) = expr
+    /// Assignment: x = expr or arr(i) = expr or obj%comp = expr
     Assignment {
         target: String,
         /// Array indices for array element assignment (None for scalar)
         indices: Option<Vec<Expr>>,
+        /// Component path for derived type access (e.g., ["x"] for p%x)
+        components: Vec<String>,
         value: Expr,
         location: SourceLocation,
     },
@@ -438,6 +497,18 @@ pub enum Expr {
         indices: Vec<Expr>,
         location: SourceLocation,
     },
+    /// Component access: obj%component
+    ComponentAccess {
+        object: Box<Expr>,
+        component: String,
+        location: SourceLocation,
+    },
+    /// Type constructor: Point(1.0, 2.0)
+    TypeConstructor {
+        type_name: String,
+        arguments: Vec<Expr>,
+        location: SourceLocation,
+    },
 }
 
 impl Expr {
@@ -453,6 +524,8 @@ impl Expr {
             Expr::Parenthesized(_, loc) => loc,
             Expr::FunctionCall { location, .. } => location,
             Expr::ArrayAccess { location, .. } => location,
+            Expr::ComponentAccess { location, .. } => location,
+            Expr::TypeConstructor { location, .. } => location,
         }
     }
 }

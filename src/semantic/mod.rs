@@ -48,6 +48,8 @@ pub enum Type {
     },
     /// Void type (for statements that don't produce values)
     Void,
+    /// Derived type (user-defined type)
+    Derived { name: String },
 }
 
 /// Simplified element kind for arrays (to maintain Hash/Eq)
@@ -272,6 +274,7 @@ impl fmt::Display for Type {
                     .collect();
                 write!(f, "{}, DIMENSION({})", elem_str, dims.join(", "))
             }
+            Type::Derived { name } => write!(f, "TYPE({})", name),
         }
     }
 }
@@ -308,6 +311,7 @@ impl From<&TypeSpec> for Type {
                     kind: kind.as_ref().and_then(|k| k.parse().ok()),
                 }
             }
+            TypeSpec::Derived { name, .. } => Type::Derived { name: name.clone() },
         }
     }
 }
@@ -658,6 +662,11 @@ impl SemanticAnalyzer {
                 self.symbol_table.define(symbol)?;
                 Ok(())
             }
+            Declaration::DerivedType(_type_def) => {
+                // TODO: Register derived type in symbol table
+                // For now, we accept it without additional checks
+                Ok(())
+            }
         }
     }
 
@@ -669,6 +678,7 @@ impl SemanticAnalyzer {
                 indices,
                 value,
                 location,
+                ..
             } => {
                 // Look up the target variable
                 let symbol = self.lookup_variable(target, *location)?;
@@ -1176,6 +1186,22 @@ impl SemanticAnalyzer {
 
                 // Return element type
                 Ok(symbol.ty.element_type())
+            }
+
+            Expr::ComponentAccess { object, .. } => {
+                // TODO: Full implementation - look up component type from derived type definition
+                // For now, just check the object and return a generic type
+                self.check_expression(object)?;
+                Ok(Type::real())
+            }
+
+            Expr::TypeConstructor { arguments, type_name, .. } => {
+                // TODO: Full implementation - verify arguments match type definition
+                // For now, just type check arguments
+                for arg in arguments {
+                    self.check_expression(arg)?;
+                }
+                Ok(Type::Derived { name: type_name.clone() })
             }
         }
     }

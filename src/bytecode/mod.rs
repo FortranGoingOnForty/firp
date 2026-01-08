@@ -946,6 +946,10 @@ impl Compiler {
                 Declaration::ImplicitNone { .. } => {
                     // No symbol export needed
                 }
+                Declaration::DerivedType(_) => {
+                    // TODO: Register derived type definition
+                    // For now, just skip it
+                }
             }
         }
 
@@ -1238,13 +1242,18 @@ impl Compiler {
                     .emit_with_operand(OpCode::StoreVar, var_index, *location);
                 Ok(())
             }
+            Declaration::DerivedType(_) => {
+                // TODO: Store derived type definition for later use
+                // For now, no bytecode needed
+                Ok(())
+            }
         }
     }
 
     /// Compile a statement
     fn compile_statement(&mut self, stmt: &Statement) -> CompileResult<()> {
         match stmt {
-            Statement::Assignment { target, indices, value, location } => {
+            Statement::Assignment { target, indices, value, location, .. } => {
                 if let Some(idx_exprs) = indices {
                     // Array element assignment: arr(i, j, ...) = value
                     // Stack order for StoreArrayElem: value, index1, index2, ..., num_indices (top)
@@ -1980,6 +1989,30 @@ impl Compiler {
                 // Emit LoadArrayElem
                 self.chunk.emit_with_operand(OpCode::LoadArrayElem, var_index, *location);
                 Ok(())
+            }
+
+            Expr::ComponentAccess { object, component, location } => {
+                // TODO: Full implementation - compile object, then access component
+                // For now, this is a placeholder that will error at runtime
+                self.compile_expression(object)?;
+                // We'd need a LoadComponent opcode and component index
+                // For now, emit a placeholder error
+                return Err(CompileError::InvalidOperation {
+                    message: format!("Component access '%{}' not yet implemented", component),
+                    location: *location,
+                });
+            }
+
+            Expr::TypeConstructor { type_name, arguments, location } => {
+                // TODO: Full implementation - create derived type instance
+                // For now, compile arguments but error out
+                for arg in arguments {
+                    self.compile_expression(arg)?;
+                }
+                return Err(CompileError::InvalidOperation {
+                    message: format!("Type constructor '{}' not yet implemented", type_name),
+                    location: *location,
+                });
             }
         }
     }

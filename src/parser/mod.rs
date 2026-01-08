@@ -597,6 +597,8 @@ impl Parser {
                 | TokenType::Complex
                 | TokenType::Logical
                 | TokenType::Character
+                | TokenType::Type
+                | TokenType::Class
         )
     }
 
@@ -612,6 +614,8 @@ impl Parser {
                 | TokenType::Character
                 | TokenType::Implicit
                 | TokenType::Parameter
+                | TokenType::Type
+                | TokenType::Class
         )
     }
 
@@ -624,6 +628,19 @@ impl Parser {
             self.advance();
             self.expect(&TokenType::None, "NONE")?;
             return Ok(Declaration::ImplicitNone { location });
+        }
+
+        // Check for TYPE definition (TYPE :: name or TYPE, EXTENDS(...) :: name)
+        // This is different from TYPE(name) :: var declarations
+        if self.check(&TokenType::Type) {
+            // Peek ahead to see if this is TYPE :: (definition) or TYPE(name) (declaration)
+            // TYPE definition: TYPE :: name or TYPE, EXTENDS(...) :: name
+            // TYPE declaration: TYPE(name) :: varname
+            let next = &self.peek_next().token_type;
+            if *next == TokenType::DoubleColon || *next == TokenType::Comma {
+                return self.parse_derived_type_def();
+            }
+            // Otherwise fall through to type spec parsing for TYPE(name) :: var
         }
 
         // Type declarations
@@ -790,12 +807,191 @@ impl Parser {
                 // TODO: Parse LEN specification
                 Ok(TypeSpec::character())
             }
+            TokenType::Type => {
+                self.advance();
+                self.expect(&TokenType::LeftParen, "(")?;
+                let type_name = self.expect_identifier()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Ok(TypeSpec::Derived { name: type_name, is_class: false })
+            }
+            TokenType::Class => {
+                self.advance();
+                self.expect(&TokenType::LeftParen, "(")?;
+                let type_name = self.expect_identifier()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Ok(TypeSpec::Derived { name: type_name, is_class: true })
+            }
             _ => Err(ParseError::UnexpectedToken {
                 expected: "type specification".to_string(),
                 found: self.peek().token_type.clone(),
                 location,
             }),
         }
+    }
+
+    /// Parse a derived type definition: TYPE :: typename ... END TYPE
+    fn parse_derived_type_def(&mut self) -> ParseResult<Declaration> {
+        let location = self.current_location();
+
+        self.expect(&TokenType::Type, "TYPE")?;
+
+        // Check for optional EXTENDS
+        let extends = if self.check(&TokenType::Comma) {
+            self.advance();
+            if self.check(&TokenType::Extends) {
+                self.advance();
+                self.expect(&TokenType::LeftParen, "(")?;
+                let parent = self.expect_identifier()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Some(parent)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.expect(&TokenType::DoubleColon, "::")?;
+        let name = self.expect_identifier()?;
+
+        let mut components = Vec::new();
+        let mut procedures = Vec::new();
+        let mut in_contains = false;
+
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END TYPE
+            if self.check(&TokenType::End) {
+                self.advance();
+                if self.check(&TokenType::Type) {
+                    self.advance();
+                    // Optional type name after END TYPE
+                    if let TokenType::Identifier(_) = self.peek().token_type {
+                        self.advance();
+                    }
+                }
+                break;
+            }
+
+            // Check for CONTAINS (starts type-bound procedure section)
+            if self.check(&TokenType::Contains) {
+                self.advance();
+                in_contains = true;
+                continue;
+            }
+
+            if in_contains {
+                // Parse type-bound procedure
+                procedures.push(self.parse_type_bound_procedure()?);
+            } else {
+                // Parse component declaration
+                components.push(self.parse_type_component()?);
+            }
+        }
+
+        Ok(Declaration::DerivedType(DerivedTypeDef {
+            name,
+            extends,
+            components,
+            procedures,
+            location,
+        }))
+    }
+
+    /// Parse a type component (member variable)
+    fn parse_type_component(&mut self) -> ParseResult<TypeComponent> {
+        let location = self.current_location();
+
+        let type_spec = self.parse_type_spec()?;
+
+        // Optional attributes
+        if self.check(&TokenType::Comma) {
+            self.advance();
+            // Skip attributes for now (POINTER, ALLOCATABLE, etc.)
+            while !self.check(&TokenType::DoubleColon) && !self.is_at_end() {
+                self.advance();
+            }
+        }
+
+        // Check for ::
+        if self.check(&TokenType::DoubleColon) {
+            self.advance();
+        }
+
+        let name = self.expect_identifier()?;
+
+        // Check for array dimensions
+        let array_spec = if self.check(&TokenType::LeftParen) {
+            Some(self.parse_array_spec()?)
+        } else {
+            None
+        };
+
+        // Check for initialization
+        let init = if self.check(&TokenType::Equal) {
+            self.advance();
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(TypeComponent {
+            name,
+            type_spec,
+            array_spec,
+            init,
+            location,
+        })
+    }
+
+    /// Parse a type-bound procedure binding
+    fn parse_type_bound_procedure(&mut self) -> ParseResult<TypeBoundProcedure> {
+        let location = self.current_location();
+
+        self.expect(&TokenType::Procedure, "PROCEDURE")?;
+
+        // Check for attributes like PASS, NOPASS
+        let mut pass_arg = None;
+        let nopass = false;
+
+        if self.check(&TokenType::LeftParen) {
+            self.advance();
+            // Parse PASS(arg)
+            pass_arg = if let TokenType::Identifier(s) = &self.peek().token_type {
+                let arg = s.clone();
+                self.advance();
+                Some(arg)
+            } else {
+                None
+            };
+            self.expect(&TokenType::RightParen, ")")?;
+        }
+
+        // Check for ::
+        if self.check(&TokenType::DoubleColon) {
+            self.advance();
+        }
+
+        let binding_name = self.expect_identifier()?;
+
+        // Check for => procedure_name
+        let procedure_name = if self.check(&TokenType::Arrow) {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+
+        Ok(TypeBoundProcedure {
+            binding_name,
+            procedure_name,
+            pass_arg,
+            nopass,
+            location,
+        })
     }
 
     /// Parse a statement
@@ -906,12 +1102,21 @@ impl Parser {
                 None
             };
 
+            // Check for component access: p%x or p%x%y
+            let mut components = Vec::new();
+            while self.check(&TokenType::Percent) {
+                self.advance();
+                let comp = self.expect_identifier()?;
+                components.push(comp);
+            }
+
             if self.check(&TokenType::Equal) {
                 self.advance();
                 let value = self.parse_expression()?;
                 return Ok(Statement::Assignment {
                     target: name,
                     indices,
+                    components,
                     value,
                     location,
                 });
@@ -1832,19 +2037,33 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
 
-                // Check if this is a function call
-                if self.check(&TokenType::LeftParen) {
+                // Check if this is a function call / array access
+                let mut expr = if self.check(&TokenType::LeftParen) {
                     self.advance();
                     let arguments = self.parse_argument_list()?;
                     self.expect(&TokenType::RightParen, ")")?;
-                    Ok(Expr::FunctionCall {
+                    Expr::FunctionCall {
                         name,
                         arguments,
                         location,
-                    })
+                    }
                 } else {
-                    Ok(Expr::Identifier(name, location))
+                    Expr::Identifier(name, location)
+                };
+
+                // Check for component access (obj%component, can be chained)
+                while self.check(&TokenType::Percent) {
+                    self.advance();
+                    let comp_location = self.current_location();
+                    let component = self.expect_identifier()?;
+                    expr = Expr::ComponentAccess {
+                        object: Box::new(expr),
+                        component,
+                        location: comp_location,
+                    };
                 }
+
+                Ok(expr)
             }
 
             // Keywords that can be used as identifiers
@@ -1921,6 +2140,14 @@ impl Parser {
 
     fn peek(&self) -> &Token {
         &self.tokens[self.position]
+    }
+
+    fn peek_next(&self) -> &Token {
+        if self.position + 1 < self.tokens.len() {
+            &self.tokens[self.position + 1]
+        } else {
+            &self.tokens[self.tokens.len() - 1] // Return EOF
+        }
     }
 
     fn advance(&mut self) -> Token {
