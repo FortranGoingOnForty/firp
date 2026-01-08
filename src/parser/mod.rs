@@ -684,6 +684,8 @@ impl Parser {
         let mut is_parameter = false;
         let mut intent: Option<Intent> = None;
         let mut is_optional = false;
+        let mut is_pointer = false;
+        let mut is_target = false;
 
         // Parse comma-separated attributes
         while self.check(&TokenType::Comma) {
@@ -692,6 +694,12 @@ impl Parser {
             if self.check(&TokenType::Parameter) {
                 self.advance();
                 is_parameter = true;
+            } else if self.check(&TokenType::Pointer) {
+                self.advance();
+                is_pointer = true;
+            } else if self.check(&TokenType::Target) {
+                self.advance();
+                is_target = true;
             } else if self.check(&TokenType::Intent) {
                 self.advance();
                 self.expect(&TokenType::LeftParen, "(")?;
@@ -789,6 +797,8 @@ impl Parser {
             let mut attributes = VarAttributes::default();
             attributes.intent = intent;
             attributes.is_optional = is_optional;
+            attributes.is_pointer = is_pointer;
+            attributes.is_target = is_target;
 
             let entity = DeclaredEntity {
                 name,
@@ -1934,7 +1944,7 @@ impl Parser {
     }
 
     /// Parse a comma-separated argument list
-    fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
+    fn parse_argument_list(&mut self) -> ParseResult<Vec<Argument>> {
         let mut args = Vec::new();
 
         // Empty argument list
@@ -1943,7 +1953,31 @@ impl Parser {
         }
 
         loop {
-            args.push(self.parse_expression()?);
+            // Check for keyword argument: identifier = expression
+            // Look ahead to see if we have identifier followed by =
+            let arg = if matches!(self.peek().token_type, TokenType::Identifier(_)) {
+                let saved_pos = self.position;
+                let name = self.expect_identifier()?;
+
+                if self.check(&TokenType::Equal) {
+                    // This is a keyword argument
+                    self.advance();
+                    let value = self.parse_expression()?;
+                    Argument::keyword(name, value)
+                } else {
+                    // Not a keyword argument, backtrack and parse as expression
+                    self.position = saved_pos;
+                    let expr = self.parse_expression()?;
+                    Argument::positional(expr)
+                }
+            } else {
+                // Not an identifier, must be a positional argument
+                let expr = self.parse_expression()?;
+                Argument::positional(expr)
+            };
+
+            args.push(arg);
+
             if self.check(&TokenType::Comma) {
                 self.advance();
             } else {
@@ -3090,10 +3124,10 @@ impl Parser {
                         }
                     } else {
                         // No slices - treat as function call (could also be array element access)
-                        // Extract expressions from Index variants
-                        let arguments: Vec<Expr> = subscripts.into_iter().map(|s| {
+                        // Extract expressions from Index variants and wrap as positional arguments
+                        let arguments: Vec<Argument> = subscripts.into_iter().map(|s| {
                             match s {
-                                ArraySubscript::Index(e) => e,
+                                ArraySubscript::Index(e) => Argument::positional(e),
                                 ArraySubscript::Slice { .. } => unreachable!("has_slices was false"),
                             }
                         }).collect();

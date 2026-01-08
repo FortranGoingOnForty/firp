@@ -166,7 +166,7 @@ fn test_parse_nested_function_calls() {
                 assert_eq!(arguments.len(), 2);
 
                 // First argument should be inner(5)
-                match &arguments[0] {
+                match &arguments[0].value {
                     Expr::FunctionCall { name, .. } => {
                         assert_eq!(name, "INNER");
                     }

@@ -24,6 +24,10 @@ pub enum OpCode {
     LoadVar,
     /// Store top of stack into a variable
     StoreVar,
+    /// Load a reference to a variable (for pass-by-reference)
+    LoadRef,
+    /// Store a parameter value (reference) without resolving
+    StoreParam,
 
     // Arithmetic operations
     /// Add two values
@@ -208,6 +212,8 @@ pub enum Intrinsic {
 
     // Inquiry intrinsics
     Present,  // PRESENT(a) - check if optional argument is present
+    Associated, // ASSOCIATED(ptr) or ASSOCIATED(ptr, target) - check if pointer is associated
+    Null,       // NULL() or NULL(mold) - return null pointer
 }
 
 impl Intrinsic {
@@ -269,6 +275,8 @@ impl Intrinsic {
             49 => Some(Intrinsic::ThisImage),
             50 => Some(Intrinsic::NumImages),
             51 => Some(Intrinsic::Present),
+            52 => Some(Intrinsic::Associated),
+            53 => Some(Intrinsic::Null),
             _ => None,
         }
     }
@@ -333,6 +341,8 @@ impl Intrinsic {
             "THIS_IMAGE" => Some(Intrinsic::ThisImage),
             "NUM_IMAGES" => Some(Intrinsic::NumImages),
             "PRESENT" => Some(Intrinsic::Present),
+            "ASSOCIATED" => Some(Intrinsic::Associated),
+            "NULL" => Some(Intrinsic::Null),
             _ => None,
         }
     }
@@ -382,6 +392,8 @@ impl Intrinsic {
             // Coarray/parallel intrinsics (no arguments)
             Intrinsic::ThisImage | Intrinsic::NumImages => (0, 0),
             Intrinsic::Present => (1, 1),
+            Intrinsic::Associated => (1, 2), // ASSOCIATED(ptr) or ASSOCIATED(ptr, target)
+            Intrinsic::Null => (0, 1),       // NULL() or NULL(mold)
         }
     }
 }
@@ -441,6 +453,8 @@ impl fmt::Display for Intrinsic {
             Intrinsic::ThisImage => write!(f, "THIS_IMAGE"),
             Intrinsic::NumImages => write!(f, "NUM_IMAGES"),
             Intrinsic::Present => write!(f, "PRESENT"),
+            Intrinsic::Associated => write!(f, "ASSOCIATED"),
+            Intrinsic::Null => write!(f, "NULL"),
         }
     }
 }
@@ -453,6 +467,8 @@ impl fmt::Display for OpCode {
             OpCode::LoadFalse => write!(f, "LoadFalse"),
             OpCode::LoadVar => write!(f, "LoadVar"),
             OpCode::StoreVar => write!(f, "StoreVar"),
+            OpCode::LoadRef => write!(f, "LoadRef"),
+            OpCode::StoreParam => write!(f, "StoreParam"),
             OpCode::Add => write!(f, "Add"),
             OpCode::Subtract => write!(f, "Subtract"),
             OpCode::Multiply => write!(f, "Multiply"),
@@ -566,6 +582,8 @@ pub enum Value {
     },
     /// Null pointer value (for disassociated pointers)
     Null,
+    /// Reference to a variable (for pass-by-reference semantics)
+    Reference(usize),
 }
 
 impl Value {
@@ -578,6 +596,7 @@ impl Value {
             Value::Array { .. } => "ARRAY",
             Value::Instance { .. } => "DERIVED TYPE",
             Value::Null => "NULL",
+            Value::Reference(_) => "REFERENCE",
         }
     }
 
@@ -719,6 +738,7 @@ impl fmt::Display for Value {
                 write!(f, ")")
             }
             Value::Null => write!(f, "NULL()"),
+            Value::Reference(idx) => write!(f, "REF({})", idx),
         }
     }
 }
@@ -979,7 +999,7 @@ impl Chunk {
                             format!("{:4}", op)
                         }
                     }
-                    OpCode::LoadVar | OpCode::StoreVar | OpCode::Read => {
+                    OpCode::LoadVar | OpCode::StoreVar | OpCode::LoadRef | OpCode::StoreParam | OpCode::Read => {
                         if let Some(name) = self.variables.get(op) {
                             format!("{:4} ; {}", op, name)
                         } else {
@@ -1464,8 +1484,9 @@ impl Compiler {
             .collect();
 
         // Pop arguments from stack into parameters (reverse order because stack is LIFO)
+        // Use StoreParam to avoid resolving references - we want to store the reference itself
         for &param_idx in param_indices.iter().rev() {
-            self.chunk.emit_with_operand(OpCode::StoreVar, param_idx, sub.location);
+            self.chunk.emit_with_operand(OpCode::StoreParam, param_idx, sub.location);
         }
 
         // Compile local declarations
@@ -1506,8 +1527,9 @@ impl Compiler {
             .collect();
 
         // Pop arguments from stack into parameters (reverse order because stack is LIFO)
+        // Use StoreParam to avoid resolving references - we want to store the reference itself
         for &param_idx in param_indices.iter().rev() {
-            self.chunk.emit_with_operand(OpCode::StoreVar, param_idx, func.location);
+            self.chunk.emit_with_operand(OpCode::StoreParam, param_idx, func.location);
         }
 
         // Allocate result variable (function name or RESULT variable)
@@ -1837,9 +1859,10 @@ impl Compiler {
             }
 
             Statement::Call { name, arguments, location } => {
-                // Compile arguments (push onto stack)
+                // Compile arguments with pass-by-reference semantics
+                // TODO: Handle keyword arguments by reordering based on procedure definition
                 for arg in arguments {
-                    self.compile_expression(arg)?;
+                    self.compile_call_argument(&arg.value)?;
                 }
 
                 // Look up procedure address
@@ -1941,25 +1964,37 @@ impl Compiler {
             }
 
             Statement::PointerAssign { pointer, pointer_components, target, location } => {
-                // For now, treat pointer assignment like regular assignment
-                // TODO: Implement proper pointer semantics with Value::Pointer
-                self.compile_expression(target)?;
+                // Pointer assignment: ptr => target
+                // If target is a simple variable, create a reference to it
+                // Otherwise, evaluate the expression and store the result
+                match target {
+                    Expr::Identifier(name, loc) => {
+                        // Create a reference to the target variable
+                        let target_index = self.chunk.get_variable_index(name)
+                            .ok_or(CompileError::InvalidOperation {
+                                message: format!("Undefined variable: {}", name),
+                                location: *loc,
+                            })?;
+                        self.chunk.emit_with_operand(OpCode::LoadRef, target_index, *loc);
+                    }
+                    Expr::FunctionCall { name, .. } if name == "NULL" => {
+                        // NULL() returns a null pointer
+                        let null_idx = self.chunk.add_constant(Value::Null);
+                        self.chunk.emit_with_operand(OpCode::LoadConst, null_idx, *location);
+                    }
+                    _ => {
+                        // Other expressions - just evaluate them
+                        self.compile_expression(target)?;
+                    }
+                }
+
                 let var_index = self.chunk.add_variable(pointer.clone());
 
                 if pointer_components.is_empty() {
-                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                    // Use StoreParam to store the reference directly without resolving
+                    self.chunk.emit_with_operand(OpCode::StoreParam, var_index, *location);
                 } else {
-                    // Store into component
-                    self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
-                    for (i, comp) in pointer_components.iter().enumerate() {
-                        if i < pointer_components.len() - 1 {
-                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
-                            self.chunk.emit_with_operand(OpCode::LoadComponent, comp_idx, *location);
-                        } else {
-                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
-                            self.chunk.emit_with_operand(OpCode::StoreComponent, comp_idx, *location);
-                        }
-                    }
+                    // Store into component (component path not fully implemented yet)
                     self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
                 }
                 Ok(())
@@ -2637,6 +2672,28 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile an argument for a procedure call with pass-by-reference semantics
+    /// If the argument is a simple variable, pass a reference to it.
+    /// Otherwise, compile the expression normally (pass by value).
+    fn compile_call_argument(&mut self, arg: &Expr) -> CompileResult<()> {
+        match arg {
+            Expr::Identifier(name, location) => {
+                // Simple variable - pass by reference
+                let var_index = self.chunk.get_variable_index(name)
+                    .ok_or(CompileError::InvalidOperation {
+                        message: format!("Undefined variable: {}", name),
+                        location: *location,
+                    })?;
+                self.chunk.emit_with_operand(OpCode::LoadRef, var_index, *location);
+                Ok(())
+            }
+            _ => {
+                // Complex expression - pass by value
+                self.compile_expression(arg)
+            }
+        }
+    }
+
     /// Compile an expression
     fn compile_expression(&mut self, expr: &Expr) -> CompileResult<()> {
         match expr {
@@ -2758,8 +2815,9 @@ impl Compiler {
                     }
 
                     // Compile all arguments (push onto stack)
+                    // Intrinsic functions use pass-by-value
                     for arg in arguments {
-                        self.compile_expression(arg)?;
+                        self.compile_expression(&arg.value)?;
                     }
 
                     // Encode operand: (intrinsic_id << 8) | arg_count
@@ -2767,9 +2825,9 @@ impl Compiler {
                     self.chunk.emit_with_operand(OpCode::CallIntrinsic, operand, *location);
                 } else if self.chunk.get_procedure_address(name).is_some() {
                     // This is a user-defined function call
-                    // Compile arguments (push onto stack)
+                    // Compile arguments with pass-by-reference semantics
                     for arg in arguments {
-                        self.compile_expression(arg)?;
+                        self.compile_call_argument(&arg.value)?;
                     }
 
                     // Look up function address
@@ -2783,9 +2841,9 @@ impl Compiler {
                     // For now, we use the first registered procedure
                     // (proper type-based resolution would require type inference)
                     if let Some(proc_name) = procedures.first() {
-                        // Compile arguments
+                        // Compile arguments with pass-by-reference semantics
                         for arg in arguments {
-                            self.compile_expression(arg)?;
+                            self.compile_call_argument(&arg.value)?;
                         }
 
                         // Look up the specific procedure address
@@ -2807,7 +2865,7 @@ impl Compiler {
                     // This is array access (variable exists but not a procedure)
                     // Push each index FIRST
                     for arg in arguments {
-                        self.compile_expression(arg)?;
+                        self.compile_expression(&arg.value)?;
                     }
 
                     // Push number of indices LAST (so it's on top of stack)
@@ -2826,7 +2884,7 @@ impl Compiler {
 
                     // Push all arguments (component values) onto the stack
                     for arg in arguments {
-                        self.compile_expression(arg)?;
+                        self.compile_expression(&arg.value)?;
                     }
 
                     // Push number of arguments
@@ -2911,7 +2969,7 @@ impl Compiler {
 
                 // Then compile all explicit arguments
                 for arg in arguments {
-                    self.compile_expression(arg)?;
+                    self.compile_expression(&arg.value)?;
                 }
 
                 // Look up the procedure associated with this method

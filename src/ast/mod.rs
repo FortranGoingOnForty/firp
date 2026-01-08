@@ -462,7 +462,7 @@ pub enum Statement {
     /// CALL statement: CALL subroutine(args)
     Call {
         name: String,
-        arguments: Vec<Expr>,
+        arguments: Vec<Argument>,
         location: SourceLocation,
     },
     /// RETURN statement
@@ -694,6 +694,27 @@ pub enum ArraySubscript {
     },
 }
 
+/// Procedure call argument (supports keyword arguments)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Argument {
+    /// Optional keyword name (for keyword arguments like `name=value`)
+    pub keyword: Option<String>,
+    /// The argument expression
+    pub value: Expr,
+}
+
+impl Argument {
+    /// Create a positional argument (no keyword)
+    pub fn positional(value: Expr) -> Self {
+        Argument { keyword: None, value }
+    }
+
+    /// Create a keyword argument
+    pub fn keyword(name: String, value: Expr) -> Self {
+        Argument { keyword: Some(name), value }
+    }
+}
+
 /// Expressions
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -725,7 +746,7 @@ pub enum Expr {
     /// Function call: func(args)
     FunctionCall {
         name: String,
-        arguments: Vec<Expr>,
+        arguments: Vec<Argument>,
         location: SourceLocation,
     },
     /// Array element access: arr(i) or arr(i, j)
@@ -756,7 +777,7 @@ pub enum Expr {
     MethodCall {
         object: Box<Expr>,
         method_name: String,
-        arguments: Vec<Expr>,
+        arguments: Vec<Argument>,
         location: SourceLocation,
     },
     /// Array constructor: [1, 2, 3] or [(i, i=1,10)]

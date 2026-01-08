@@ -430,6 +430,26 @@ impl VM {
                     self.set_variable_by_index(index, value, location)?;
                     self.ip += 1;
                 }
+                OpCode::LoadRef => {
+                    // Push a reference to a variable (for pass-by-reference)
+                    let index = operand.unwrap_or(0);
+                    // If this variable is itself a reference, follow it
+                    let target_index = self.resolve_reference(index, location)?;
+                    self.push(Value::Reference(target_index), location)?;
+                    self.ip += 1;
+                }
+                OpCode::StoreParam => {
+                    // Store a parameter value (possibly a reference) without resolving
+                    // This is used at function/subroutine entry to set up parameter bindings
+                    let index = operand.unwrap_or(0);
+                    let value = self.pop(location)?;
+                    // Store directly without resolving references
+                    if index >= self.variables.len() {
+                        self.variables.resize(index + 1, None);
+                    }
+                    self.variables[index] = Some(value);
+                    self.ip += 1;
+                }
 
                 // Arithmetic
                 OpCode::Add => {
@@ -2091,6 +2111,37 @@ impl VM {
                 let is_present = !matches!(arg, Value::Null);
                 Ok(Value::Logical(is_present))
             }
+
+            Intrinsic::Associated => {
+                // ASSOCIATED(ptr) or ASSOCIATED(ptr, target)
+                // Check if a pointer is associated with a target
+                if arg_count == 1 {
+                    let ptr = self.pop(location)?;
+                    // A pointer is associated if it's a Reference (not Null)
+                    let is_associated = matches!(ptr, Value::Reference(_));
+                    Ok(Value::Logical(is_associated))
+                } else {
+                    // ASSOCIATED(ptr, target) - check if ptr points to target
+                    let target = self.pop(location)?;
+                    let ptr = self.pop(location)?;
+                    // For now, just check if both are the same reference
+                    let is_associated = match (ptr, target) {
+                        (Value::Reference(p), Value::Reference(t)) => p == t,
+                        _ => false,
+                    };
+                    Ok(Value::Logical(is_associated))
+                }
+            }
+
+            Intrinsic::Null => {
+                // NULL() or NULL(mold)
+                // Return a null pointer value
+                // If mold is provided, we just pop and ignore it (for type compatibility)
+                if arg_count == 1 {
+                    let _mold = self.pop(location)?;
+                }
+                Ok(Value::Null)
+            }
         }
     }
 
@@ -2164,27 +2215,62 @@ impl VM {
 
     // Variable operations
 
+    /// Resolve a reference chain - if the variable at `index` contains a Reference,
+    /// follow it to get the target variable index.
+    fn resolve_reference(&self, index: usize, location: SourceLocation) -> VMResult<usize> {
+        if let Some(Some(Value::Reference(target))) = self.variables.get(index) {
+            // This variable is a reference, follow it
+            Ok(*target)
+        } else {
+            // Not a reference, return the original index
+            Ok(index)
+        }
+    }
+
     fn get_variable_by_index(&self, index: usize, location: SourceLocation) -> VMResult<Value> {
+        self.get_variable_by_index_with_depth(index, location, 0)
+    }
+
+    fn get_variable_by_index_with_depth(&self, index: usize, location: SourceLocation, depth: usize) -> VMResult<Value> {
+        // Prevent infinite recursion in case of reference cycles
+        if depth > 100 {
+            return Err(RuntimeError::TypeError {
+                message: "Reference cycle detected".to_string(),
+                location,
+            });
+        }
+
+        // First resolve any reference
+        let actual_index = self.resolve_reference(index, location)?;
+
         let value = self
             .variables
-            .get(index)
-            .ok_or(RuntimeError::InvalidVariable { index, location })?
+            .get(actual_index)
+            .ok_or(RuntimeError::InvalidVariable { index: actual_index, location })?
             .clone()
             .unwrap_or(Value::Integer(0)); // Uninitialized variables default to 0
-        Ok(value)
+
+        // If the value is itself a Reference, follow it (shouldn't happen after resolve)
+        match value {
+            Value::Reference(target) => self.get_variable_by_index_with_depth(target, location, depth + 1),
+            _ => Ok(value),
+        }
     }
 
     fn set_variable_by_index(
         &mut self,
         index: usize,
         value: Value,
-        _location: SourceLocation,
+        location: SourceLocation,
     ) -> VMResult<()> {
-        if index >= self.variables.len() {
+        // First resolve any reference
+        let actual_index = self.resolve_reference(index, location)?;
+
+        if actual_index >= self.variables.len() {
             // Extend if needed
-            self.variables.resize(index + 1, None);
+            self.variables.resize(actual_index + 1, None);
         }
-        self.variables[index] = Some(value);
+        self.variables[actual_index] = Some(value);
         Ok(())
     }
 
@@ -2679,6 +2765,7 @@ impl VM {
             Value::Array { elements, .. } => !elements.is_empty(),
             Value::Instance { .. } => true, // Instances are always truthy
             Value::Null => false, // Null is falsy
+            Value::Reference(_) => true, // References are truthy (they exist)
         }
     }
 
@@ -2691,6 +2778,7 @@ impl VM {
             Value::Array { .. } => 0.0, // Arrays can't be converted to real
             Value::Instance { .. } => 0.0, // Instances can't be converted to real
             Value::Null => 0.0, // Null can't be converted to real
+            Value::Reference(_) => 0.0, // References can't be converted to real
         }
     }
 

@@ -1078,7 +1078,7 @@ impl SemanticAnalyzer {
                 // TODO: Full implementation in Sprint 08
                 // For now, just type check the arguments
                 for arg in arguments {
-                    self.check_expression(arg)?;
+                    self.check_expression(&arg.value)?;
                 }
                 Ok(())
             }
@@ -1434,7 +1434,7 @@ impl SemanticAnalyzer {
                 // TODO: Full implementation in Sprint 08
                 // For now, just type check arguments and return integer
                 for arg in arguments {
-                    self.check_expression(arg)?;
+                    self.check_expression(&arg.value)?;
                 }
                 Ok(Type::integer())
             }
@@ -1491,7 +1491,7 @@ impl SemanticAnalyzer {
                 // Type check the object and arguments
                 self.check_expression(object)?;
                 for arg in arguments {
-                    self.check_expression(arg)?;
+                    self.check_expression(&arg.value)?;
                 }
                 // Return a generic type for now
                 // TODO: Look up the method's return type from the type definition
