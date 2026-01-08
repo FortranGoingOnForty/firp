@@ -240,6 +240,21 @@ pub struct ArraySpec {
     pub dimensions: Vec<ArrayDimSpec>,
 }
 
+/// Variable attributes (POINTER, TARGET, ALLOCATABLE, etc.)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VarAttributes {
+    /// POINTER attribute
+    pub is_pointer: bool,
+    /// TARGET attribute
+    pub is_target: bool,
+    /// ALLOCATABLE attribute
+    pub is_allocatable: bool,
+    /// OPTIONAL attribute (for procedure arguments)
+    pub is_optional: bool,
+    /// SAVE attribute
+    pub is_save: bool,
+}
+
 /// A single declared entity (name with optional array dimensions)
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeclaredEntity {
@@ -248,11 +263,13 @@ pub struct DeclaredEntity {
     pub array_spec: Option<ArraySpec>,
     /// Initialization expression
     pub init: Option<Expr>,
+    /// Variable attributes
+    pub attributes: VarAttributes,
 }
 
 impl DeclaredEntity {
     pub fn scalar(name: String) -> Self {
-        Self { name, array_spec: None, init: None }
+        Self { name, array_spec: None, init: None, attributes: VarAttributes::default() }
     }
 
     pub fn array(name: String, dims: Vec<ArrayDimSpec>) -> Self {
@@ -260,6 +277,7 @@ impl DeclaredEntity {
             name,
             array_spec: Some(ArraySpec { dimensions: dims }),
             init: None,
+            attributes: VarAttributes::default(),
         }
     }
 
@@ -488,6 +506,96 @@ pub enum Statement {
         iostat: Option<String>,
         location: SourceLocation,
     },
+    /// Pointer assignment: ptr => target
+    PointerAssign {
+        /// The pointer variable (possibly with component access)
+        pointer: String,
+        /// Component path for pointer (e.g., obj%ptr)
+        pointer_components: Vec<String>,
+        /// The target expression
+        target: Expr,
+        location: SourceLocation,
+    },
+    /// NULLIFY statement: NULLIFY(ptr1, ptr2, ...)
+    Nullify {
+        /// List of pointers to nullify
+        pointers: Vec<String>,
+        location: SourceLocation,
+    },
+    /// ALLOCATE statement: ALLOCATE(ptr, STAT=stat_var)
+    Allocate {
+        /// Variable to allocate
+        variable: String,
+        /// Array dimensions for allocation (None for scalar)
+        dimensions: Option<Vec<Expr>>,
+        /// STAT variable for error code
+        stat: Option<String>,
+        location: SourceLocation,
+    },
+    /// DEALLOCATE statement: DEALLOCATE(ptr, STAT=stat_var)
+    Deallocate {
+        /// Variable to deallocate
+        variable: String,
+        /// STAT variable for error code
+        stat: Option<String>,
+        location: SourceLocation,
+    },
+    /// DO CONCURRENT loop for parallel execution
+    DoConcurrent {
+        /// Loop control specifications (variable, start, end, step)
+        controls: Vec<ConcurrentControl>,
+        /// Locality specifications (LOCAL, SHARED, etc.)
+        locality: Vec<LocalitySpec>,
+        /// Loop body
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+    /// SYNC ALL statement for coarray synchronization
+    SyncAll {
+        location: SourceLocation,
+    },
+    /// SYNC IMAGES statement for selective synchronization
+    SyncImages {
+        /// Image indices to sync with (None = all)
+        images: Option<Vec<Expr>>,
+        location: SourceLocation,
+    },
+    /// CRITICAL section
+    Critical {
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+
+    /// WHERE construct for masked array assignment
+    Where {
+        /// Mask expression (logical array)
+        mask: Expr,
+        /// Body statements (executed where mask is true)
+        body: Vec<Statement>,
+        /// ELSEWHERE clause (executed where mask is false)
+        elsewhere: Option<Vec<Statement>>,
+        location: SourceLocation,
+    },
+
+    /// FORALL construct for array element-wise operations
+    Forall {
+        /// Index specifications: (var, start, end, step)
+        indices: Vec<ForallIndex>,
+        /// Optional mask expression
+        mask: Option<Expr>,
+        /// Body statements
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+}
+
+/// FORALL index specification
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForallIndex {
+    pub var: String,
+    pub start: Expr,
+    pub end: Expr,
+    pub step: Option<Expr>,
 }
 
 /// Format specification for I/O
@@ -518,6 +626,48 @@ pub enum CaseSelector {
     Values(Vec<Expr>),
     /// Range: CASE (1:10)
     Range(Expr, Expr),
+}
+
+/// Control specification for DO CONCURRENT loop
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcurrentControl {
+    /// Loop variable name
+    pub variable: String,
+    /// Start value
+    pub start: Expr,
+    /// End value
+    pub end: Expr,
+    /// Optional step value
+    pub step: Option<Expr>,
+}
+
+/// Locality specification for DO CONCURRENT
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalitySpec {
+    /// LOCAL(var_list) - private to each iteration
+    Local(Vec<String>),
+    /// LOCAL_INIT(var_list) - private, initialized from outer scope
+    LocalInit(Vec<String>),
+    /// SHARED(var_list) - shared across iterations
+    Shared(Vec<String>),
+    /// DEFAULT(NONE) - requires explicit locality for all vars
+    DefaultNone,
+}
+
+/// Array subscript - either a single index or a slice (triplet)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArraySubscript {
+    /// Single index: arr(i)
+    Index(Expr),
+    /// Slice/triplet: arr(start:end:step) where any can be None
+    /// arr(:) = Slice(None, None, None)
+    /// arr(1:5) = Slice(Some(1), Some(5), None)
+    /// arr(::2) = Slice(None, None, Some(2))
+    Slice {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+    },
 }
 
 /// Expressions
@@ -560,6 +710,12 @@ pub enum Expr {
         indices: Vec<Expr>,
         location: SourceLocation,
     },
+    /// Array section/slice: arr(1:5), arr(::2), arr(1:10:2)
+    ArraySection {
+        name: String,
+        subscripts: Vec<ArraySubscript>,
+        location: SourceLocation,
+    },
     /// Component access: obj%component
     ComponentAccess {
         object: Box<Expr>,
@@ -571,6 +727,39 @@ pub enum Expr {
         type_name: String,
         arguments: Vec<Expr>,
         location: SourceLocation,
+    },
+    /// Method call: obj%method(args)
+    MethodCall {
+        object: Box<Expr>,
+        method_name: String,
+        arguments: Vec<Expr>,
+        location: SourceLocation,
+    },
+    /// Array constructor: [1, 2, 3] or [(i, i=1,10)]
+    ArrayConstructor {
+        /// Elements can be expressions or implied-DO loops
+        elements: Vec<ArrayConstructorItem>,
+        location: SourceLocation,
+    },
+}
+
+/// Item in an array constructor - either a value or an implied-DO loop
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArrayConstructorItem {
+    /// Simple expression value
+    Value(Expr),
+    /// Implied-DO loop: (expr, var=start,end[,step])
+    ImpliedDo {
+        /// Expression to evaluate for each iteration
+        expr: Box<Expr>,
+        /// Loop variable name
+        var: String,
+        /// Loop start value
+        start: Box<Expr>,
+        /// Loop end value
+        end: Box<Expr>,
+        /// Optional loop step
+        step: Option<Box<Expr>>,
     },
 }
 
@@ -587,8 +776,11 @@ impl Expr {
             Expr::Parenthesized(_, loc) => loc,
             Expr::FunctionCall { location, .. } => location,
             Expr::ArrayAccess { location, .. } => location,
+            Expr::ArraySection { location, .. } => location,
             Expr::ComponentAccess { location, .. } => location,
             Expr::TypeConstructor { location, .. } => location,
+            Expr::MethodCall { location, .. } => location,
+            Expr::ArrayConstructor { location, .. } => location,
         }
     }
 }

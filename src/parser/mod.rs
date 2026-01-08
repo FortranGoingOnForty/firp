@@ -715,6 +715,7 @@ impl Parser {
                 name,
                 array_spec,
                 init: init_expr,
+                attributes: VarAttributes::default(),
             };
             entities.push(entity);
 
@@ -1200,6 +1201,26 @@ impl Parser {
             return Ok(Statement::Continue { location });
         }
 
+        // SYNC statement (SYNC ALL or SYNC IMAGES)
+        if self.check(&TokenType::Sync) {
+            return self.parse_sync_statement();
+        }
+
+        // CRITICAL section
+        if self.check(&TokenType::Critical) {
+            return self.parse_critical_section();
+        }
+
+        // WHERE statement/construct
+        if self.check(&TokenType::Where) {
+            return self.parse_where_statement();
+        }
+
+        // FORALL statement/construct
+        if self.check(&TokenType::Forall) {
+            return self.parse_forall_statement();
+        }
+
         // CALL statement
         if self.check(&TokenType::Call) {
             return self.parse_call_statement();
@@ -1233,6 +1254,23 @@ impl Parser {
         // CLOSE statement
         if self.check(&TokenType::Close) {
             return self.parse_close_statement();
+        }
+
+        // ALLOCATE statement
+        if self.check(&TokenType::Allocate) {
+            return self.parse_allocate_statement();
+        }
+
+        // DEALLOCATE statement
+        if self.check(&TokenType::Deallocate) {
+            return self.parse_deallocate_statement();
+        }
+
+        // NULLIFY statement (check for identifier NULLIFY since it's not a keyword yet)
+        if let TokenType::Identifier(name) = &self.peek().token_type {
+            if name.to_uppercase() == "NULLIFY" {
+                return self.parse_nullify_statement();
+            }
         }
 
         // Assignment: identifier = expression or arr(i) = expression
@@ -1285,9 +1323,19 @@ impl Parser {
                     value,
                     location,
                 });
+            } else if self.check(&TokenType::Arrow) {
+                // Pointer assignment: ptr => target
+                self.advance();
+                let target_expr = self.parse_expression()?;
+                return Ok(Statement::PointerAssign {
+                    pointer: name,
+                    pointer_components: components,
+                    target: target_expr,
+                    location,
+                });
             } else {
                 return Err(ParseError::UnexpectedToken {
-                    expected: "= (assignment)".to_string(),
+                    expected: "= or => (assignment)".to_string(),
                     found: self.peek().token_type.clone(),
                     location,
                 });
@@ -1614,6 +1662,115 @@ impl Parser {
         })
     }
 
+    /// Parse ALLOCATE statement: ALLOCATE(var, STAT=stat)
+    fn parse_allocate_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Allocate, "ALLOCATE")?;
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse variable name
+        let variable = self.expect_identifier()?;
+
+        // Parse optional array dimensions
+        let dimensions = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let mut dims = Vec::new();
+            loop {
+                dims.push(self.parse_expression()?);
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&TokenType::RightParen, ")")?;
+            Some(dims)
+        } else {
+            None
+        };
+
+        // Parse optional STAT
+        let stat = if self.check(&TokenType::Comma) {
+            self.advance();
+            if self.check(&TokenType::Stat) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                Some(self.expect_identifier()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        Ok(Statement::Allocate {
+            variable,
+            dimensions,
+            stat,
+            location,
+        })
+    }
+
+    /// Parse DEALLOCATE statement: DEALLOCATE(var, STAT=stat)
+    fn parse_deallocate_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Deallocate, "DEALLOCATE")?;
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse variable name
+        let variable = self.expect_identifier()?;
+
+        // Parse optional STAT
+        let stat = if self.check(&TokenType::Comma) {
+            self.advance();
+            if self.check(&TokenType::Stat) {
+                self.advance();
+                self.expect(&TokenType::Equal, "=")?;
+                Some(self.expect_identifier()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        Ok(Statement::Deallocate {
+            variable,
+            stat,
+            location,
+        })
+    }
+
+    /// Parse NULLIFY statement: NULLIFY(ptr1, ptr2, ...)
+    fn parse_nullify_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        // Consume NULLIFY identifier
+        self.advance();
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse list of pointer names
+        let mut pointers = Vec::new();
+        loop {
+            pointers.push(self.expect_identifier()?);
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        Ok(Statement::Nullify {
+            pointers,
+            location,
+        })
+    }
+
     /// Check if current token could start an identifier
     fn is_identifier_start(&self) -> bool {
         matches!(
@@ -1706,6 +1863,200 @@ impl Parser {
         }
 
         Ok(args)
+    }
+
+    /// Parse array subscript list, which may contain slices
+    /// Returns (subscripts, has_slices) where has_slices indicates if any slice notation was used
+    fn parse_subscript_list(&mut self) -> ParseResult<(Vec<ArraySubscript>, bool)> {
+        let mut subscripts = Vec::new();
+        let mut has_slices = false;
+
+        // Empty subscript list
+        if self.check(&TokenType::RightParen) {
+            return Ok((subscripts, false));
+        }
+
+        loop {
+            let subscript = self.parse_subscript()?;
+            if matches!(subscript, ArraySubscript::Slice { .. }) {
+                has_slices = true;
+            }
+            subscripts.push(subscript);
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok((subscripts, has_slices))
+    }
+
+    /// Parse a single subscript (either an index or a slice)
+    fn parse_subscript(&mut self) -> ParseResult<ArraySubscript> {
+        // Check if this starts with :: (DoubleColon) - e.g., arr(::2)
+        if self.check(&TokenType::DoubleColon) {
+            // This is a slice with no start and no end, just potentially a step
+            self.advance(); // consume ::
+            let step = if self.check(&TokenType::Comma) || self.check(&TokenType::RightParen) {
+                None
+            } else {
+                Some(Box::new(self.parse_expression()?))
+            };
+            return Ok(ArraySubscript::Slice { start: None, end: None, step });
+        }
+
+        // Check if this starts with a single colon (e.g., `:5` or `:`)
+        if self.check(&TokenType::Colon) {
+            // This is a slice starting with no lower bound
+            return self.parse_slice(None);
+        }
+
+        // Parse the first expression
+        let first_expr = self.parse_expression()?;
+
+        // Check if followed by :: (DoubleColon) - e.g., arr(2::2)
+        if self.check(&TokenType::DoubleColon) {
+            self.advance(); // consume ::
+            let step = if self.check(&TokenType::Comma) || self.check(&TokenType::RightParen) {
+                None
+            } else {
+                Some(Box::new(self.parse_expression()?))
+            };
+            return Ok(ArraySubscript::Slice {
+                start: Some(Box::new(first_expr)),
+                end: None,
+                step,
+            });
+        }
+
+        // Check if followed by single colon (making it a slice)
+        if self.check(&TokenType::Colon) {
+            // This is a slice: first_expr:...
+            return self.parse_slice(Some(Box::new(first_expr)));
+        }
+
+        // Just a simple index
+        Ok(ArraySubscript::Index(first_expr))
+    }
+
+    /// Parse remainder of a slice after we've seen start (or know start is None)
+    /// Handles: start:end, start:end:step, start:, start::step, :end, :end:step, :, ::step
+    fn parse_slice(&mut self, start: Option<Box<Expr>>) -> ParseResult<ArraySubscript> {
+        // Consume the first colon
+        self.expect(&TokenType::Colon, ":")?;
+
+        // Check what follows the colon
+        let end = if self.check(&TokenType::Colon) || self.check(&TokenType::DoubleColon) || self.check(&TokenType::Comma) || self.check(&TokenType::RightParen) {
+            // No end value: `start:` or `start::step` or `:` or `::step`
+            None
+        } else {
+            // There's an end value
+            Some(Box::new(self.parse_expression()?))
+        };
+
+        // Check for step (another colon or double colon)
+        let step = if self.check(&TokenType::Colon) {
+            self.advance();
+            if self.check(&TokenType::Comma) || self.check(&TokenType::RightParen) {
+                // No step value after second colon (weird but valid: `1:5:`)
+                None
+            } else {
+                Some(Box::new(self.parse_expression()?))
+            }
+        } else if self.check(&TokenType::DoubleColon) {
+            // Rare case: `:end::step` or similar, where :: appears
+            self.advance();
+            if self.check(&TokenType::Comma) || self.check(&TokenType::RightParen) {
+                None
+            } else {
+                Some(Box::new(self.parse_expression()?))
+            }
+        } else {
+            None
+        };
+
+        Ok(ArraySubscript::Slice { start, end, step })
+    }
+
+    /// Parse array constructor items (values and implied-DO loops)
+    fn parse_array_constructor_items(&mut self) -> ParseResult<Vec<ArrayConstructorItem>> {
+        let mut items = Vec::new();
+
+        // Empty constructor
+        if self.check(&TokenType::RightBracket) {
+            return Ok(items);
+        }
+
+        loop {
+            let item = self.parse_array_constructor_item()?;
+            items.push(item);
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Parse a single array constructor item (value or implied-DO)
+    fn parse_array_constructor_item(&mut self) -> ParseResult<ArrayConstructorItem> {
+        // Check for implied-DO: (expr, var=start,end[,step])
+        if self.check(&TokenType::LeftParen) {
+            // Could be an implied-DO or just a parenthesized expression
+            // Look ahead to detect the pattern: (expr, identifier =
+            let checkpoint = self.position;
+
+            self.advance(); // consume (
+            let first_expr = self.parse_expression()?;
+
+            if self.check(&TokenType::Comma) {
+                // This might be an implied-DO
+                self.advance();
+                if let TokenType::Identifier(var_name) = &self.peek().token_type.clone() {
+                    let var = var_name.clone();
+                    self.advance();
+
+                    if self.check(&TokenType::Equal) {
+                        // This is an implied-DO
+                        self.advance();
+                        let start = self.parse_expression()?;
+                        self.expect(&TokenType::Comma, ",")?;
+                        let end = self.parse_expression()?;
+
+                        let step = if self.check(&TokenType::Comma) {
+                            self.advance();
+                            Some(Box::new(self.parse_expression()?))
+                        } else {
+                            None
+                        };
+
+                        self.expect(&TokenType::RightParen, ")")?;
+
+                        return Ok(ArrayConstructorItem::ImpliedDo {
+                            expr: Box::new(first_expr),
+                            var,
+                            start: Box::new(start),
+                            end: Box::new(end),
+                            step,
+                        });
+                    }
+                }
+                // Not an implied-DO, restore position and parse as value
+                self.position = checkpoint;
+            } else {
+                // Just a parenthesized expression, restore and parse as value
+                self.position = checkpoint;
+            }
+        }
+
+        // Parse as a simple value
+        let expr = self.parse_expression()?;
+        Ok(ArrayConstructorItem::Value(expr))
     }
 
     /// Parse IF statement
@@ -1815,12 +2166,17 @@ impl Parser {
         })
     }
 
-    /// Parse DO statement (loop, while, or infinite)
+    /// Parse DO statement (loop, while, concurrent, or infinite)
     fn parse_do_statement(&mut self) -> ParseResult<Statement> {
         let location = self.current_location();
         self.expect(&TokenType::Do, "DO")?;
 
         // Check what kind of DO loop this is
+
+        // DO CONCURRENT
+        if self.check(&TokenType::Concurrent) {
+            return self.parse_do_concurrent(location);
+        }
 
         // DO WHILE
         if self.check(&TokenType::While) {
@@ -1897,6 +2253,355 @@ impl Parser {
         self.expect(&TokenType::Do, "DO")?;
 
         Ok(Statement::DoInfinite { body, location })
+    }
+
+    /// Parse DO CONCURRENT statement
+    /// Syntax: DO CONCURRENT (i = start:end, j = start:end) [locality-specs]
+    fn parse_do_concurrent(&mut self, location: SourceLocation) -> ParseResult<Statement> {
+        self.expect(&TokenType::Concurrent, "CONCURRENT")?;
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse concurrent controls
+        let mut controls = Vec::new();
+        loop {
+            let variable = self.expect_identifier()?;
+            self.expect(&TokenType::Equal, "=")?;
+
+            let start = self.parse_expression()?;
+            self.expect(&TokenType::Colon, ":")?;
+            let end = self.parse_expression()?;
+
+            // Optional step (start:end:step)
+            let step = if self.check(&TokenType::Colon) {
+                self.advance();
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+
+            controls.push(ConcurrentControl {
+                variable,
+                start,
+                end,
+                step,
+            });
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Parse optional locality specifications
+        let mut locality = Vec::new();
+        while self.check_locality_keyword() {
+            locality.push(self.parse_locality_spec()?);
+        }
+
+        // Parse body
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.is_end_do() {
+            body.push(self.parse_statement()?);
+        }
+
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Do, "DO")?;
+
+        Ok(Statement::DoConcurrent {
+            controls,
+            locality,
+            body,
+            location,
+        })
+    }
+
+    /// Check if current token is a locality keyword
+    fn check_locality_keyword(&self) -> bool {
+        matches!(
+            self.peek().token_type,
+            TokenType::Identifier(ref s) if s.to_uppercase() == "LOCAL"
+                || s.to_uppercase() == "LOCAL_INIT"
+                || s.to_uppercase() == "SHARED"
+                || s.to_uppercase() == "DEFAULT"
+        )
+    }
+
+    /// Parse a locality specification
+    fn parse_locality_spec(&mut self) -> ParseResult<LocalitySpec> {
+        let keyword = self.expect_identifier()?.to_uppercase();
+
+        match keyword.as_str() {
+            "LOCAL" => {
+                self.expect(&TokenType::LeftParen, "(")?;
+                let vars = self.parse_identifier_list()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Ok(LocalitySpec::Local(vars))
+            }
+            "LOCAL_INIT" => {
+                self.expect(&TokenType::LeftParen, "(")?;
+                let vars = self.parse_identifier_list()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Ok(LocalitySpec::LocalInit(vars))
+            }
+            "SHARED" => {
+                self.expect(&TokenType::LeftParen, "(")?;
+                let vars = self.parse_identifier_list()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                Ok(LocalitySpec::Shared(vars))
+            }
+            "DEFAULT" => {
+                self.expect(&TokenType::LeftParen, "(")?;
+                let mode = self.expect_identifier()?.to_uppercase();
+                self.expect(&TokenType::RightParen, ")")?;
+                if mode == "NONE" {
+                    Ok(LocalitySpec::DefaultNone)
+                } else {
+                    Err(ParseError::UnexpectedToken {
+                        expected: "NONE".to_string(),
+                        found: TokenType::Identifier(mode),
+                        location: self.current_location(),
+                    })
+                }
+            }
+            _ => Err(ParseError::UnexpectedToken {
+                expected: "locality keyword (LOCAL, SHARED, DEFAULT)".to_string(),
+                found: TokenType::Identifier(keyword),
+                location: self.current_location(),
+            }),
+        }
+    }
+
+    /// Parse a comma-separated list of identifiers
+    fn parse_identifier_list(&mut self) -> ParseResult<Vec<String>> {
+        let mut names = Vec::new();
+        names.push(self.expect_identifier()?);
+        while self.check(&TokenType::Comma) {
+            self.advance();
+            names.push(self.expect_identifier()?);
+        }
+        Ok(names)
+    }
+
+    /// Parse SYNC statement (SYNC ALL or SYNC IMAGES)
+    fn parse_sync_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Sync, "SYNC")?;
+
+        if self.check(&TokenType::All) {
+            self.advance();
+            Ok(Statement::SyncAll { location })
+        } else if self.check(&TokenType::Images) {
+            self.advance();
+            // Optional image list: SYNC IMAGES (1, 2, 3) or SYNC IMAGES (*)
+            let images = if self.check(&TokenType::LeftParen) {
+                self.advance();
+                if self.check(&TokenType::Star) {
+                    self.advance();
+                    self.expect(&TokenType::RightParen, ")")?;
+                    None // * means all images
+                } else {
+                    let mut img_list = Vec::new();
+                    img_list.push(self.parse_expression()?);
+                    while self.check(&TokenType::Comma) {
+                        self.advance();
+                        img_list.push(self.parse_expression()?);
+                    }
+                    self.expect(&TokenType::RightParen, ")")?;
+                    Some(img_list)
+                }
+            } else {
+                None
+            };
+            Ok(Statement::SyncImages { images, location })
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "ALL or IMAGES".to_string(),
+                found: self.peek().token_type.clone(),
+                location,
+            })
+        }
+    }
+
+    /// Parse CRITICAL section
+    fn parse_critical_section(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Critical, "CRITICAL")?;
+
+        // Parse body until END CRITICAL
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenType::End) {
+            body.push(self.parse_statement()?);
+        }
+
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Critical, "CRITICAL")?;
+
+        Ok(Statement::Critical { body, location })
+    }
+
+    /// Parse WHERE statement/construct
+    /// Single-line form: WHERE (mask) assignment
+    /// Block form: WHERE (mask) ... [ELSEWHERE ...] END WHERE
+    fn parse_where_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Where, "WHERE")?;
+
+        // Parse mask expression in parentheses
+        self.expect(&TokenType::LeftParen, "(")?;
+        let mask = self.parse_expression()?;
+
+        // Save line of ) to detect single-line WHERE
+        let rparen_line = self.peek().location.line;
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Detect single-line WHERE: statement is on same line as WHERE (mask)
+        let next_token_line = self.peek().location.line;
+        let is_single_line = next_token_line == rparen_line
+            && !self.check(&TokenType::End)
+            && !self.check(&TokenType::Elsewhere)
+            && !self.is_at_end();
+
+        if is_single_line {
+            // Single-line WHERE: parse one statement and return (no END WHERE)
+            let stmt = self.parse_statement()?;
+            return Ok(Statement::Where {
+                mask,
+                body: vec![stmt],
+                elsewhere: None,
+                location,
+            });
+        }
+
+        // Block WHERE: parse body statements until END or ELSEWHERE
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenType::End) && !self.check(&TokenType::Elsewhere) {
+            body.push(self.parse_statement()?);
+        }
+
+        // Check for ELSEWHERE
+        let elsewhere = if self.check(&TokenType::Elsewhere) {
+            self.advance();
+            let mut else_body = Vec::new();
+            while !self.is_at_end() && !self.check(&TokenType::End) {
+                else_body.push(self.parse_statement()?);
+            }
+            Some(else_body)
+        } else {
+            None
+        };
+
+        // Expect END WHERE for block form
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Where, "WHERE")?;
+
+        Ok(Statement::Where {
+            mask,
+            body,
+            elsewhere,
+            location,
+        })
+    }
+
+    /// Parse FORALL statement/construct
+    fn parse_forall_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Forall, "FORALL")?;
+
+        // Parse index specifications in parentheses
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        let mut indices = Vec::new();
+        let mut mask = None;
+
+        // Parse index specs: var = start:end[:step]
+        loop {
+            // Check if this is a mask expression (no '=' follows identifier)
+            if let TokenType::Identifier(var_name) = &self.peek().token_type.clone() {
+                let var = var_name.clone();
+                self.advance();
+
+                if self.check(&TokenType::Equal) {
+                    // This is an index spec
+                    self.advance();
+                    let start = self.parse_expression()?;
+                    self.expect(&TokenType::Colon, ":")?;
+                    let end = self.parse_expression()?;
+
+                    let step = if self.check(&TokenType::Colon) {
+                        self.advance();
+                        Some(self.parse_expression()?)
+                    } else {
+                        None
+                    };
+
+                    indices.push(ForallIndex { var, start, end, step });
+                } else {
+                    // This is a mask expression - backtrack and parse
+                    // Actually, the mask comes after a comma at the end
+                    // Let's handle this differently - restore var and parse as mask
+                    // For now, assume mask is at the end after all indices
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "= after index variable".to_string(),
+                        found: self.peek().token_type.clone(),
+                        location: self.current_location(),
+                    });
+                }
+            } else {
+                break;
+            }
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+                // Check if next is the mask (not an identifier followed by =)
+                // For simplicity, if next token after comma is not identifier=, it's a mask
+                if let TokenType::Identifier(_) = &self.peek().token_type {
+                    // Look ahead to see if there's an =
+                    // For now, continue parsing indices
+                    continue;
+                } else {
+                    // Parse mask expression
+                    mask = Some(self.parse_expression()?);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Check if single-line or multi-line FORALL
+        if !self.is_at_end() && !self.check(&TokenType::End) {
+            if let TokenType::Identifier(_) = self.peek().token_type {
+                // Single-line FORALL
+                let stmt = self.parse_statement()?;
+                return Ok(Statement::Forall {
+                    indices,
+                    mask,
+                    body: vec![stmt],
+                    location,
+                });
+            }
+        }
+
+        // Multi-line FORALL construct
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenType::End) {
+            body.push(self.parse_statement()?);
+        }
+
+        // Expect END FORALL
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Forall, "FORALL")?;
+
+        Ok(Statement::Forall {
+            indices,
+            mask,
+            body,
+            location,
+        })
     }
 
     /// Parse SELECT CASE statement
@@ -2197,35 +2902,68 @@ impl Parser {
                 Ok(Expr::LogicalLiteral(false, location))
             }
 
-            // Identifier (or function call if followed by parentheses)
+            // Identifier (or function call / array access if followed by parentheses)
             TokenType::Identifier(name) => {
                 let name = name.clone();
                 self.advance();
 
-                // Check if this is a function call / array access
+                // Check if this is a function call / array access / array section
                 let mut expr = if self.check(&TokenType::LeftParen) {
                     self.advance();
-                    let arguments = self.parse_argument_list()?;
+                    let (subscripts, has_slices) = self.parse_subscript_list()?;
                     self.expect(&TokenType::RightParen, ")")?;
-                    Expr::FunctionCall {
-                        name,
-                        arguments,
-                        location,
+
+                    if has_slices {
+                        // This is an array section (slice notation used)
+                        Expr::ArraySection {
+                            name,
+                            subscripts,
+                            location,
+                        }
+                    } else {
+                        // No slices - treat as function call (could also be array element access)
+                        // Extract expressions from Index variants
+                        let arguments: Vec<Expr> = subscripts.into_iter().map(|s| {
+                            match s {
+                                ArraySubscript::Index(e) => e,
+                                ArraySubscript::Slice { .. } => unreachable!("has_slices was false"),
+                            }
+                        }).collect();
+                        Expr::FunctionCall {
+                            name,
+                            arguments,
+                            location,
+                        }
                     }
                 } else {
                     Expr::Identifier(name, location)
                 };
 
                 // Check for component access (obj%component, can be chained)
+                // Also check for method calls (obj%method(args))
                 while self.check(&TokenType::Percent) {
                     self.advance();
                     let comp_location = self.current_location();
                     let component = self.expect_identifier()?;
-                    expr = Expr::ComponentAccess {
-                        object: Box::new(expr),
-                        component,
-                        location: comp_location,
-                    };
+
+                    // Check if this is a method call (component followed by parentheses)
+                    if self.check(&TokenType::LeftParen) {
+                        self.advance();
+                        let arguments = self.parse_argument_list()?;
+                        self.expect(&TokenType::RightParen, ")")?;
+                        expr = Expr::MethodCall {
+                            object: Box::new(expr),
+                            method_name: component,
+                            arguments,
+                            location: comp_location,
+                        };
+                    } else {
+                        expr = Expr::ComponentAccess {
+                            object: Box::new(expr),
+                            component,
+                            location: comp_location,
+                        };
+                    }
                 }
 
                 Ok(expr)
@@ -2263,6 +3001,14 @@ impl Parser {
                 let expr = self.parse_expression()?;
                 self.expect(&TokenType::RightParen, ")")?;
                 Ok(Expr::Parenthesized(Box::new(expr), location))
+            }
+
+            // Array constructor: [1, 2, 3] or [(i, i=1,10)]
+            TokenType::LeftBracket => {
+                self.advance();
+                let elements = self.parse_array_constructor_items()?;
+                self.expect(&TokenType::RightBracket, "]")?;
+                Ok(Expr::ArrayConstructor { elements, location })
             }
 
             _ => Err(ParseError::UnexpectedToken {

@@ -1030,6 +1030,148 @@ impl SemanticAnalyzer {
                 self.check_expression(unit)?;
                 Ok(())
             }
+
+            Statement::PointerAssign { target, .. } => {
+                // Type check the target expression
+                self.check_expression(target)?;
+                Ok(())
+            }
+
+            Statement::Nullify { .. } => {
+                // NULLIFY just takes pointer names - nothing to type check
+                Ok(())
+            }
+
+            Statement::Allocate { dimensions, .. } => {
+                // Type check dimension expressions if present
+                if let Some(dims) = dimensions {
+                    for dim in dims {
+                        self.check_expression(dim)?;
+                    }
+                }
+                Ok(())
+            }
+
+            Statement::Deallocate { .. } => {
+                // DEALLOCATE just takes variable names - nothing to type check
+                Ok(())
+            }
+
+            Statement::DoConcurrent { controls, body, .. } => {
+                // Type check control expressions
+                for ctrl in controls {
+                    let start_type = self.check_expression(&ctrl.start)?;
+                    let end_type = self.check_expression(&ctrl.end)?;
+
+                    // Start and end must be integers
+                    if !start_type.is_integer() {
+                        return Err(SemanticError::TypeMismatch {
+                            expected: Type::integer(),
+                            found: start_type,
+                            location: *ctrl.start.location(),
+                        });
+                    }
+                    if !end_type.is_integer() {
+                        return Err(SemanticError::TypeMismatch {
+                            expected: Type::integer(),
+                            found: end_type,
+                            location: *ctrl.end.location(),
+                        });
+                    }
+
+                    // Check step if present
+                    if let Some(step) = &ctrl.step {
+                        let step_type = self.check_expression(step)?;
+                        if !step_type.is_integer() {
+                            return Err(SemanticError::TypeMismatch {
+                                expected: Type::integer(),
+                                found: step_type,
+                                location: *step.location(),
+                            });
+                        }
+                    }
+                }
+
+                // Type check body
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+                Ok(())
+            }
+
+            Statement::SyncAll { .. } => {
+                // SYNC ALL has no expressions to type check
+                Ok(())
+            }
+
+            Statement::SyncImages { images, .. } => {
+                // Type check image indices if present
+                if let Some(imgs) = images {
+                    for img in imgs {
+                        let img_type = self.check_expression(img)?;
+                        if !img_type.is_integer() {
+                            return Err(SemanticError::TypeMismatch {
+                                expected: Type::integer(),
+                                found: img_type,
+                                location: *img.location(),
+                            });
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            Statement::Critical { body, .. } => {
+                // Type check body
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+                Ok(())
+            }
+
+            Statement::Where { mask, body, elsewhere, .. } => {
+                // Type check mask (should be logical array)
+                let mask_type = self.check_expression(mask)?;
+                // Mask should be logical or array of logical
+                // For now, just allow any expression
+
+                // Type check body statements
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+
+                // Type check elsewhere if present
+                if let Some(else_stmts) = elsewhere {
+                    for stmt in else_stmts {
+                        self.analyze_statement(stmt)?;
+                    }
+                }
+
+                Ok(())
+            }
+
+            Statement::Forall { indices, mask, body, .. } => {
+                // Type check index bounds
+                for index in indices {
+                    self.check_expression(&index.start)?;
+                    self.check_expression(&index.end)?;
+                    if let Some(step) = &index.step {
+                        self.check_expression(step)?;
+                    }
+                }
+
+                // Type check mask if present
+                if let Some(m) = mask {
+                    self.check_expression(m)?;
+                }
+
+                // Type check body statements
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -1207,6 +1349,126 @@ impl SemanticAnalyzer {
                     self.check_expression(arg)?;
                 }
                 Ok(Type::Derived { name: type_name.clone() })
+            }
+
+            Expr::MethodCall { object, arguments, .. } => {
+                // Type check the object and arguments
+                self.check_expression(object)?;
+                for arg in arguments {
+                    self.check_expression(arg)?;
+                }
+                // Return a generic type for now
+                // TODO: Look up the method's return type from the type definition
+                Ok(Type::real())
+            }
+
+            Expr::ArraySection { name, subscripts, location } => {
+                // Look up the array variable
+                let symbol = self.lookup_variable(name, *location)?;
+
+                // Check that it's an array
+                if !symbol.ty.is_array() {
+                    return Err(SemanticError::TypeMismatch {
+                        expected: Type::Array {
+                            element_kind: ArrayElementKind::Integer,
+                            dimensions: vec![],
+                        },
+                        found: symbol.ty.clone(),
+                        location: *location,
+                    });
+                }
+
+                // Check subscript types (indices must be integer, slices have optional integer bounds)
+                for sub in subscripts {
+                    match sub {
+                        ArraySubscript::Index(idx_expr) => {
+                            let idx_type = self.check_expression(idx_expr)?;
+                            if !idx_type.is_numeric() {
+                                return Err(SemanticError::TypeMismatch {
+                                    expected: Type::integer(),
+                                    found: idx_type,
+                                    location: *idx_expr.location(),
+                                });
+                            }
+                        }
+                        ArraySubscript::Slice { start, end, step } => {
+                            // Check each part of the slice triplet (if present)
+                            if let Some(start_expr) = start {
+                                let start_type = self.check_expression(start_expr)?;
+                                if !start_type.is_numeric() {
+                                    return Err(SemanticError::TypeMismatch {
+                                        expected: Type::integer(),
+                                        found: start_type,
+                                        location: *start_expr.location(),
+                                    });
+                                }
+                            }
+                            if let Some(end_expr) = end {
+                                let end_type = self.check_expression(end_expr)?;
+                                if !end_type.is_numeric() {
+                                    return Err(SemanticError::TypeMismatch {
+                                        expected: Type::integer(),
+                                        found: end_type,
+                                        location: *end_expr.location(),
+                                    });
+                                }
+                            }
+                            if let Some(step_expr) = step {
+                                let step_type = self.check_expression(step_expr)?;
+                                if !step_type.is_numeric() {
+                                    return Err(SemanticError::TypeMismatch {
+                                        expected: Type::integer(),
+                                        found: step_type,
+                                        location: *step_expr.location(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Return array type (slicing returns an array, not a scalar)
+                // TODO: Compute proper dimensions based on slicing
+                Ok(symbol.ty.clone())
+            }
+
+            Expr::ArrayConstructor { elements, .. } => {
+                // Type check all elements
+                let mut element_type = Type::integer(); // Default to integer
+
+                for item in elements {
+                    match item {
+                        ArrayConstructorItem::Value(expr) => {
+                            let ty = self.check_expression(expr)?;
+                            // Update element type (could add type promotion logic)
+                            if ty.is_real() {
+                                element_type = Type::real();
+                            }
+                        }
+                        ArrayConstructorItem::ImpliedDo { expr, start, end, step, .. } => {
+                            // Check the expression and loop bounds
+                            let expr_ty = self.check_expression(expr)?;
+                            if expr_ty.is_real() {
+                                element_type = Type::real();
+                            }
+                            self.check_expression(start)?;
+                            self.check_expression(end)?;
+                            if let Some(s) = step {
+                                self.check_expression(s)?;
+                            }
+                        }
+                    }
+                }
+
+                // Return array type (1D array of the element type)
+                Ok(Type::Array {
+                    element_kind: if element_type.is_real() {
+                        ArrayElementKind::Real
+                    } else {
+                        ArrayElementKind::Integer
+                    },
+                    dimensions: vec![ArrayBound::new(1, 1)], // Placeholder, actual size unknown at compile time
+                })
             }
         }
     }

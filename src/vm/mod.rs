@@ -27,6 +27,19 @@ pub struct CallFrame {
     pub arg_count: usize,
 }
 
+/// Slice specification for array section extraction
+#[derive(Debug, Clone)]
+pub enum SliceSpec {
+    /// Single index (reduces dimension)
+    Index(i64),
+    /// Slice with optional start, end, step
+    Slice {
+        start: Option<i64>,
+        end: Option<i64>,
+        step: Option<i64>,
+    },
+}
+
 /// Runtime error types
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeError {
@@ -820,6 +833,121 @@ impl VM {
                     self.ip += 1;
                 }
 
+                OpCode::LoadArraySection => {
+                    // Stack contains: num_subscripts, then for each subscript:
+                    //   - if index (marker=0): marker, value
+                    //   - if slice (marker=1): marker, start, end, step, flags
+                    let var_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "LoadArraySection requires variable index".to_string(),
+                        location,
+                    })?;
+
+                    // Helper to extract integer from Value
+                    let value_to_int = |v: &Value, loc: SourceLocation| -> Result<i64, RuntimeError> {
+                        match v {
+                            Value::Integer(n) => Ok(*n),
+                            Value::Real(n) => Ok(*n as i64),
+                            _ => Err(RuntimeError::TypeError {
+                                message: "Expected numeric value".to_string(),
+                                location: loc,
+                            }),
+                        }
+                    };
+
+                    // Pop subscript count
+                    let num_subs_val = self.pop(location)?;
+                    let num_subs = value_to_int(&num_subs_val, location)? as usize;
+
+                    // Collect subscript specifications (in reverse order due to stack)
+                    let mut subscript_specs: Vec<SliceSpec> = Vec::with_capacity(num_subs);
+                    for _ in 0..num_subs {
+                        subscript_specs.push(SliceSpec::Index(0)); // placeholder
+                    }
+
+                    // Pop subscripts in reverse order (last subscript first on stack)
+                    for i in (0..num_subs).rev() {
+                        // Pop potential flags (if slice) or value (if index)
+                        let first_val = self.pop(location)?;
+                        let first_int = value_to_int(&first_val, location)?;
+
+                        // Check if this looks like slice flags (0-7)
+                        if first_int >= 0 && first_int <= 7 {
+                            // Could be slice flags - check further
+                            let step_val = self.pop(location)?;
+                            let end_val = self.pop(location)?;
+                            let start_val = self.pop(location)?;
+                            let marker_val = self.pop(location)?;
+                            let marker_int = value_to_int(&marker_val, location)?;
+
+                            if marker_int == 1 {
+                                // This is a slice
+                                let flags = first_int;
+                                let has_start = (flags & 1) != 0;
+                                let has_end = (flags & 2) != 0;
+                                let has_step = (flags & 4) != 0;
+
+                                subscript_specs[i] = SliceSpec::Slice {
+                                    start: if has_start { Some(value_to_int(&start_val, location)?) } else { None },
+                                    end: if has_end { Some(value_to_int(&end_val, location)?) } else { None },
+                                    step: if has_step { Some(value_to_int(&step_val, location)?) } else { None },
+                                };
+                            } else {
+                                // Not a slice - this was an index followed by other values
+                                return Err(RuntimeError::TypeError {
+                                    message: "Invalid array subscript format".to_string(),
+                                    location,
+                                });
+                            }
+                        } else {
+                            // This is an index value
+                            let marker_val = self.pop(location)?;
+                            let marker_int = value_to_int(&marker_val, location)?;
+                            if marker_int != 0 {
+                                return Err(RuntimeError::TypeError {
+                                    message: "Expected index marker".to_string(),
+                                    location,
+                                });
+                            }
+                            subscript_specs[i] = SliceSpec::Index(first_int);
+                        }
+                    }
+
+                    // Get array from variable
+                    let array = self.get_variable_by_index(var_index, location)?;
+
+                    // Extract the slice
+                    let section = self.extract_array_section(&array, &subscript_specs, location)?;
+
+                    self.push(section, location)?;
+                    self.ip += 1;
+                }
+
+                OpCode::BuildArray => {
+                    // Stack: value1, value2, ..., valueN, count
+                    // Pop count, then pop that many values, build array
+                    let count_val = self.pop(location)?;
+                    let count = match count_val {
+                        Value::Integer(n) => n as usize,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "BuildArray expected integer count".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop values in reverse order
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        elements.push(self.pop(location)?);
+                    }
+                    elements.reverse();
+
+                    // Build the array
+                    let dims = vec![ArrayDim { lower: 1, upper: count as i64 }];
+                    let array = Value::Array { elements, dims };
+                    self.push(array, location)?;
+                    self.ip += 1;
+                }
+
                 OpCode::CallIntrinsic => {
                     // Decode operand: (intrinsic_id << 8) | arg_count
                     let encoded = operand.ok_or(RuntimeError::InvalidInstruction {
@@ -1457,6 +1585,237 @@ impl VM {
                     }),
                 }
             }
+
+            Intrinsic::Reshape => {
+                // RESHAPE(source, shape) - reshape array to new shape
+                let shape_arr = self.pop(location)?;
+                let source = self.pop(location)?;
+
+                // Get shape as vector of dimensions
+                let shape = match &shape_arr {
+                    Value::Array { elements, .. } => {
+                        let mut dims = Vec::new();
+                        for elem in elements {
+                            match elem {
+                                Value::Integer(n) => dims.push(*n as usize),
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "RESHAPE: shape must be integer array".to_string(),
+                                    location,
+                                }),
+                            }
+                        }
+                        dims
+                    }
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "RESHAPE: shape must be an array".to_string(),
+                        location,
+                    }),
+                };
+
+                // Get source elements
+                let source_elements = match source {
+                    Value::Array { elements, .. } => elements,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "RESHAPE: source must be an array".to_string(),
+                        location,
+                    }),
+                };
+
+                // Calculate total size of new shape
+                let new_size: usize = shape.iter().product();
+                if new_size != source_elements.len() {
+                    return Err(RuntimeError::TypeError {
+                        message: format!(
+                            "RESHAPE: source has {} elements but shape requires {}",
+                            source_elements.len(), new_size
+                        ),
+                        location,
+                    });
+                }
+
+                // Create new array with the shape
+                let dims: Vec<ArrayDim> = shape.iter()
+                    .map(|&s| ArrayDim::new(1, s as i64))
+                    .collect();
+
+                Ok(Value::Array {
+                    elements: source_elements,
+                    dims,
+                })
+            }
+
+            Intrinsic::Transpose => {
+                // TRANSPOSE(matrix) - transpose a 2D array
+                let matrix = self.pop(location)?;
+
+                match matrix {
+                    Value::Array { elements, dims } => {
+                        if dims.len() != 2 {
+                            return Err(RuntimeError::TypeError {
+                                message: format!(
+                                    "TRANSPOSE: requires 2D array, got {}D",
+                                    dims.len()
+                                ),
+                                location,
+                            });
+                        }
+
+                        let rows = dims[0].size() as usize;
+                        let cols = dims[1].size() as usize;
+
+                        // Create transposed array (swap rows and cols)
+                        let mut transposed = vec![Value::Integer(0); elements.len()];
+                        for i in 0..rows {
+                            for j in 0..cols {
+                                let old_idx = i * cols + j;
+                                let new_idx = j * rows + i;
+                                transposed[new_idx] = elements[old_idx].clone();
+                            }
+                        }
+
+                        let new_dims = vec![
+                            ArrayDim::new(1, cols as i64),
+                            ArrayDim::new(1, rows as i64),
+                        ];
+
+                        Ok(Value::Array {
+                            elements: transposed,
+                            dims: new_dims,
+                        })
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "TRANSPOSE: requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Matmul => {
+                // MATMUL(matrix_a, matrix_b) - matrix multiplication
+                let matrix_b = self.pop(location)?;
+                let matrix_a = self.pop(location)?;
+
+                match (&matrix_a, &matrix_b) {
+                    (
+                        Value::Array { elements: a_elems, dims: a_dims },
+                        Value::Array { elements: b_elems, dims: b_dims },
+                    ) => {
+                        // Support 2D x 2D, 2D x 1D (vector), and 1D x 2D
+                        let (a_rows, a_cols) = if a_dims.len() == 2 {
+                            (a_dims[0].size() as usize, a_dims[1].size() as usize)
+                        } else if a_dims.len() == 1 {
+                            (1, a_dims[0].size() as usize)
+                        } else {
+                            return Err(RuntimeError::TypeError {
+                                message: "MATMUL: first argument must be 1D or 2D array".to_string(),
+                                location,
+                            });
+                        };
+
+                        let (b_rows, b_cols) = if b_dims.len() == 2 {
+                            (b_dims[0].size() as usize, b_dims[1].size() as usize)
+                        } else if b_dims.len() == 1 {
+                            (b_dims[0].size() as usize, 1)
+                        } else {
+                            return Err(RuntimeError::TypeError {
+                                message: "MATMUL: second argument must be 1D or 2D array".to_string(),
+                                location,
+                            });
+                        };
+
+                        // Check dimensions are compatible for multiplication
+                        if a_cols != b_rows {
+                            return Err(RuntimeError::TypeError {
+                                message: format!(
+                                    "MATMUL: incompatible dimensions ({},{}) x ({},{})",
+                                    a_rows, a_cols, b_rows, b_cols
+                                ),
+                                location,
+                            });
+                        }
+
+                        // Perform matrix multiplication
+                        // Result is stored in column-major order for Fortran
+                        let mut result = vec![Value::Integer(0); a_rows * b_cols];
+                        let mut is_integer = true;
+
+                        for i in 0..a_rows {
+                            for j in 0..b_cols {
+                                let mut sum = 0.0;
+                                for k in 0..a_cols {
+                                    // Fortran uses column-major order
+                                    let a_idx = i + k * a_rows;
+                                    let b_idx = k + j * b_rows;
+
+                                    let a_val = match &a_elems[a_idx] {
+                                        Value::Integer(n) => *n as f64,
+                                        Value::Real(n) => { is_integer = false; *n }
+                                        _ => return Err(RuntimeError::TypeError {
+                                            message: "MATMUL: requires numeric arrays".to_string(),
+                                            location,
+                                        }),
+                                    };
+                                    let b_val = match &b_elems[b_idx] {
+                                        Value::Integer(n) => *n as f64,
+                                        Value::Real(n) => { is_integer = false; *n }
+                                        _ => return Err(RuntimeError::TypeError {
+                                            message: "MATMUL: requires numeric arrays".to_string(),
+                                            location,
+                                        }),
+                                    };
+                                    sum += a_val * b_val;
+                                }
+                                // Store result in column-major order
+                                let result_idx = i + j * a_rows;
+                                if is_integer {
+                                    result[result_idx] = Value::Integer(sum as i64);
+                                } else {
+                                    result[result_idx] = Value::Real(sum);
+                                }
+                            }
+                        }
+
+                        // Determine result dimensions
+                        let result_dims = if a_dims.len() == 1 && b_dims.len() == 1 {
+                            // 1D x 1D = scalar (but we return 1D with one element)
+                            vec![ArrayDim::new(1, 1)]
+                        } else if a_dims.len() == 1 {
+                            // 1D x 2D = 1D
+                            vec![ArrayDim::new(1, b_cols as i64)]
+                        } else if b_dims.len() == 1 {
+                            // 2D x 1D = 1D
+                            vec![ArrayDim::new(1, a_rows as i64)]
+                        } else {
+                            // 2D x 2D = 2D
+                            vec![
+                                ArrayDim::new(1, a_rows as i64),
+                                ArrayDim::new(1, b_cols as i64),
+                            ]
+                        };
+
+                        Ok(Value::Array {
+                            elements: result,
+                            dims: result_dims,
+                        })
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "MATMUL: requires two array arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::ThisImage => {
+                // In single-image mode, always return 1
+                // In multi-image mode, this would return the current image index
+                Ok(Value::Integer(1))
+            }
+
+            Intrinsic::NumImages => {
+                // In single-image mode, always return 1
+                // In multi-image mode, this would return the total number of images
+                Ok(Value::Integer(1))
+            }
         }
     }
 
@@ -1587,6 +1946,149 @@ impl VM {
         indices.reverse();
 
         Ok(indices)
+    }
+
+    /// Extract an array section based on slice specifications
+    fn extract_array_section(&self, array: &Value, specs: &[SliceSpec], location: SourceLocation) -> VMResult<Value> {
+        match array {
+            Value::Array { elements, dims } => {
+                // Get array dimensions info
+                let dim_bounds: Vec<(i64, i64)> = dims.iter()
+                    .map(|d| (d.lower, d.upper))
+                    .collect();
+
+                if specs.len() != dim_bounds.len() {
+                    return Err(RuntimeError::IndexOutOfBounds {
+                        message: format!("Expected {} subscripts, got {}", dim_bounds.len(), specs.len()),
+                        location,
+                    });
+                }
+
+                // Process each dimension and determine resulting shape
+                let mut result_dims: Vec<ArrayDim> = Vec::new();
+                let mut slice_ranges: Vec<Vec<i64>> = Vec::new();
+
+                for (spec, (lower, upper)) in specs.iter().zip(dim_bounds.iter()) {
+                    match spec {
+                        SliceSpec::Index(idx) => {
+                            // Single index - this dimension is eliminated
+                            if *idx < *lower || *idx > *upper {
+                                return Err(RuntimeError::IndexOutOfBounds {
+                                    message: format!("Index {} out of bounds [{}, {}]", idx, lower, upper),
+                                    location,
+                                });
+                            }
+                            slice_ranges.push(vec![*idx]);
+                        }
+                        SliceSpec::Slice { start, end, step } => {
+                            // Slice - dimension is preserved (possibly with different size)
+                            let start_idx = start.unwrap_or(*lower);
+                            let end_idx = end.unwrap_or(*upper);
+                            let step_val = step.unwrap_or(1);
+
+                            if step_val == 0 {
+                                return Err(RuntimeError::TypeError {
+                                    message: "Slice step cannot be zero".to_string(),
+                                    location,
+                                });
+                            }
+
+                            // Generate indices for this slice
+                            let mut indices = Vec::new();
+                            if step_val > 0 {
+                                let mut i = start_idx;
+                                while i <= end_idx {
+                                    if i >= *lower && i <= *upper {
+                                        indices.push(i);
+                                    }
+                                    i += step_val;
+                                }
+                            } else {
+                                let mut i = start_idx;
+                                while i >= end_idx {
+                                    if i >= *lower && i <= *upper {
+                                        indices.push(i);
+                                    }
+                                    i += step_val;
+                                }
+                            }
+
+                            if !indices.is_empty() {
+                                result_dims.push(ArrayDim {
+                                    lower: 1,
+                                    upper: indices.len() as i64,
+                                });
+                            }
+                            slice_ranges.push(indices);
+                        }
+                    }
+                }
+
+                // Extract elements based on computed ranges
+                let mut result_elements = Vec::new();
+                self.extract_elements_recursive(elements, dims, &slice_ranges, 0, &mut result_elements);
+
+                // If all dimensions were eliminated (all single indices), return scalar
+                if result_dims.is_empty() {
+                    if result_elements.len() == 1 {
+                        return Ok(result_elements.into_iter().next().unwrap());
+                    }
+                }
+
+                Ok(Value::Array {
+                    elements: result_elements,
+                    dims: result_dims,
+                })
+            }
+            _ => Err(RuntimeError::TypeError {
+                message: "Cannot slice non-array value".to_string(),
+                location,
+            }),
+        }
+    }
+
+    /// Recursively extract elements from an array based on slice ranges
+    fn extract_elements_recursive(
+        &self,
+        elements: &[Value],
+        dimensions: &[ArrayDim],
+        slice_ranges: &[Vec<i64>],
+        dim_idx: usize,
+        result: &mut Vec<Value>,
+    ) {
+        if dim_idx >= dimensions.len() {
+            return;
+        }
+
+        let dim = &dimensions[dim_idx];
+        let range = &slice_ranges[dim_idx];
+
+        // Calculate stride for this dimension
+        let stride: usize = dimensions[dim_idx + 1..].iter()
+            .map(|d| (d.upper - d.lower + 1) as usize)
+            .product::<usize>()
+            .max(1);
+
+        for &idx in range {
+            let offset = ((idx - dim.lower) as usize) * stride;
+
+            if dim_idx == dimensions.len() - 1 {
+                // Last dimension - copy elements directly
+                if offset < elements.len() {
+                    result.push(elements[offset].clone());
+                }
+            } else {
+                // Recurse for inner dimensions
+                let sub_elements = if offset + stride <= elements.len() {
+                    &elements[offset..offset + stride]
+                } else if offset < elements.len() {
+                    &elements[offset..]
+                } else {
+                    &[]
+                };
+                self.extract_elements_recursive(sub_elements, &dimensions[dim_idx + 1..], &slice_ranges[dim_idx + 1..], 0, result);
+            }
+        }
     }
 
     // I/O operations
@@ -1901,6 +2403,7 @@ impl VM {
             Value::Character(s) => !s.is_empty(),
             Value::Array { elements, .. } => !elements.is_empty(),
             Value::Instance { .. } => true, // Instances are always truthy
+            Value::Null => false, // Null is falsy
         }
     }
 
@@ -1912,6 +2415,7 @@ impl VM {
             Value::Character(_) => 0.0,
             Value::Array { .. } => 0.0, // Arrays can't be converted to real
             Value::Instance { .. } => 0.0, // Instances can't be converted to real
+            Value::Null => 0.0, // Null can't be converted to real
         }
     }
 

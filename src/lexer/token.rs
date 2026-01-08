@@ -103,6 +103,15 @@ pub enum TokenType {
 
     // Keywords - Parallel
     Concurrent,
+    Sync,
+    All,
+    Images,
+    Critical,
+
+    // Keywords - Array operations
+    Where,
+    Elsewhere,
+    Forall,
 
     // Literals
     IntegerLiteral(String),
@@ -235,6 +244,13 @@ impl fmt::Display for TokenType {
             TokenType::Operator => write!(f, "OPERATOR"),
             TokenType::Assignment => write!(f, "ASSIGNMENT"),
             TokenType::Concurrent => write!(f, "CONCURRENT"),
+            TokenType::Sync => write!(f, "SYNC"),
+            TokenType::All => write!(f, "ALL"),
+            TokenType::Images => write!(f, "IMAGES"),
+            TokenType::Critical => write!(f, "CRITICAL"),
+            TokenType::Where => write!(f, "WHERE"),
+            TokenType::Elsewhere => write!(f, "ELSEWHERE"),
+            TokenType::Forall => write!(f, "FORALL"),
             TokenType::IntegerLiteral(s) => write!(f, "Integer({})", s),
             TokenType::RealLiteral(s) => write!(f, "Real({})", s),
             TokenType::StringLiteral(s) => write!(f, "String(\"{}\")", s),

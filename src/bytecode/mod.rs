@@ -114,6 +114,13 @@ pub enum OpCode {
     LoadArrayElem,
     /// Store value into array element (operand = variable index, expects value and indices on stack)
     StoreArrayElem,
+    /// Load array section/slice (operand = variable index, expects slice specs on stack)
+    /// Stack format: [subscript_count, then for each subscript:
+    ///   - if index: 0 (marker), value
+    ///   - if slice: 1 (marker), start_or_0, end_or_0, step_or_0, has_start, has_end, has_step]
+    LoadArraySection,
+    /// Build array from stack values (expects count on top, then values below)
+    BuildArray,
 
     // Intrinsic function operations
     /// Call an intrinsic function (operand = Intrinsic enum value, expects args on stack)
@@ -168,6 +175,15 @@ pub enum Intrinsic {
     Maxval,
     Minval,
     DotProduct,
+
+    // Transformational intrinsics
+    Reshape,
+    Transpose,
+    Matmul,
+
+    // Coarray/parallel intrinsics
+    ThisImage,
+    NumImages,
 }
 
 impl Intrinsic {
@@ -203,6 +219,11 @@ impl Intrinsic {
             26 => Some(Intrinsic::Maxval),
             27 => Some(Intrinsic::Minval),
             28 => Some(Intrinsic::DotProduct),
+            29 => Some(Intrinsic::Reshape),
+            30 => Some(Intrinsic::Transpose),
+            31 => Some(Intrinsic::Matmul),
+            32 => Some(Intrinsic::ThisImage),
+            33 => Some(Intrinsic::NumImages),
             _ => None,
         }
     }
@@ -240,6 +261,13 @@ impl Intrinsic {
             "MAXVAL" => Some(Intrinsic::Maxval),
             "MINVAL" => Some(Intrinsic::Minval),
             "DOT_PRODUCT" => Some(Intrinsic::DotProduct),
+            // Transformational intrinsics
+            "RESHAPE" => Some(Intrinsic::Reshape),
+            "TRANSPOSE" => Some(Intrinsic::Transpose),
+            "MATMUL" => Some(Intrinsic::Matmul),
+            // Coarray/parallel intrinsics
+            "THIS_IMAGE" => Some(Intrinsic::ThisImage),
+            "NUM_IMAGES" => Some(Intrinsic::NumImages),
             _ => None,
         }
     }
@@ -267,6 +295,14 @@ impl Intrinsic {
 
             // Two array argument function
             Intrinsic::DotProduct => (2, 2),
+
+            // Transformational intrinsics
+            Intrinsic::Reshape => (2, 2),    // RESHAPE(source, shape)
+            Intrinsic::Transpose => (1, 1),  // TRANSPOSE(matrix)
+            Intrinsic::Matmul => (2, 2),     // MATMUL(matrix_a, matrix_b)
+
+            // Coarray/parallel intrinsics (no arguments)
+            Intrinsic::ThisImage | Intrinsic::NumImages => (0, 0),
         }
     }
 }
@@ -303,6 +339,11 @@ impl fmt::Display for Intrinsic {
             Intrinsic::Maxval => write!(f, "MAXVAL"),
             Intrinsic::Minval => write!(f, "MINVAL"),
             Intrinsic::DotProduct => write!(f, "DOT_PRODUCT"),
+            Intrinsic::Reshape => write!(f, "RESHAPE"),
+            Intrinsic::Transpose => write!(f, "TRANSPOSE"),
+            Intrinsic::Matmul => write!(f, "MATMUL"),
+            Intrinsic::ThisImage => write!(f, "THIS_IMAGE"),
+            Intrinsic::NumImages => write!(f, "NUM_IMAGES"),
         }
     }
 }
@@ -350,6 +391,8 @@ impl fmt::Display for OpCode {
             OpCode::AllocArray => write!(f, "AllocArray"),
             OpCode::LoadArrayElem => write!(f, "LoadArrayElem"),
             OpCode::StoreArrayElem => write!(f, "StoreArrayElem"),
+            OpCode::LoadArraySection => write!(f, "LoadArraySection"),
+            OpCode::BuildArray => write!(f, "BuildArray"),
             OpCode::CallIntrinsic => write!(f, "CallIntrinsic"),
             OpCode::CreateInstance => write!(f, "CreateInstance"),
             OpCode::LoadComponent => write!(f, "LoadComponent"),
@@ -424,6 +467,8 @@ pub enum Value {
         /// Component values in order matching type definition
         components: Vec<Value>,
     },
+    /// Null pointer value (for disassociated pointers)
+    Null,
 }
 
 impl Value {
@@ -435,6 +480,7 @@ impl Value {
             Value::Character(_) => "CHARACTER",
             Value::Array { .. } => "ARRAY",
             Value::Instance { .. } => "DERIVED TYPE",
+            Value::Null => "NULL",
         }
     }
 
@@ -575,6 +621,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Null => write!(f, "NULL()"),
         }
     }
 }
@@ -1795,7 +1842,328 @@ impl Compiler {
                 self.chunk.emit(OpCode::CloseFile, *location);
                 Ok(())
             }
+
+            Statement::PointerAssign { pointer, pointer_components, target, location } => {
+                // For now, treat pointer assignment like regular assignment
+                // TODO: Implement proper pointer semantics with Value::Pointer
+                self.compile_expression(target)?;
+                let var_index = self.chunk.add_variable(pointer.clone());
+
+                if pointer_components.is_empty() {
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                } else {
+                    // Store into component
+                    self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                    for (i, comp) in pointer_components.iter().enumerate() {
+                        if i < pointer_components.len() - 1 {
+                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
+                            self.chunk.emit_with_operand(OpCode::LoadComponent, comp_idx, *location);
+                        } else {
+                            let comp_idx = self.chunk.add_constant(Value::Character(comp.clone()));
+                            self.chunk.emit_with_operand(OpCode::StoreComponent, comp_idx, *location);
+                        }
+                    }
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                }
+                Ok(())
+            }
+
+            Statement::Nullify { pointers, location } => {
+                // Set each pointer to null (using nil/undefined value)
+                for ptr_name in pointers {
+                    let null_idx = self.chunk.add_constant(Value::Null);
+                    self.chunk.emit_with_operand(OpCode::LoadConst, null_idx, *location);
+                    let var_index = self.chunk.add_variable(ptr_name.clone());
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                }
+                Ok(())
+            }
+
+            Statement::Allocate { variable, dimensions, location, .. } => {
+                // Allocate creates an array with specified dimensions
+                // Stack layout: lower1, upper1, lower2, upper2, ..., num_dims
+                if let Some(dims) = dimensions {
+                    // For each dimension, push lower (1 for Fortran default) and upper bound
+                    for dim in dims {
+                        // Push lower bound (1 for Fortran 1-based arrays)
+                        let one_idx = self.chunk.add_constant(Value::Integer(1));
+                        self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, *location);
+                        // Push upper bound (the dimension size expression)
+                        self.compile_expression(dim)?;
+                    }
+                    // Push number of dimensions
+                    let num_dims_idx = self.chunk.add_constant(Value::Integer(dims.len() as i64));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, num_dims_idx, *location);
+                    // Create the array with var_index as operand
+                    let var_index = self.chunk.add_variable(variable.clone());
+                    self.chunk.emit_with_operand(OpCode::AllocArray, var_index, *location);
+                } else {
+                    // Scalar allocation - just mark as allocated (no-op for now)
+                }
+                Ok(())
+            }
+
+            Statement::Deallocate { variable, location, .. } => {
+                // Deallocate sets the variable to nil
+                let null_idx = self.chunk.add_constant(Value::Null);
+                self.chunk.emit_with_operand(OpCode::LoadConst, null_idx, *location);
+                let var_index = self.chunk.add_variable(variable.clone());
+                self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                Ok(())
+            }
+
+            Statement::DoConcurrent { controls, body, location, .. } => {
+                // For now, compile DO CONCURRENT as a sequential nested loop
+                // TODO: Implement parallel execution using rayon
+                self.compile_do_concurrent(controls, body, *location)
+            }
+
+            Statement::SyncAll { location } => {
+                // SYNC ALL - synchronization point (no-op in single-image mode)
+                // Just emit a no-op for now
+                self.chunk.emit(OpCode::Nop, *location);
+                Ok(())
+            }
+
+            Statement::SyncImages { location, .. } => {
+                // SYNC IMAGES - synchronization point (no-op in single-image mode)
+                self.chunk.emit(OpCode::Nop, *location);
+                Ok(())
+            }
+
+            Statement::Critical { body, location } => {
+                // CRITICAL section - compile body sequentially
+                // In multi-threaded mode, this would need mutex protection
+                for stmt in body {
+                    self.compile_statement(stmt)?;
+                }
+                let _ = location; // Suppress unused warning
+                Ok(())
+            }
+
+            Statement::Where { mask, body, elsewhere, location } => {
+                // WHERE construct: masked array assignment
+                // Simplified implementation: compile as element-by-element operations
+                // In a full implementation, this would iterate over array elements
+                // and apply the mask. For now, we compile body/elsewhere sequentially
+                // and let array operations handle masking naturally.
+
+                // Compile mask expression and store it
+                self.compile_expression(mask)?;
+                let mask_var = "__where_mask".to_string();
+                let mask_index = self.chunk.add_variable(mask_var);
+                self.chunk.emit_with_operand(OpCode::StoreVar, mask_index, *location);
+
+                // For a simple WHERE (single mask check), we use conditional execution
+                // Load mask and check if it's truthy (for scalar mask)
+                self.chunk.emit_with_operand(OpCode::LoadVar, mask_index, *location);
+
+                // Jump over body if mask is false
+                let else_jump = self.chunk.current_offset();
+                self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, *location);
+
+                // Compile WHERE body
+                for stmt in body {
+                    self.compile_statement(stmt)?;
+                }
+
+                // Handle ELSEWHERE
+                if let Some(else_stmts) = elsewhere {
+                    // Jump over elsewhere block after body
+                    let end_jump = self.chunk.current_offset();
+                    self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
+
+                    // Patch else_jump to here
+                    let elsewhere_start = self.chunk.current_offset();
+                    self.chunk.patch_jump(else_jump, elsewhere_start);
+
+                    // Compile ELSEWHERE body
+                    for stmt in else_stmts {
+                        self.compile_statement(stmt)?;
+                    }
+
+                    // Patch end_jump to after elsewhere
+                    let end_pos = self.chunk.current_offset();
+                    self.chunk.patch_jump(end_jump, end_pos);
+                } else {
+                    // No elsewhere - just patch the jump
+                    let end_pos = self.chunk.current_offset();
+                    self.chunk.patch_jump(else_jump, end_pos);
+                }
+
+                Ok(())
+            }
+
+            Statement::Forall { indices, mask, body, location } => {
+                // FORALL construct: element-wise array operations
+                // Compile as nested loops
+
+                // Generate nested loop structure
+                let mut loop_vars = Vec::new();
+                let mut loop_starts = Vec::new();
+                let mut exit_jumps = Vec::new();
+
+                // Initialize all loop variables and store end/step values
+                for (i, idx) in indices.iter().enumerate() {
+                    let var_index = self.chunk.add_variable(idx.var.clone());
+                    loop_vars.push(var_index);
+
+                    // Initialize loop variable with start
+                    self.compile_expression(&idx.start)?;
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+
+                    // Store end value
+                    self.compile_expression(&idx.end)?;
+                    let end_var = format!("__forall_end_{}", i);
+                    let end_index = self.chunk.add_variable(end_var);
+                    self.chunk.emit_with_operand(OpCode::StoreVar, end_index, *location);
+
+                    // Store step value (default 1)
+                    if let Some(step) = &idx.step {
+                        self.compile_expression(step)?;
+                    } else {
+                        let one_idx = self.chunk.add_constant(Value::Integer(1));
+                        self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, *location);
+                    }
+                    let step_var = format!("__forall_step_{}", i);
+                    let step_index = self.chunk.add_variable(step_var);
+                    self.chunk.emit_with_operand(OpCode::StoreVar, step_index, *location);
+
+                    // Loop start
+                    loop_starts.push(self.chunk.current_offset());
+
+                    // Check condition: var <= end
+                    self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                    self.chunk.emit_with_operand(OpCode::LoadVar, end_index, *location);
+                    self.chunk.emit(OpCode::LessEqual, *location);
+
+                    // Jump out if false
+                    let exit_jump = self.chunk.current_offset();
+                    self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, *location);
+                    exit_jumps.push((exit_jump, end_index, step_index));
+                }
+
+                // Compile mask check if present
+                if let Some(m) = mask {
+                    self.compile_expression(m)?;
+                    let skip_jump = self.chunk.current_offset();
+                    self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, *location);
+
+                    // Compile body
+                    for stmt in body {
+                        self.compile_statement(stmt)?;
+                    }
+
+                    // Patch skip jump to after body
+                    let after_body = self.chunk.current_offset();
+                    self.chunk.patch_jump(skip_jump, after_body);
+                } else {
+                    // Compile body
+                    for stmt in body {
+                        self.compile_statement(stmt)?;
+                    }
+                }
+
+                // Generate loop increments and jumps (in reverse order)
+                for (i, (exit_jump, end_index, step_index)) in exit_jumps.iter().enumerate().rev() {
+                    let var_index = loop_vars[i];
+
+                    // Increment loop variable
+                    self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                    self.chunk.emit_with_operand(OpCode::LoadVar, *step_index, *location);
+                    self.chunk.emit(OpCode::Add, *location);
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+
+                    // Jump back to loop start
+                    self.chunk.emit_with_operand(OpCode::Jump, loop_starts[i], *location);
+
+                    // Patch exit jump
+                    let after_loop = self.chunk.current_offset();
+                    self.chunk.patch_jump(*exit_jump, after_loop);
+                }
+
+                Ok(())
+            }
         }
+    }
+
+    /// Compile DO CONCURRENT loop
+    fn compile_do_concurrent(
+        &mut self,
+        controls: &[ConcurrentControl],
+        body: &[Statement],
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        // For now, compile as nested sequential loops
+        // TODO: Add parallel execution via OpCode::DoConcurrentStart/End
+
+        if controls.is_empty() {
+            // No controls, just execute body once
+            for stmt in body {
+                self.compile_statement(stmt)?;
+            }
+            return Ok(());
+        }
+
+        // Compile nested loops for each control
+        self.compile_concurrent_control(controls, 0, body, location)
+    }
+
+    /// Recursively compile concurrent controls as nested loops
+    fn compile_concurrent_control(
+        &mut self,
+        controls: &[ConcurrentControl],
+        index: usize,
+        body: &[Statement],
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        if index >= controls.len() {
+            // All controls processed, compile body
+            for stmt in body {
+                self.compile_statement(stmt)?;
+            }
+            return Ok(());
+        }
+
+        let ctrl = &controls[index];
+        let var_index = self.chunk.add_variable(ctrl.variable.clone());
+
+        // Initialize loop variable: var = start
+        self.compile_expression(&ctrl.start)?;
+        self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
+
+        // Loop start
+        let loop_start = self.chunk.current_offset();
+
+        // Compile end expression and compare: var <= end
+        self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
+        self.compile_expression(&ctrl.end)?;
+        self.chunk.emit(OpCode::LessEqual, location);
+
+        // Jump to end if false
+        let jump_to_end = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Compile inner controls or body
+        self.compile_concurrent_control(controls, index + 1, body, location)?;
+
+        // Increment: var = var + step (or 1 if no step)
+        self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
+        if let Some(step) = &ctrl.step {
+            self.compile_expression(step)?;
+        } else {
+            let one_idx = self.chunk.add_constant(Value::Integer(1));
+            self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, location);
+        }
+        self.chunk.emit(OpCode::Add, location);
+        self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
+
+        // Jump back to loop start
+        self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
+
+        // Patch jump to end
+        self.chunk.patch_jump(jump_to_end, self.chunk.current_offset());
+
+        Ok(())
     }
 
     /// Compile an IF statement
@@ -2399,6 +2767,210 @@ impl Compiler {
 
                 // Emit CreateInstance with type index
                 self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
+                Ok(())
+            }
+
+            Expr::MethodCall { object, method_name, arguments, location } => {
+                // Type-bound procedure call: obj%method(args)
+                // The object is passed as the first argument (PASS attribute)
+
+                // First, compile the object (this will be the "self" argument)
+                self.compile_expression(object)?;
+
+                // Then compile all explicit arguments
+                for arg in arguments {
+                    self.compile_expression(arg)?;
+                }
+
+                // Look up the procedure associated with this method
+                // For now, we look for the procedure by the method name directly
+                // TODO: Look up from type-bound procedure registry
+                if let Some(func_address) = self.chunk.get_procedure_address(method_name) {
+                    self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                    Ok(())
+                } else {
+                    // Try with the method name as is
+                    Err(CompileError::InvalidOperation {
+                        message: format!("Unknown method: {}", method_name),
+                        location: *location,
+                    })
+                }
+            }
+
+            Expr::ArraySection { name, subscripts, location } => {
+                // Array section/slice: arr(1:5), arr(::2), arr(1:10:2, 3)
+                // Push subscript info onto the stack, then emit LoadArraySection
+
+                // For each subscript, push its components
+                for sub in subscripts {
+                    match sub {
+                        ArraySubscript::Index(idx_expr) => {
+                            // Push marker 0 (index type)
+                            let marker_idx = self.chunk.add_constant(Value::Integer(0));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, marker_idx, *location);
+                            // Push the index value
+                            self.compile_expression(idx_expr)?;
+                        }
+                        ArraySubscript::Slice { start, end, step } => {
+                            // Push marker 1 (slice type)
+                            let marker_idx = self.chunk.add_constant(Value::Integer(1));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, marker_idx, *location);
+
+                            // Push start (or 0 placeholder)
+                            if let Some(start_expr) = start {
+                                self.compile_expression(start_expr)?;
+                            } else {
+                                let zero_idx = self.chunk.add_constant(Value::Integer(0));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                            }
+
+                            // Push end (or 0 placeholder)
+                            if let Some(end_expr) = end {
+                                self.compile_expression(end_expr)?;
+                            } else {
+                                let zero_idx = self.chunk.add_constant(Value::Integer(0));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                            }
+
+                            // Push step (or 0 placeholder)
+                            if let Some(step_expr) = step {
+                                self.compile_expression(step_expr)?;
+                            } else {
+                                let zero_idx = self.chunk.add_constant(Value::Integer(0));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                            }
+
+                            // Push flags: has_start, has_end, has_step (as single integer)
+                            let flags = (if start.is_some() { 1 } else { 0 })
+                                + (if end.is_some() { 2 } else { 0 })
+                                + (if step.is_some() { 4 } else { 0 });
+                            let flags_idx = self.chunk.add_constant(Value::Integer(flags));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, flags_idx, *location);
+                        }
+                    }
+                }
+
+                // Push number of subscripts
+                let num_subs = subscripts.len();
+                let sub_count_idx = self.chunk.add_constant(Value::Integer(num_subs as i64));
+                self.chunk.emit_with_operand(OpCode::LoadConst, sub_count_idx, *location);
+
+                // Get variable index
+                let var_index = self.chunk.add_variable(name.clone());
+
+                // Emit LoadArraySection
+                self.chunk.emit_with_operand(OpCode::LoadArraySection, var_index, *location);
+                Ok(())
+            }
+
+            Expr::ArrayConstructor { elements, location } => {
+                // Compile array constructor: [1, 2, 3] or [(i, i=1,10)]
+                // Strategy: For simple values, push each value and then call BuildArray
+                // For implied-DO, use a counter variable to track element count
+
+                let mut element_count = 0;
+                let mut has_implied_do = false;
+
+                // Create a counter variable for dynamic counting
+                let counter_var = "__array_constructor_counter".to_string();
+                let counter_index = self.chunk.add_variable(counter_var);
+
+                for item in elements {
+                    match item {
+                        ArrayConstructorItem::Value(expr) => {
+                            self.compile_expression(expr)?;
+                            element_count += 1;
+                        }
+                        ArrayConstructorItem::ImpliedDo { expr, var, start, end, step } => {
+                            has_implied_do = true;
+
+                            // Initialize counter to current element count (from simple values before this)
+                            let init_count_idx = self.chunk.add_constant(Value::Integer(element_count as i64));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, init_count_idx, *location);
+                            self.chunk.emit_with_operand(OpCode::StoreVar, counter_index, *location);
+
+                            // Create loop variable
+                            let var_index = self.chunk.add_variable(var.clone());
+
+                            // Compile start and initialize loop variable
+                            self.compile_expression(start)?;
+                            self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+
+                            // Compile end value and store it temporarily
+                            self.compile_expression(end)?;
+                            let end_var = format!("__implied_do_end_{}", var);
+                            let end_index = self.chunk.add_variable(end_var);
+                            self.chunk.emit_with_operand(OpCode::StoreVar, end_index, *location);
+
+                            // Get step value (default 1)
+                            let step_val = if let Some(s) = step {
+                                self.compile_expression(s)?;
+                                let step_var = format!("__implied_do_step_{}", var);
+                                let step_index = self.chunk.add_variable(step_var.clone());
+                                self.chunk.emit_with_operand(OpCode::StoreVar, step_index, *location);
+                                Some(step_index)
+                            } else {
+                                None
+                            };
+
+                            // Loop start
+                            let loop_start = self.chunk.current_offset();
+
+                            // Check condition: var <= end (for positive step)
+                            self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                            self.chunk.emit_with_operand(OpCode::LoadVar, end_index, *location);
+                            self.chunk.emit(OpCode::LessEqual, *location);
+
+                            // Jump out if condition is false
+                            let exit_jump = self.chunk.current_offset();
+                            self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, *location);
+
+                            // Compile the expression (which uses the loop variable)
+                            self.compile_expression(expr)?;
+
+                            // Increment counter
+                            self.chunk.emit_with_operand(OpCode::LoadVar, counter_index, *location);
+                            let one_idx = self.chunk.add_constant(Value::Integer(1));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, *location);
+                            self.chunk.emit(OpCode::Add, *location);
+                            self.chunk.emit_with_operand(OpCode::StoreVar, counter_index, *location);
+
+                            // Increment loop variable
+                            self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                            if let Some(step_index) = step_val {
+                                self.chunk.emit_with_operand(OpCode::LoadVar, step_index, *location);
+                            } else {
+                                let one_idx2 = self.chunk.add_constant(Value::Integer(1));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, one_idx2, *location);
+                            }
+                            self.chunk.emit(OpCode::Add, *location);
+                            self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+
+                            // Jump back to loop start
+                            self.chunk.emit_with_operand(OpCode::Jump, loop_start, *location);
+
+                            // Patch the exit jump
+                            let after_loop = self.chunk.current_offset();
+                            self.chunk.patch_jump(exit_jump, after_loop);
+
+                            // Reset element_count since we track via counter
+                            element_count = 0;
+                        }
+                    }
+                }
+
+                // Emit BuildArray
+                if has_implied_do {
+                    // Load the counter (which has total count)
+                    self.chunk.emit_with_operand(OpCode::LoadVar, counter_index, *location);
+                    self.chunk.emit(OpCode::BuildArray, *location);
+                } else {
+                    // Simple constructor - use compile-time count
+                    let count_idx = self.chunk.add_constant(Value::Integer(element_count as i64));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+                    self.chunk.emit(OpCode::BuildArray, *location);
+                }
+
                 Ok(())
             }
         }
