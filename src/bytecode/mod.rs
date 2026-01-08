@@ -152,6 +152,14 @@ pub enum Intrinsic {
     Int,
     Real,
     Dble,
+
+    // Array intrinsics
+    Sum,
+    Product,
+    Size,
+    Maxval,
+    Minval,
+    DotProduct,
 }
 
 impl Intrinsic {
@@ -181,6 +189,12 @@ impl Intrinsic {
             20 => Some(Intrinsic::Int),
             21 => Some(Intrinsic::Real),
             22 => Some(Intrinsic::Dble),
+            23 => Some(Intrinsic::Sum),
+            24 => Some(Intrinsic::Product),
+            25 => Some(Intrinsic::Size),
+            26 => Some(Intrinsic::Maxval),
+            27 => Some(Intrinsic::Minval),
+            28 => Some(Intrinsic::DotProduct),
             _ => None,
         }
     }
@@ -211,6 +225,13 @@ impl Intrinsic {
             "INT" | "IFIX" | "IDINT" => Some(Intrinsic::Int),
             "REAL" | "FLOAT" | "SNGL" => Some(Intrinsic::Real),
             "DBLE" | "DFLOAT" => Some(Intrinsic::Dble),
+            // Array intrinsics
+            "SUM" => Some(Intrinsic::Sum),
+            "PRODUCT" => Some(Intrinsic::Product),
+            "SIZE" => Some(Intrinsic::Size),
+            "MAXVAL" => Some(Intrinsic::Maxval),
+            "MINVAL" => Some(Intrinsic::Minval),
+            "DOT_PRODUCT" => Some(Intrinsic::DotProduct),
             _ => None,
         }
     }
@@ -231,6 +252,13 @@ impl Intrinsic {
 
             // Variable argument functions (at least 2)
             Intrinsic::Max | Intrinsic::Min => (2, 255),
+
+            // Array intrinsics (single array argument)
+            Intrinsic::Sum | Intrinsic::Product | Intrinsic::Size |
+            Intrinsic::Maxval | Intrinsic::Minval => (1, 1),
+
+            // Two array argument function
+            Intrinsic::DotProduct => (2, 2),
         }
     }
 }
@@ -261,6 +289,12 @@ impl fmt::Display for Intrinsic {
             Intrinsic::Int => write!(f, "INT"),
             Intrinsic::Real => write!(f, "REAL"),
             Intrinsic::Dble => write!(f, "DBLE"),
+            Intrinsic::Sum => write!(f, "SUM"),
+            Intrinsic::Product => write!(f, "PRODUCT"),
+            Intrinsic::Size => write!(f, "SIZE"),
+            Intrinsic::Maxval => write!(f, "MAXVAL"),
+            Intrinsic::Minval => write!(f, "MINVAL"),
+            Intrinsic::DotProduct => write!(f, "DOT_PRODUCT"),
         }
     }
 }

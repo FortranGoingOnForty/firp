@@ -1088,6 +1088,220 @@ impl VM {
                     }),
                 }
             }
+
+            // Array intrinsics
+            Intrinsic::Sum => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        let mut sum = 0.0;
+                        let mut is_integer = true;
+                        for elem in &elements {
+                            match elem {
+                                Value::Integer(n) => sum += *n as f64,
+                                Value::Real(n) => {
+                                    sum += n;
+                                    is_integer = false;
+                                }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "SUM requires numeric array".to_string(),
+                                    location,
+                                }),
+                            }
+                        }
+                        if is_integer {
+                            Ok(Value::Integer(sum as i64))
+                        } else {
+                            Ok(Value::Real(sum))
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "SUM requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Product => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        let mut product = 1.0;
+                        let mut is_integer = true;
+                        for elem in &elements {
+                            match elem {
+                                Value::Integer(n) => product *= *n as f64,
+                                Value::Real(n) => {
+                                    product *= n;
+                                    is_integer = false;
+                                }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "PRODUCT requires numeric array".to_string(),
+                                    location,
+                                }),
+                            }
+                        }
+                        if is_integer {
+                            Ok(Value::Integer(product as i64))
+                        } else {
+                            Ok(Value::Real(product))
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "PRODUCT requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Size => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        Ok(Value::Integer(elements.len() as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "SIZE requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Maxval => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        if elements.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "MAXVAL: empty array".to_string(),
+                                location,
+                            });
+                        }
+                        let mut max_val: f64 = f64::NEG_INFINITY;
+                        let mut is_integer = true;
+                        for elem in &elements {
+                            match elem {
+                                Value::Integer(n) => {
+                                    if (*n as f64) > max_val {
+                                        max_val = *n as f64;
+                                    }
+                                }
+                                Value::Real(n) => {
+                                    if *n > max_val {
+                                        max_val = *n;
+                                    }
+                                    is_integer = false;
+                                }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "MAXVAL requires numeric array".to_string(),
+                                    location,
+                                }),
+                            }
+                        }
+                        if is_integer {
+                            Ok(Value::Integer(max_val as i64))
+                        } else {
+                            Ok(Value::Real(max_val))
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "MAXVAL requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Minval => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        if elements.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "MINVAL: empty array".to_string(),
+                                location,
+                            });
+                        }
+                        let mut min_val: f64 = f64::INFINITY;
+                        let mut is_integer = true;
+                        for elem in &elements {
+                            match elem {
+                                Value::Integer(n) => {
+                                    if (*n as f64) < min_val {
+                                        min_val = *n as f64;
+                                    }
+                                }
+                                Value::Real(n) => {
+                                    if *n < min_val {
+                                        min_val = *n;
+                                    }
+                                    is_integer = false;
+                                }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "MINVAL requires numeric array".to_string(),
+                                    location,
+                                }),
+                            }
+                        }
+                        if is_integer {
+                            Ok(Value::Integer(min_val as i64))
+                        } else {
+                            Ok(Value::Real(min_val))
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "MINVAL requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::DotProduct => {
+                let arr2 = self.pop(location)?;
+                let arr1 = self.pop(location)?;
+                match (&arr1, &arr2) {
+                    (Value::Array { elements: e1, .. }, Value::Array { elements: e2, .. }) => {
+                        if e1.len() != e2.len() {
+                            return Err(RuntimeError::TypeError {
+                                message: format!(
+                                    "DOT_PRODUCT: arrays must have same size ({} vs {})",
+                                    e1.len(), e2.len()
+                                ),
+                                location,
+                            });
+                        }
+                        let mut dot = 0.0;
+                        let mut is_integer = true;
+                        for (v1, v2) in e1.iter().zip(e2.iter()) {
+                            let n1 = match v1 {
+                                Value::Integer(n) => *n as f64,
+                                Value::Real(n) => { is_integer = false; *n }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "DOT_PRODUCT requires numeric arrays".to_string(),
+                                    location,
+                                }),
+                            };
+                            let n2 = match v2 {
+                                Value::Integer(n) => *n as f64,
+                                Value::Real(n) => { is_integer = false; *n }
+                                _ => return Err(RuntimeError::TypeError {
+                                    message: "DOT_PRODUCT requires numeric arrays".to_string(),
+                                    location,
+                                }),
+                            };
+                            dot += n1 * n2;
+                        }
+                        if is_integer {
+                            Ok(Value::Integer(dot as i64))
+                        } else {
+                            Ok(Value::Real(dot))
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "DOT_PRODUCT requires two array arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
         }
     }
 
