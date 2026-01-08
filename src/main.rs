@@ -1,55 +1,137 @@
+//! FIRP - Fortran Interpreter
+//!
+//! Usage:
+//!   firp              Start interactive REPL
+//!   firp <file>       Execute a Fortran file
+//!   firp --help       Show help
+
+use firp::bytecode::Compiler;
 use firp::lexer::Lexer;
 use firp::parser::Parser;
+use firp::repl::Repl;
+use firp::vm::VM;
+use std::env;
+use std::fs;
+use std::process;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    println!("FIRP - Fortran Interpreter v0.1.0");
-    println!("Sprint 02: Parser implementation\n");
+    let args: Vec<String> = env::args().collect();
 
-    // Simple test program
-    let source = r#"
-        program arithmetic
-          implicit none
-          integer :: x, y, z
-          real :: a, b
+    match args.len() {
+        1 => {
+            // No arguments - start REPL
+            run_repl();
+        }
+        2 => {
+            let arg = &args[1];
+            match arg.as_str() {
+                "--help" | "-h" => print_help(),
+                "--version" | "-v" => print_version(),
+                _ => {
+                    // Assume it's a filename
+                    run_file(arg);
+                }
+            }
+        }
+        _ => {
+            eprintln!("Usage: firp [file]");
+            eprintln!("       firp --help");
+            process::exit(1);
+        }
+    }
+}
 
-          x = 10
-          y = 3
-          z = x + y * 2
+fn print_help() {
+    println!("FIRP - Fortran Interpreter v{}", VERSION);
+    println!();
+    println!("Usage:");
+    println!("  firp              Start interactive REPL");
+    println!("  firp <file>       Execute a Fortran file");
+    println!("  firp --help       Show this help message");
+    println!("  firp --version    Show version information");
+    println!();
+    println!("REPL Commands:");
+    println!("  :help             Show REPL help");
+    println!("  :quit             Exit the REPL");
+    println!("  :vars             Show defined variables");
+    println!("  :load <file>      Load and execute a file");
+    println!();
+    println!("For more information, visit: https://github.com/FortranGoingOnForty/firp");
+}
 
-          a = 3.14
-          b = a * 2.0
+fn print_version() {
+    println!("FIRP v{}", VERSION);
+}
 
-          print *, 'Result:', z
-        end program arithmetic
-    "#;
+fn run_repl() {
+    match Repl::new() {
+        Ok(mut repl) => {
+            if let Err(e) = repl.run() {
+                eprintln!("REPL error: {}", e);
+                process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize REPL: {}", e);
+            process::exit(1);
+        }
+    }
+}
 
-    println!("Source code:");
-    println!("{}\n", source);
+fn run_file(filename: &str) {
+    // Read source file
+    let source = match fs::read_to_string(filename) {
+        Ok(contents) => contents,
+        Err(e) => {
+            eprintln!("Error reading file '{}': {}", filename, e);
+            process::exit(1);
+        }
+    };
 
-    // Lex
-    let mut lexer = Lexer::new(source);
+    // Tokenize
+    let mut lexer = Lexer::new(&source);
     let tokens = match lexer.tokenize() {
         Ok(tokens) => tokens,
         Err(e) => {
             eprintln!("Lexer error: {}", e);
-            return;
+            process::exit(1);
         }
     };
 
-    println!("✓ Lexer: {} tokens\n", tokens.len());
-
     // Parse
     let mut parser = Parser::new(tokens);
-    match parser.parse_program() {
-        Ok(program) => {
-            println!("✓ Parser: Successfully parsed program");
-            println!("  Program name: {}", program.name.as_ref().unwrap_or(&"<unnamed>".to_string()));
-            println!("  Declarations: {}", program.declarations.len());
-            println!("  Statements: {}", program.statements.len());
-            println!("\n{:#?}", program);
+    let program = match parser.parse_program() {
+        Ok(program) => program,
+        Err(e) => {
+            eprintln!("Parse error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Compile
+    let mut compiler = Compiler::new();
+    let chunk = match compiler.compile(&program) {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            eprintln!("Compile error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Execute
+    let mut vm = VM::new();
+    match vm.run(chunk) {
+        Ok(()) => {
+            // Print output
+            for line in vm.output() {
+                println!("{}", line);
+            }
         }
         Err(e) => {
-            eprintln!("Parser error: {}", e);
+            eprintln!("Runtime error: {}", e);
+            process::exit(1);
         }
     }
 }

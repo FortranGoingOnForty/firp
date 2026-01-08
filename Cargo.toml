@@ -12,5 +12,6 @@ name = "firp"
 path = "src/main.rs"
 
 [dependencies]
+rustyline = "14.0"
 
 [dev-dependencies]
