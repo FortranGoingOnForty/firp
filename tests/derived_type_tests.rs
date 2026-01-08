@@ -588,7 +588,6 @@ fn test_parse_operator_interface() {
 // =====================================================================
 
 #[test]
-#[ignore] // Derived type function parameters not yet implemented
 fn test_execute_operator_overloading_simple() {
     // Simplified test: just test calling a function that works with derived types
     let source = r#"
@@ -628,7 +627,6 @@ fn test_execute_operator_overloading_simple() {
 }
 
 #[test]
-#[ignore] // Requires derived type function parameters (not yet implemented)
 fn test_execute_operator_overloading() {
     let source = r#"
         MODULE vector_math

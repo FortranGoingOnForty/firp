@@ -5,7 +5,7 @@
 
 use crate::ast::*;
 use crate::lexer::SourceLocation;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Bytecode operation codes
@@ -976,6 +976,8 @@ pub struct Compiler {
     loop_stack: Vec<LoopContext>,
     /// Registry of compiled modules
     module_registry: ModuleRegistry,
+    /// Current function parameter names (to avoid reinitializing them)
+    current_function_params: HashSet<String>,
 }
 
 impl Compiler {
@@ -984,6 +986,7 @@ impl Compiler {
             chunk: Chunk::new(),
             loop_stack: Vec::new(),
             module_registry: ModuleRegistry::new(),
+            current_function_params: HashSet::new(),
         }
     }
 
@@ -1273,6 +1276,12 @@ impl Compiler {
         // Register procedure entry point
         self.chunk.add_procedure(sub.name.clone(), entry_address);
 
+        // Track subroutine parameters to avoid reinitializing them
+        self.current_function_params.clear();
+        for param in &sub.parameters {
+            self.current_function_params.insert(param.name.clone());
+        }
+
         // Allocate parameter slots and pop arguments into them (in reverse order)
         let param_indices: Vec<_> = sub.parameters.iter()
             .map(|param| self.chunk.add_variable(param.name.clone()))
@@ -1296,6 +1305,9 @@ impl Compiler {
         // Emit return at end
         self.chunk.emit(OpCode::Return, sub.location);
 
+        // Clear parameter tracking
+        self.current_function_params.clear();
+
         Ok(())
     }
 
@@ -1305,6 +1317,12 @@ impl Compiler {
 
         // Register procedure entry point
         self.chunk.add_procedure(func.name.clone(), entry_address);
+
+        // Track function parameters to avoid reinitializing them
+        self.current_function_params.clear();
+        for param in &func.parameters {
+            self.current_function_params.insert(param.name.clone());
+        }
 
         // Allocate parameter slots and pop arguments into them (in reverse order)
         let param_indices: Vec<_> = func.parameters.iter()
@@ -1341,6 +1359,9 @@ impl Compiler {
         // Emit return at end
         self.chunk.emit(OpCode::Return, func.location);
 
+        // Clear parameter tracking
+        self.current_function_params.clear();
+
         Ok(())
     }
 
@@ -1349,7 +1370,10 @@ impl Compiler {
         match decl {
             Declaration::Variable { type_spec, entities, location, .. } => {
                 for entity in entities {
-                    // Allocate variable slot
+                    // Check if this is a function parameter (should not be reinitialized)
+                    let is_param = self.current_function_params.contains(&entity.name);
+
+                    // Allocate variable slot (returns existing index if already declared)
                     let var_index = self.chunk.add_variable(entity.name.clone());
 
                     // Check if this is an array declaration
@@ -1383,25 +1407,28 @@ impl Compiler {
                             .emit_with_operand(OpCode::StoreVar, var_index, *location);
                     } else if let TypeSpec::Derived { name, .. } = type_spec {
                         // Derived type without initialization - create a default instance
-                        if let Some(type_index) = self.chunk.get_type_index(name) {
-                            // Get the number of components
-                            let num_components = self.chunk.types[type_index].components.len();
+                        // ONLY if this is not a function parameter (params get values from caller)
+                        if !is_param {
+                            if let Some(type_index) = self.chunk.get_type_index(name) {
+                                // Get the number of components
+                                let num_components = self.chunk.types[type_index].components.len();
 
-                            // Push default values (0) for each component
-                            for _ in 0..num_components {
-                                let zero_idx = self.chunk.add_constant(Value::Integer(0));
-                                self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                                // Push default values (0) for each component
+                                for _ in 0..num_components {
+                                    let zero_idx = self.chunk.add_constant(Value::Integer(0));
+                                    self.chunk.emit_with_operand(OpCode::LoadConst, zero_idx, *location);
+                                }
+
+                                // Push argument count
+                                let count_idx = self.chunk.add_constant(Value::Integer(num_components as i64));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+
+                                // Create the instance
+                                self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
+
+                                // Store to variable
+                                self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
                             }
-
-                            // Push argument count
-                            let count_idx = self.chunk.add_constant(Value::Integer(num_components as i64));
-                            self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
-
-                            // Create the instance
-                            self.chunk.emit_with_operand(OpCode::CreateInstance, type_index, *location);
-
-                            // Store to variable
-                            self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
                         }
                     }
                     // Primitive scalars without initialization don't need bytecode
