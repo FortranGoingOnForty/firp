@@ -1,4 +1,989 @@
 //! Bytecode instruction set and compiler
 //!
-//! This module will be implemented in Sprint 05
+//! This module defines the bytecode instruction set for the FIRP VM
+//! and provides a compiler to transform AST into bytecode.
 
+use crate::ast::*;
+use crate::lexer::SourceLocation;
+use std::collections::HashMap;
+use std::fmt;
+
+/// Bytecode operation codes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpCode {
+    // Constants
+    /// Load a constant from the constant pool
+    LoadConst,
+    /// Load boolean true
+    LoadTrue,
+    /// Load boolean false
+    LoadFalse,
+
+    // Variables
+    /// Load a variable onto the stack
+    LoadVar,
+    /// Store top of stack into a variable
+    StoreVar,
+
+    // Arithmetic operations
+    /// Add two values
+    Add,
+    /// Subtract two values
+    Subtract,
+    /// Multiply two values
+    Multiply,
+    /// Divide two values
+    Divide,
+    /// Power (exponentiation)
+    Power,
+    /// Negate a value (unary minus)
+    Negate,
+
+    // Comparison operations
+    /// Equality comparison
+    Equal,
+    /// Not equal comparison
+    NotEqual,
+    /// Less than comparison
+    Less,
+    /// Less than or equal comparison
+    LessEqual,
+    /// Greater than comparison
+    Greater,
+    /// Greater than or equal comparison
+    GreaterEqual,
+
+    // Logical operations
+    /// Logical AND
+    And,
+    /// Logical OR
+    Or,
+    /// Logical NOT
+    Not,
+
+    // Type conversions
+    /// Convert integer to real
+    IntToReal,
+    /// Convert real to integer
+    RealToInt,
+
+    // Control flow
+    /// Unconditional jump
+    Jump,
+    /// Jump if top of stack is false
+    JumpIfFalse,
+    /// Jump if top of stack is true
+    JumpIfTrue,
+
+    // Stack operations
+    /// Pop top of stack (discard value)
+    Pop,
+    /// Duplicate top of stack
+    Dup,
+
+    // I/O operations
+    /// Print values
+    Print,
+
+    // Program control
+    /// Halt execution
+    Halt,
+    /// No operation
+    Nop,
+}
+
+impl fmt::Display for OpCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpCode::LoadConst => write!(f, "LoadConst"),
+            OpCode::LoadTrue => write!(f, "LoadTrue"),
+            OpCode::LoadFalse => write!(f, "LoadFalse"),
+            OpCode::LoadVar => write!(f, "LoadVar"),
+            OpCode::StoreVar => write!(f, "StoreVar"),
+            OpCode::Add => write!(f, "Add"),
+            OpCode::Subtract => write!(f, "Subtract"),
+            OpCode::Multiply => write!(f, "Multiply"),
+            OpCode::Divide => write!(f, "Divide"),
+            OpCode::Power => write!(f, "Power"),
+            OpCode::Negate => write!(f, "Negate"),
+            OpCode::Equal => write!(f, "Equal"),
+            OpCode::NotEqual => write!(f, "NotEqual"),
+            OpCode::Less => write!(f, "Less"),
+            OpCode::LessEqual => write!(f, "LessEqual"),
+            OpCode::Greater => write!(f, "Greater"),
+            OpCode::GreaterEqual => write!(f, "GreaterEqual"),
+            OpCode::And => write!(f, "And"),
+            OpCode::Or => write!(f, "Or"),
+            OpCode::Not => write!(f, "Not"),
+            OpCode::IntToReal => write!(f, "IntToReal"),
+            OpCode::RealToInt => write!(f, "RealToInt"),
+            OpCode::Jump => write!(f, "Jump"),
+            OpCode::JumpIfFalse => write!(f, "JumpIfFalse"),
+            OpCode::JumpIfTrue => write!(f, "JumpIfTrue"),
+            OpCode::Pop => write!(f, "Pop"),
+            OpCode::Dup => write!(f, "Dup"),
+            OpCode::Print => write!(f, "Print"),
+            OpCode::Halt => write!(f, "Halt"),
+            OpCode::Nop => write!(f, "Nop"),
+        }
+    }
+}
+
+/// Runtime value types
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Integer(i64),
+    Real(f64),
+    Logical(bool),
+    Character(String),
+}
+
+impl Value {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Integer(_) => "INTEGER",
+            Value::Real(_) => "REAL",
+            Value::Logical(_) => "LOGICAL",
+            Value::Character(_) => "CHARACTER",
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Integer(v) => write!(f, "{}", v),
+            Value::Real(v) => write!(f, "{}", v),
+            Value::Logical(true) => write!(f, ".TRUE."),
+            Value::Logical(false) => write!(f, ".FALSE."),
+            Value::Character(s) => write!(f, "'{}'", s),
+        }
+    }
+}
+
+/// A single bytecode instruction
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instruction {
+    pub opcode: OpCode,
+    pub operand: Option<usize>,
+    pub location: SourceLocation,
+}
+
+impl Instruction {
+    pub fn new(opcode: OpCode, location: SourceLocation) -> Self {
+        Self {
+            opcode,
+            operand: None,
+            location,
+        }
+    }
+
+    pub fn with_operand(opcode: OpCode, operand: usize, location: SourceLocation) -> Self {
+        Self {
+            opcode,
+            operand: Some(operand),
+            location,
+        }
+    }
+}
+
+/// Constant pool for storing literal values
+#[derive(Debug, Clone, Default)]
+pub struct ConstantPool {
+    constants: Vec<Value>,
+    index_map: HashMap<String, usize>, // For deduplication
+}
+
+impl ConstantPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a constant to the pool, returns its index
+    /// Deduplicates identical constants
+    pub fn add(&mut self, value: Value) -> usize {
+        let key = format!("{:?}", value);
+
+        if let Some(&index) = self.index_map.get(&key) {
+            return index;
+        }
+
+        let index = self.constants.len();
+        self.constants.push(value);
+        self.index_map.insert(key, index);
+        index
+    }
+
+    /// Get a constant by index
+    pub fn get(&self, index: usize) -> Option<&Value> {
+        self.constants.get(index)
+    }
+
+    /// Get all constants
+    pub fn constants(&self) -> &[Value] {
+        &self.constants
+    }
+
+    /// Number of constants
+    pub fn len(&self) -> usize {
+        self.constants.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.constants.is_empty()
+    }
+}
+
+/// A chunk of bytecode with its constant pool
+#[derive(Debug, Clone, Default)]
+pub struct Chunk {
+    pub instructions: Vec<Instruction>,
+    pub constants: ConstantPool,
+    pub variables: Vec<String>, // Variable names by index
+}
+
+impl Chunk {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an instruction without operand
+    pub fn emit(&mut self, opcode: OpCode, location: SourceLocation) -> usize {
+        let index = self.instructions.len();
+        self.instructions.push(Instruction::new(opcode, location));
+        index
+    }
+
+    /// Add an instruction with operand
+    pub fn emit_with_operand(
+        &mut self,
+        opcode: OpCode,
+        operand: usize,
+        location: SourceLocation,
+    ) -> usize {
+        let index = self.instructions.len();
+        self.instructions
+            .push(Instruction::with_operand(opcode, operand, location));
+        index
+    }
+
+    /// Add a constant and return its index
+    pub fn add_constant(&mut self, value: Value) -> usize {
+        self.constants.add(value)
+    }
+
+    /// Add a variable and return its index
+    pub fn add_variable(&mut self, name: String) -> usize {
+        // Check if variable already exists
+        if let Some(pos) = self.variables.iter().position(|v| v == &name) {
+            return pos;
+        }
+        let index = self.variables.len();
+        self.variables.push(name);
+        index
+    }
+
+    /// Get variable index by name
+    pub fn get_variable_index(&self, name: &str) -> Option<usize> {
+        self.variables.iter().position(|v| v == name)
+    }
+
+    /// Patch a jump instruction with the actual target
+    pub fn patch_jump(&mut self, instruction_index: usize, target: usize) {
+        if let Some(instr) = self.instructions.get_mut(instruction_index) {
+            instr.operand = Some(target);
+        }
+    }
+
+    /// Current instruction count (for jump targets)
+    pub fn current_offset(&self) -> usize {
+        self.instructions.len()
+    }
+
+    /// Disassemble the chunk into a readable string
+    pub fn disassemble(&self, name: &str) -> String {
+        let mut output = format!("== {} ==\n", name);
+
+        // Show constants
+        if !self.constants.is_empty() {
+            output.push_str("Constants:\n");
+            for (i, constant) in self.constants.constants().iter().enumerate() {
+                output.push_str(&format!("  {:04} = {}\n", i, constant));
+            }
+            output.push('\n');
+        }
+
+        // Show variables
+        if !self.variables.is_empty() {
+            output.push_str("Variables:\n");
+            for (i, var) in self.variables.iter().enumerate() {
+                output.push_str(&format!("  {:04} = {}\n", i, var));
+            }
+            output.push('\n');
+        }
+
+        // Show instructions
+        output.push_str("Instructions:\n");
+        for (i, instr) in self.instructions.iter().enumerate() {
+            output.push_str(&self.disassemble_instruction(i, instr));
+        }
+
+        output
+    }
+
+    fn disassemble_instruction(&self, offset: usize, instr: &Instruction) -> String {
+        let operand_str = match instr.operand {
+            Some(op) => {
+                match instr.opcode {
+                    OpCode::LoadConst => {
+                        if let Some(val) = self.constants.get(op) {
+                            format!("{:4} ; {}", op, val)
+                        } else {
+                            format!("{:4}", op)
+                        }
+                    }
+                    OpCode::LoadVar | OpCode::StoreVar => {
+                        if let Some(name) = self.variables.get(op) {
+                            format!("{:4} ; {}", op, name)
+                        } else {
+                            format!("{:4}", op)
+                        }
+                    }
+                    OpCode::Print => format!("{:4} ; count", op),
+                    _ => format!("{:4}", op),
+                }
+            }
+            None => String::new(),
+        };
+
+        format!(
+            "  {:04} {:12} {}\n",
+            offset, instr.opcode, operand_str
+        )
+    }
+}
+
+/// Compiler error types
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompileError {
+    UndeclaredVariable {
+        name: String,
+        location: SourceLocation,
+    },
+    InternalError {
+        message: String,
+        location: SourceLocation,
+    },
+}
+
+impl fmt::Display for CompileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompileError::UndeclaredVariable { name, location } => {
+                write!(f, "Undeclared variable '{}' at {}", name, location)
+            }
+            CompileError::InternalError { message, location } => {
+                write!(f, "Internal compiler error at {}: {}", location, message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompileError {}
+
+pub type CompileResult<T> = Result<T, CompileError>;
+
+/// Bytecode compiler that transforms AST to bytecode
+pub struct Compiler {
+    chunk: Chunk,
+}
+
+impl Compiler {
+    pub fn new() -> Self {
+        Self {
+            chunk: Chunk::new(),
+        }
+    }
+
+    /// Compile a complete program
+    pub fn compile(&mut self, program: &Program) -> CompileResult<Chunk> {
+        // Process declarations first (allocate variable slots)
+        for decl in &program.declarations {
+            self.compile_declaration(decl)?;
+        }
+
+        // Compile statements
+        for stmt in &program.statements {
+            self.compile_statement(stmt)?;
+        }
+
+        // Emit halt at end
+        let loc = program.location;
+        self.chunk.emit(OpCode::Halt, loc);
+
+        Ok(std::mem::take(&mut self.chunk))
+    }
+
+    /// Compile a declaration
+    fn compile_declaration(&mut self, decl: &Declaration) -> CompileResult<()> {
+        match decl {
+            Declaration::Variable { names, init, location, .. } => {
+                for (i, name) in names.iter().enumerate() {
+                    // Allocate variable slot
+                    let var_index = self.chunk.add_variable(name.clone());
+
+                    // If there's initialization, compile it
+                    if let Some(init_exprs) = init {
+                        if let Some(Some(init_expr)) = init_exprs.get(i) {
+                            self.compile_expression(init_expr)?;
+                            self.chunk
+                                .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Declaration::ImplicitNone { .. } => {
+                // No bytecode needed for IMPLICIT NONE
+                Ok(())
+            }
+            Declaration::Parameter { name, value, location, .. } => {
+                // Treat parameters like initialized constants
+                let var_index = self.chunk.add_variable(name.clone());
+                self.compile_expression(value)?;
+                self.chunk
+                    .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                Ok(())
+            }
+        }
+    }
+
+    /// Compile a statement
+    fn compile_statement(&mut self, stmt: &Statement) -> CompileResult<()> {
+        match stmt {
+            Statement::Assignment { target, value, location } => {
+                // Compile the value expression
+                self.compile_expression(value)?;
+
+                // Get or create variable index
+                let var_index = self.chunk.add_variable(target.clone());
+                self.chunk
+                    .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                Ok(())
+            }
+
+            Statement::Print { values, location, .. } => {
+                // Compile each value expression
+                for value in values {
+                    self.compile_expression(value)?;
+                }
+                // Emit print with count of values
+                self.chunk
+                    .emit_with_operand(OpCode::Print, values.len(), *location);
+                Ok(())
+            }
+
+            Statement::If {
+                condition,
+                then_block,
+                else_if_blocks,
+                else_block,
+                location,
+            } => {
+                self.compile_if_statement(
+                    condition,
+                    then_block,
+                    else_if_blocks,
+                    else_block,
+                    *location,
+                )
+            }
+
+            Statement::DoLoop {
+                variable,
+                start,
+                end,
+                step,
+                body,
+                location,
+            } => {
+                self.compile_do_loop(variable, start, end, step.as_ref(), body, *location)
+            }
+
+            Statement::DoWhile {
+                condition,
+                body,
+                location,
+            } => {
+                self.compile_do_while(condition, body, *location)
+            }
+
+            Statement::DoInfinite { body, location } => {
+                self.compile_do_infinite(body, *location)
+            }
+
+            Statement::SelectCase {
+                selector,
+                cases,
+                default,
+                location,
+            } => {
+                self.compile_select_case(selector, cases, default.as_ref(), *location)
+            }
+
+            Statement::Exit { location } => {
+                // Exit is compiled as an unconditional jump
+                // The target will be patched by the enclosing loop
+                self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
+                Ok(())
+            }
+
+            Statement::Cycle { location } => {
+                // Cycle is compiled as an unconditional jump back to loop start
+                self.chunk.emit_with_operand(OpCode::Jump, 0, *location);
+                Ok(())
+            }
+
+            Statement::Continue { location } => {
+                // Continue is a no-op
+                self.chunk.emit(OpCode::Nop, *location);
+                Ok(())
+            }
+        }
+    }
+
+    /// Compile an IF statement
+    fn compile_if_statement(
+        &mut self,
+        condition: &Expr,
+        then_block: &[Statement],
+        else_if_blocks: &[(Expr, Vec<Statement>)],
+        else_block: &Option<Vec<Statement>>,
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        // Compile condition
+        self.compile_expression(condition)?;
+
+        // Jump to else/elif if false
+        let jump_to_else = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Compile then block
+        for stmt in then_block {
+            self.compile_statement(stmt)?;
+        }
+
+        // Jump over else blocks
+        let mut end_jumps = vec![];
+        if !else_if_blocks.is_empty() || else_block.is_some() {
+            end_jumps.push(self.chunk.emit_with_operand(OpCode::Jump, 0, location));
+        }
+
+        // Patch jump to first else/elif
+        self.chunk.patch_jump(jump_to_else, self.chunk.current_offset());
+
+        // Compile else if blocks
+        for (elif_cond, elif_body) in else_if_blocks {
+            self.compile_expression(elif_cond)?;
+            let jump_to_next = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+            for stmt in elif_body {
+                self.compile_statement(stmt)?;
+            }
+
+            end_jumps.push(self.chunk.emit_with_operand(OpCode::Jump, 0, location));
+            self.chunk.patch_jump(jump_to_next, self.chunk.current_offset());
+        }
+
+        // Compile else block
+        if let Some(else_stmts) = else_block {
+            for stmt in else_stmts {
+                self.compile_statement(stmt)?;
+            }
+        }
+
+        // Patch all end jumps
+        let end_offset = self.chunk.current_offset();
+        for jump in end_jumps {
+            self.chunk.patch_jump(jump, end_offset);
+        }
+
+        Ok(())
+    }
+
+    /// Compile a counted DO loop
+    fn compile_do_loop(
+        &mut self,
+        variable: &str,
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+        body: &[Statement],
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        let var_index = self.chunk.add_variable(variable.to_string());
+
+        // Initialize loop variable
+        self.compile_expression(start)?;
+        self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
+
+        // Loop start
+        let loop_start = self.chunk.current_offset();
+
+        // Check condition: variable <= end
+        self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
+        self.compile_expression(end)?;
+        self.chunk.emit(OpCode::LessEqual, location);
+
+        // Jump out if condition is false
+        let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Compile body
+        for stmt in body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Increment loop variable
+        self.chunk.emit_with_operand(OpCode::LoadVar, var_index, location);
+        if let Some(step_expr) = step {
+            self.compile_expression(step_expr)?;
+        } else {
+            // Default step is 1
+            let one_index = self.chunk.add_constant(Value::Integer(1));
+            self.chunk.emit_with_operand(OpCode::LoadConst, one_index, location);
+        }
+        self.chunk.emit(OpCode::Add, location);
+        self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
+
+        // Jump back to loop start
+        self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
+
+        // Patch exit jump
+        self.chunk.patch_jump(exit_jump, self.chunk.current_offset());
+
+        Ok(())
+    }
+
+    /// Compile a DO WHILE loop
+    fn compile_do_while(
+        &mut self,
+        condition: &Expr,
+        body: &[Statement],
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        let loop_start = self.chunk.current_offset();
+
+        // Check condition
+        self.compile_expression(condition)?;
+        let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Compile body
+        for stmt in body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Jump back to loop start
+        self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
+
+        // Patch exit jump
+        self.chunk.patch_jump(exit_jump, self.chunk.current_offset());
+
+        Ok(())
+    }
+
+    /// Compile an infinite DO loop
+    fn compile_do_infinite(
+        &mut self,
+        body: &[Statement],
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        let loop_start = self.chunk.current_offset();
+
+        // Compile body
+        for stmt in body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Jump back to loop start
+        self.chunk.emit_with_operand(OpCode::Jump, loop_start, location);
+
+        Ok(())
+    }
+
+    /// Compile a SELECT CASE statement
+    fn compile_select_case(
+        &mut self,
+        selector: &Expr,
+        cases: &[CaseClause],
+        default: Option<&Vec<Statement>>,
+        location: SourceLocation,
+    ) -> CompileResult<()> {
+        // Compile selector and store in temp
+        self.compile_expression(selector)?;
+
+        let mut end_jumps = vec![];
+
+        // Compile each case
+        for case in cases {
+            // Duplicate selector value for comparison
+            self.chunk.emit(OpCode::Dup, location);
+
+            // Compile case selector comparison
+            match &case.selector {
+                CaseSelector::Value(expr) => {
+                    self.compile_expression(expr)?;
+                    self.chunk.emit(OpCode::Equal, location);
+                }
+                CaseSelector::Values(exprs) => {
+                    // Check if selector equals any value
+                    for (i, expr) in exprs.iter().enumerate() {
+                        if i > 0 {
+                            self.chunk.emit(OpCode::Dup, location);
+                        }
+                        self.compile_expression(expr)?;
+                        self.chunk.emit(OpCode::Equal, location);
+                        if i > 0 {
+                            self.chunk.emit(OpCode::Or, location);
+                        }
+                    }
+                }
+                CaseSelector::Range(start, end) => {
+                    // Check if selector >= start AND selector <= end
+                    self.chunk.emit(OpCode::Dup, location);
+                    self.compile_expression(start)?;
+                    self.chunk.emit(OpCode::GreaterEqual, location);
+
+                    // Swap and check <= end
+                    self.chunk.emit(OpCode::Dup, location);
+                    self.compile_expression(end)?;
+                    self.chunk.emit(OpCode::LessEqual, location);
+
+                    self.chunk.emit(OpCode::And, location);
+                }
+            }
+
+            // Jump to next case if not matching
+            let next_case = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+            // Pop the duplicated selector
+            self.chunk.emit(OpCode::Pop, location);
+
+            // Compile case body
+            for stmt in &case.body {
+                self.compile_statement(stmt)?;
+            }
+
+            // Jump to end
+            end_jumps.push(self.chunk.emit_with_operand(OpCode::Jump, 0, location));
+
+            // Patch next case jump
+            self.chunk.patch_jump(next_case, self.chunk.current_offset());
+        }
+
+        // Pop selector value
+        self.chunk.emit(OpCode::Pop, location);
+
+        // Compile default case
+        if let Some(default_stmts) = default {
+            for stmt in default_stmts {
+                self.compile_statement(stmt)?;
+            }
+        }
+
+        // Patch end jumps
+        let end_offset = self.chunk.current_offset();
+        for jump in end_jumps {
+            self.chunk.patch_jump(jump, end_offset);
+        }
+
+        Ok(())
+    }
+
+    /// Compile an expression
+    fn compile_expression(&mut self, expr: &Expr) -> CompileResult<()> {
+        match expr {
+            Expr::IntegerLiteral(value, location) => {
+                let index = self.chunk.add_constant(Value::Integer(*value));
+                self.chunk.emit_with_operand(OpCode::LoadConst, index, *location);
+                Ok(())
+            }
+
+            Expr::RealLiteral(value, location) => {
+                let index = self.chunk.add_constant(Value::Real(*value));
+                self.chunk.emit_with_operand(OpCode::LoadConst, index, *location);
+                Ok(())
+            }
+
+            Expr::StringLiteral(value, location) => {
+                let index = self.chunk.add_constant(Value::Character(value.clone()));
+                self.chunk.emit_with_operand(OpCode::LoadConst, index, *location);
+                Ok(())
+            }
+
+            Expr::LogicalLiteral(value, location) => {
+                if *value {
+                    self.chunk.emit(OpCode::LoadTrue, *location);
+                } else {
+                    self.chunk.emit(OpCode::LoadFalse, *location);
+                }
+                Ok(())
+            }
+
+            Expr::Identifier(name, location) => {
+                let var_index = self.chunk.add_variable(name.clone());
+                self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
+                Ok(())
+            }
+
+            Expr::BinaryOp { op, left, right, location } => {
+                // Compile left operand
+                self.compile_expression(left)?;
+                // Compile right operand
+                self.compile_expression(right)?;
+                // Emit operation
+                let opcode = match op {
+                    BinaryOperator::Add => OpCode::Add,
+                    BinaryOperator::Subtract => OpCode::Subtract,
+                    BinaryOperator::Multiply => OpCode::Multiply,
+                    BinaryOperator::Divide => OpCode::Divide,
+                    BinaryOperator::Power => OpCode::Power,
+                    BinaryOperator::Equal => OpCode::Equal,
+                    BinaryOperator::NotEqual => OpCode::NotEqual,
+                    BinaryOperator::Less => OpCode::Less,
+                    BinaryOperator::LessEqual => OpCode::LessEqual,
+                    BinaryOperator::Greater => OpCode::Greater,
+                    BinaryOperator::GreaterEqual => OpCode::GreaterEqual,
+                    BinaryOperator::And => OpCode::And,
+                    BinaryOperator::Or => OpCode::Or,
+                    BinaryOperator::Eqv => OpCode::Equal, // Logical equivalence
+                    BinaryOperator::Neqv => OpCode::NotEqual, // Logical non-equivalence
+                };
+                self.chunk.emit(opcode, *location);
+                Ok(())
+            }
+
+            Expr::UnaryOp { op, operand, location } => {
+                self.compile_expression(operand)?;
+                let opcode = match op {
+                    UnaryOperator::Minus => OpCode::Negate,
+                    UnaryOperator::Plus => return Ok(()), // Unary plus is a no-op
+                    UnaryOperator::Not => OpCode::Not,
+                };
+                self.chunk.emit(opcode, *location);
+                Ok(())
+            }
+
+            Expr::Parenthesized(inner, _) => {
+                self.compile_expression(inner)
+            }
+        }
+    }
+
+    /// Get the compiled chunk (consumes the compiler)
+    pub fn into_chunk(self) -> Chunk {
+        self.chunk
+    }
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_opcode_display() {
+        assert_eq!(format!("{}", OpCode::LoadConst), "LoadConst");
+        assert_eq!(format!("{}", OpCode::Add), "Add");
+        assert_eq!(format!("{}", OpCode::JumpIfFalse), "JumpIfFalse");
+    }
+
+    #[test]
+    fn test_value_display() {
+        assert_eq!(format!("{}", Value::Integer(42)), "42");
+        assert_eq!(format!("{}", Value::Real(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Logical(true)), ".TRUE.");
+        assert_eq!(format!("{}", Value::Character("hello".into())), "'hello'");
+    }
+
+    #[test]
+    fn test_constant_pool_deduplication() {
+        let mut pool = ConstantPool::new();
+
+        let idx1 = pool.add(Value::Integer(42));
+        let idx2 = pool.add(Value::Integer(42));
+        let idx3 = pool.add(Value::Integer(100));
+
+        assert_eq!(idx1, idx2); // Same value, same index
+        assert_ne!(idx1, idx3); // Different value, different index
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_emit_instructions() {
+        let mut chunk = Chunk::new();
+        let loc = SourceLocation { line: 1, column: 1 };
+
+        let idx = chunk.add_constant(Value::Integer(42));
+        chunk.emit_with_operand(OpCode::LoadConst, idx, loc);
+        chunk.emit(OpCode::Negate, loc);
+        chunk.emit(OpCode::Halt, loc);
+
+        assert_eq!(chunk.instructions.len(), 3);
+        assert_eq!(chunk.instructions[0].opcode, OpCode::LoadConst);
+        assert_eq!(chunk.instructions[0].operand, Some(0));
+        assert_eq!(chunk.instructions[1].opcode, OpCode::Negate);
+        assert_eq!(chunk.instructions[2].opcode, OpCode::Halt);
+    }
+
+    #[test]
+    fn test_chunk_variables() {
+        let mut chunk = Chunk::new();
+
+        let idx1 = chunk.add_variable("X".to_string());
+        let idx2 = chunk.add_variable("Y".to_string());
+        let idx3 = chunk.add_variable("X".to_string()); // Same as idx1
+
+        assert_eq!(idx1, 0);
+        assert_eq!(idx2, 1);
+        assert_eq!(idx3, idx1); // Reuses existing variable
+        assert_eq!(chunk.variables.len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_patch_jump() {
+        let mut chunk = Chunk::new();
+        let loc = SourceLocation { line: 1, column: 1 };
+
+        let jump_idx = chunk.emit_with_operand(OpCode::Jump, 0, loc);
+        chunk.emit(OpCode::Nop, loc);
+        chunk.emit(OpCode::Nop, loc);
+        let target = chunk.current_offset();
+        chunk.patch_jump(jump_idx, target);
+
+        assert_eq!(chunk.instructions[0].operand, Some(3));
+    }
+
+    #[test]
+    fn test_disassemble() {
+        let mut chunk = Chunk::new();
+        let loc = SourceLocation { line: 1, column: 1 };
+
+        let const_idx = chunk.add_constant(Value::Integer(42));
+        let var_idx = chunk.add_variable("X".to_string());
+
+        chunk.emit_with_operand(OpCode::LoadConst, const_idx, loc);
+        chunk.emit_with_operand(OpCode::StoreVar, var_idx, loc);
+        chunk.emit(OpCode::Halt, loc);
+
+        let output = chunk.disassemble("test");
+        assert!(output.contains("LoadConst"));
+        assert!(output.contains("42"));
+        assert!(output.contains("StoreVar"));
+        assert!(output.contains("X"));
+    }
+}
