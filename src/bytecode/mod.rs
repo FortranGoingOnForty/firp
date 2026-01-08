@@ -2084,6 +2084,41 @@ impl Compiler {
 
                 Ok(())
             }
+
+            Statement::Associate { associations, body, location } => {
+                // ASSOCIATE creates temporary aliases
+                // For each association, store the target expression in a variable
+                for (alias, target) in associations {
+                    // Compile the target expression
+                    self.compile_expression(target)?;
+
+                    // Store in a variable (add_variable creates or finds the variable)
+                    let var_index = self.chunk.add_variable(alias.clone());
+                    self.chunk.emit_with_operand(OpCode::StoreVar, var_index, *location);
+                }
+
+                // Compile the body
+                for stmt in body {
+                    self.compile_statement(stmt)?;
+                }
+
+                Ok(())
+            }
+
+            Statement::Block { declarations, body, .. } => {
+                // BLOCK creates a new local scope
+                // Process declarations
+                for decl in declarations {
+                    self.compile_declaration(decl)?;
+                }
+
+                // Compile the body
+                for stmt in body {
+                    self.compile_statement(stmt)?;
+                }
+
+                Ok(())
+            }
         }
     }
 

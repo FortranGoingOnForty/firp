@@ -1221,6 +1221,16 @@ impl Parser {
             return self.parse_forall_statement();
         }
 
+        // ASSOCIATE construct
+        if self.check(&TokenType::Associate) {
+            return self.parse_associate_construct();
+        }
+
+        // BLOCK construct
+        if self.check(&TokenType::Block) {
+            return self.parse_block_construct();
+        }
+
         // CALL statement
         if self.check(&TokenType::Call) {
             return self.parse_call_statement();
@@ -2599,6 +2609,85 @@ impl Parser {
         Ok(Statement::Forall {
             indices,
             mask,
+            body,
+            location,
+        })
+    }
+
+    /// Parse ASSOCIATE construct
+    /// ASSOCIATE (alias => expr, ...) ... END ASSOCIATE
+    fn parse_associate_construct(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Associate, "ASSOCIATE")?;
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        // Parse associations: alias => expr
+        let mut associations = Vec::new();
+        loop {
+            // Parse alias name
+            let alias = self.expect_identifier()?;
+
+            // Expect => (arrow operator)
+            self.expect(&TokenType::Arrow, "=>")?;
+
+            // Parse target expression
+            let target = self.parse_expression()?;
+
+            associations.push((alias, target));
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        // Parse body statements
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenType::End) {
+            body.push(self.parse_statement()?);
+        }
+
+        // Expect END ASSOCIATE
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Associate, "ASSOCIATE")?;
+
+        Ok(Statement::Associate {
+            associations,
+            body,
+            location,
+        })
+    }
+
+    /// Parse BLOCK construct
+    /// BLOCK [declarations] ... END BLOCK
+    fn parse_block_construct(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Block, "BLOCK")?;
+
+        // Parse declarations and body statements
+        let mut declarations = Vec::new();
+        let mut body = Vec::new();
+        let mut in_declarations = true;
+
+        while !self.is_at_end() && !self.check(&TokenType::End) {
+            // Check if this is a declaration (type declaration, etc.)
+            if in_declarations && self.is_declaration_start() {
+                declarations.push(self.parse_declaration()?);
+            } else {
+                in_declarations = false;
+                body.push(self.parse_statement()?);
+            }
+        }
+
+        // Expect END BLOCK
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Block, "BLOCK")?;
+
+        Ok(Statement::Block {
+            declarations,
             body,
             location,
         })

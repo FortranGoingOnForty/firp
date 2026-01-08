@@ -113,6 +113,13 @@ pub enum TokenType {
     Elsewhere,
     Forall,
 
+    // Keywords - Modern constructs
+    Associate,
+    Block,
+    Present,
+    Pure,
+    Elemental,
+
     // Literals
     IntegerLiteral(String),
     RealLiteral(String),
@@ -291,6 +298,11 @@ impl fmt::Display for TokenType {
             TokenType::Dot => write!(f, "."),
             TokenType::Percent => write!(f, "%"),
             TokenType::Arrow => write!(f, "=>"),
+            TokenType::Associate => write!(f, "ASSOCIATE"),
+            TokenType::Block => write!(f, "BLOCK"),
+            TokenType::Present => write!(f, "PRESENT"),
+            TokenType::Pure => write!(f, "PURE"),
+            TokenType::Elemental => write!(f, "ELEMENTAL"),
             TokenType::Eof => write!(f, "EOF"),
         }
     }

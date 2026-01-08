@@ -587,6 +587,24 @@ pub enum Statement {
         body: Vec<Statement>,
         location: SourceLocation,
     },
+
+    /// ASSOCIATE construct for temporary aliases
+    Associate {
+        /// List of associations: (alias_name, target_expression)
+        associations: Vec<(String, Expr)>,
+        /// Body statements
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+
+    /// BLOCK construct for local scoping
+    Block {
+        /// Local declarations within the block
+        declarations: Vec<Declaration>,
+        /// Body statements
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
 }
 
 /// FORALL index specification

@@ -1172,6 +1172,45 @@ impl SemanticAnalyzer {
 
                 Ok(())
             }
+
+            Statement::Associate { associations, body, location } => {
+                // Create a new scope for the associations
+                self.symbol_table.enter_scope();
+
+                // Type check each association and add alias to scope
+                for (alias, target) in associations {
+                    let target_type = self.check_expression(target)?;
+                    // Add alias as a variable in the current scope
+                    let symbol = Symbol::new(alias.clone(), target_type, *location);
+                    let _ = self.symbol_table.define(symbol);
+                }
+
+                // Type check body statements
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+
+                self.symbol_table.exit_scope();
+                Ok(())
+            }
+
+            Statement::Block { declarations, body, .. } => {
+                // Create a new scope for the block
+                self.symbol_table.enter_scope();
+
+                // Process declarations
+                for decl in declarations {
+                    self.analyze_declaration(decl)?;
+                }
+
+                // Type check body statements
+                for stmt in body {
+                    self.analyze_statement(stmt)?;
+                }
+
+                self.symbol_table.exit_scope();
+                Ok(())
+            }
         }
     }
 
