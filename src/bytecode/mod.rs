@@ -114,6 +114,155 @@ pub enum OpCode {
     LoadArrayElem,
     /// Store value into array element (operand = variable index, expects value and indices on stack)
     StoreArrayElem,
+
+    // Intrinsic function operations
+    /// Call an intrinsic function (operand = Intrinsic enum value, expects args on stack)
+    CallIntrinsic,
+}
+
+/// Intrinsic functions available in Fortran
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Intrinsic {
+    // Mathematical functions
+    Sqrt = 0,
+    Abs,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Exp,
+    Log,
+    Log10,
+
+    // Utility functions
+    Mod,
+    Modulo,
+    Max,
+    Min,
+    Floor,
+    Ceiling,
+    Nint,
+    Sign,
+
+    // Type conversion functions
+    Int,
+    Real,
+    Dble,
+}
+
+impl Intrinsic {
+    /// Get intrinsic from its numeric value
+    pub fn from_usize(value: usize) -> Option<Intrinsic> {
+        match value {
+            0 => Some(Intrinsic::Sqrt),
+            1 => Some(Intrinsic::Abs),
+            2 => Some(Intrinsic::Sin),
+            3 => Some(Intrinsic::Cos),
+            4 => Some(Intrinsic::Tan),
+            5 => Some(Intrinsic::Asin),
+            6 => Some(Intrinsic::Acos),
+            7 => Some(Intrinsic::Atan),
+            8 => Some(Intrinsic::Atan2),
+            9 => Some(Intrinsic::Exp),
+            10 => Some(Intrinsic::Log),
+            11 => Some(Intrinsic::Log10),
+            12 => Some(Intrinsic::Mod),
+            13 => Some(Intrinsic::Modulo),
+            14 => Some(Intrinsic::Max),
+            15 => Some(Intrinsic::Min),
+            16 => Some(Intrinsic::Floor),
+            17 => Some(Intrinsic::Ceiling),
+            18 => Some(Intrinsic::Nint),
+            19 => Some(Intrinsic::Sign),
+            20 => Some(Intrinsic::Int),
+            21 => Some(Intrinsic::Real),
+            22 => Some(Intrinsic::Dble),
+            _ => None,
+        }
+    }
+
+    /// Get intrinsic by name (case-insensitive)
+    pub fn from_name(name: &str) -> Option<Intrinsic> {
+        match name.to_uppercase().as_str() {
+            "SQRT" => Some(Intrinsic::Sqrt),
+            "ABS" | "IABS" | "DABS" => Some(Intrinsic::Abs),
+            "SIN" | "DSIN" => Some(Intrinsic::Sin),
+            "COS" | "DCOS" => Some(Intrinsic::Cos),
+            "TAN" | "DTAN" => Some(Intrinsic::Tan),
+            "ASIN" | "DASIN" => Some(Intrinsic::Asin),
+            "ACOS" | "DACOS" => Some(Intrinsic::Acos),
+            "ATAN" | "DATAN" => Some(Intrinsic::Atan),
+            "ATAN2" | "DATAN2" => Some(Intrinsic::Atan2),
+            "EXP" | "DEXP" => Some(Intrinsic::Exp),
+            "LOG" | "ALOG" | "DLOG" => Some(Intrinsic::Log),
+            "LOG10" | "ALOG10" | "DLOG10" => Some(Intrinsic::Log10),
+            "MOD" => Some(Intrinsic::Mod),
+            "MODULO" => Some(Intrinsic::Modulo),
+            "MAX" | "MAX0" | "AMAX1" | "DMAX1" => Some(Intrinsic::Max),
+            "MIN" | "MIN0" | "AMIN1" | "DMIN1" => Some(Intrinsic::Min),
+            "FLOOR" => Some(Intrinsic::Floor),
+            "CEILING" => Some(Intrinsic::Ceiling),
+            "NINT" | "ANINT" | "DNINT" => Some(Intrinsic::Nint),
+            "SIGN" | "ISIGN" | "DSIGN" => Some(Intrinsic::Sign),
+            "INT" | "IFIX" | "IDINT" => Some(Intrinsic::Int),
+            "REAL" | "FLOAT" | "SNGL" => Some(Intrinsic::Real),
+            "DBLE" | "DFLOAT" => Some(Intrinsic::Dble),
+            _ => None,
+        }
+    }
+
+    /// Get the number of required arguments for this intrinsic
+    pub fn arg_count(&self) -> (usize, usize) {
+        // Returns (min_args, max_args)
+        match self {
+            // Single argument functions
+            Intrinsic::Sqrt | Intrinsic::Abs | Intrinsic::Sin | Intrinsic::Cos |
+            Intrinsic::Tan | Intrinsic::Asin | Intrinsic::Acos | Intrinsic::Atan |
+            Intrinsic::Exp | Intrinsic::Log | Intrinsic::Log10 |
+            Intrinsic::Floor | Intrinsic::Ceiling | Intrinsic::Nint |
+            Intrinsic::Int | Intrinsic::Real | Intrinsic::Dble => (1, 1),
+
+            // Two argument functions
+            Intrinsic::Mod | Intrinsic::Modulo | Intrinsic::Atan2 | Intrinsic::Sign => (2, 2),
+
+            // Variable argument functions (at least 2)
+            Intrinsic::Max | Intrinsic::Min => (2, 255),
+        }
+    }
+}
+
+impl fmt::Display for Intrinsic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Intrinsic::Sqrt => write!(f, "SQRT"),
+            Intrinsic::Abs => write!(f, "ABS"),
+            Intrinsic::Sin => write!(f, "SIN"),
+            Intrinsic::Cos => write!(f, "COS"),
+            Intrinsic::Tan => write!(f, "TAN"),
+            Intrinsic::Asin => write!(f, "ASIN"),
+            Intrinsic::Acos => write!(f, "ACOS"),
+            Intrinsic::Atan => write!(f, "ATAN"),
+            Intrinsic::Atan2 => write!(f, "ATAN2"),
+            Intrinsic::Exp => write!(f, "EXP"),
+            Intrinsic::Log => write!(f, "LOG"),
+            Intrinsic::Log10 => write!(f, "LOG10"),
+            Intrinsic::Mod => write!(f, "MOD"),
+            Intrinsic::Modulo => write!(f, "MODULO"),
+            Intrinsic::Max => write!(f, "MAX"),
+            Intrinsic::Min => write!(f, "MIN"),
+            Intrinsic::Floor => write!(f, "FLOOR"),
+            Intrinsic::Ceiling => write!(f, "CEILING"),
+            Intrinsic::Nint => write!(f, "NINT"),
+            Intrinsic::Sign => write!(f, "SIGN"),
+            Intrinsic::Int => write!(f, "INT"),
+            Intrinsic::Real => write!(f, "REAL"),
+            Intrinsic::Dble => write!(f, "DBLE"),
+        }
+    }
 }
 
 impl fmt::Display for OpCode {
@@ -159,6 +308,7 @@ impl fmt::Display for OpCode {
             OpCode::AllocArray => write!(f, "AllocArray"),
             OpCode::LoadArrayElem => write!(f, "LoadArrayElem"),
             OpCode::StoreArrayElem => write!(f, "StoreArrayElem"),
+            OpCode::CallIntrinsic => write!(f, "CallIntrinsic"),
         }
     }
 }
@@ -1715,10 +1865,31 @@ impl Compiler {
             }
 
             Expr::FunctionCall { name, arguments, location } => {
-                // Check if this is a function call or an array access
-                // First check if it's a known procedure (function)
-                if self.chunk.get_procedure_address(name).is_some() {
-                    // This is a function call
+                // Check for intrinsic function FIRST
+                if let Some(intrinsic) = Intrinsic::from_name(name) {
+                    // Validate argument count
+                    let (min_args, max_args) = intrinsic.arg_count();
+                    let arg_count = arguments.len();
+                    if arg_count < min_args || arg_count > max_args {
+                        return Err(CompileError::InvalidOperation {
+                            message: format!(
+                                "Intrinsic {} expects {}-{} arguments, got {}",
+                                intrinsic, min_args, max_args, arg_count
+                            ),
+                            location: *location,
+                        });
+                    }
+
+                    // Compile all arguments (push onto stack)
+                    for arg in arguments {
+                        self.compile_expression(arg)?;
+                    }
+
+                    // Encode operand: (intrinsic_id << 8) | arg_count
+                    let operand = ((intrinsic as usize) << 8) | arg_count;
+                    self.chunk.emit_with_operand(OpCode::CallIntrinsic, operand, *location);
+                } else if self.chunk.get_procedure_address(name).is_some() {
+                    // This is a user-defined function call
                     // Compile arguments (push onto stack)
                     for arg in arguments {
                         self.compile_expression(arg)?;

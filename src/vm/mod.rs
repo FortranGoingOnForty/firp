@@ -3,7 +3,7 @@
 //! This module implements a stack-based virtual machine that executes
 //! compiled Fortran bytecode.
 
-use crate::bytecode::{ArrayDim, Chunk, Instruction, OpCode, Value};
+use crate::bytecode::{ArrayDim, Chunk, Instruction, Intrinsic, OpCode, Value};
 use crate::lexer::SourceLocation;
 use std::collections::HashMap;
 use std::fmt;
@@ -86,6 +86,11 @@ pub enum RuntimeError {
         message: String,
         location: SourceLocation,
     },
+    /// Math error (e.g., sqrt of negative)
+    MathError {
+        message: String,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -126,6 +131,9 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeError::IoError { message, location } => {
                 write!(f, "I/O error: {} at {}", message, location)
+            }
+            RuntimeError::MathError { message, location } => {
+                write!(f, "Math error: {} at {}", message, location)
             }
         }
     }
@@ -811,10 +819,322 @@ impl VM {
                     })?;
                     self.ip += 1;
                 }
+
+                OpCode::CallIntrinsic => {
+                    // Decode operand: (intrinsic_id << 8) | arg_count
+                    let encoded = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "CallIntrinsic requires operand".to_string(),
+                        location,
+                    })?;
+
+                    let intrinsic_id = encoded >> 8;
+                    let arg_count = encoded & 0xFF;
+
+                    let intrinsic = Intrinsic::from_usize(intrinsic_id)
+                        .ok_or(RuntimeError::InvalidInstruction {
+                            message: format!("Unknown intrinsic ID: {}", intrinsic_id),
+                            location,
+                        })?;
+
+                    // Execute the intrinsic
+                    let result = self.execute_intrinsic(intrinsic, arg_count, location)?;
+                    self.push(result, location)?;
+                    self.ip += 1;
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Execute an intrinsic function
+    fn execute_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        arg_count: usize,
+        location: SourceLocation,
+    ) -> VMResult<Value> {
+        match intrinsic {
+            // Mathematical functions (single argument)
+            Intrinsic::Sqrt => {
+                let arg = self.pop_as_real(location)?;
+                if arg < 0.0 {
+                    return Err(RuntimeError::MathError {
+                        message: "SQRT of negative number".to_string(),
+                        location,
+                    });
+                }
+                Ok(Value::Real(arg.sqrt()))
+            }
+
+            Intrinsic::Abs => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(n) => Ok(Value::Integer(n.abs())),
+                    Value::Real(n) => Ok(Value::Real(n.abs())),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ABS requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Sin => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Real(arg.sin()))
+            }
+
+            Intrinsic::Cos => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Real(arg.cos()))
+            }
+
+            Intrinsic::Tan => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Real(arg.tan()))
+            }
+
+            Intrinsic::Asin => {
+                let arg = self.pop_as_real(location)?;
+                if arg < -1.0 || arg > 1.0 {
+                    return Err(RuntimeError::MathError {
+                        message: "ASIN argument out of range [-1, 1]".to_string(),
+                        location,
+                    });
+                }
+                Ok(Value::Real(arg.asin()))
+            }
+
+            Intrinsic::Acos => {
+                let arg = self.pop_as_real(location)?;
+                if arg < -1.0 || arg > 1.0 {
+                    return Err(RuntimeError::MathError {
+                        message: "ACOS argument out of range [-1, 1]".to_string(),
+                        location,
+                    });
+                }
+                Ok(Value::Real(arg.acos()))
+            }
+
+            Intrinsic::Atan => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Real(arg.atan()))
+            }
+
+            Intrinsic::Atan2 => {
+                let x = self.pop_as_real(location)?;
+                let y = self.pop_as_real(location)?;
+                Ok(Value::Real(y.atan2(x)))
+            }
+
+            Intrinsic::Exp => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Real(arg.exp()))
+            }
+
+            Intrinsic::Log => {
+                let arg = self.pop_as_real(location)?;
+                if arg <= 0.0 {
+                    return Err(RuntimeError::MathError {
+                        message: "LOG of non-positive number".to_string(),
+                        location,
+                    });
+                }
+                Ok(Value::Real(arg.ln()))
+            }
+
+            Intrinsic::Log10 => {
+                let arg = self.pop_as_real(location)?;
+                if arg <= 0.0 {
+                    return Err(RuntimeError::MathError {
+                        message: "LOG10 of non-positive number".to_string(),
+                        location,
+                    });
+                }
+                Ok(Value::Real(arg.log10()))
+            }
+
+            // Utility functions
+            Intrinsic::Mod => {
+                let b = self.pop(location)?;
+                let a = self.pop(location)?;
+                match (&a, &b) {
+                    (Value::Integer(a), Value::Integer(b)) => {
+                        if *b == 0 {
+                            return Err(RuntimeError::DivisionByZero { location });
+                        }
+                        Ok(Value::Integer(a % b))
+                    }
+                    _ => {
+                        let a = self.value_to_real(&a, location)?;
+                        let b = self.value_to_real(&b, location)?;
+                        if b == 0.0 {
+                            return Err(RuntimeError::DivisionByZero { location });
+                        }
+                        Ok(Value::Real(a % b))
+                    }
+                }
+            }
+
+            Intrinsic::Modulo => {
+                // MODULO differs from MOD for negative numbers
+                // MODULO(a, b) = a - FLOOR(a/b) * b
+                let b = self.pop(location)?;
+                let a = self.pop(location)?;
+                match (&a, &b) {
+                    (Value::Integer(a), Value::Integer(b)) => {
+                        if *b == 0 {
+                            return Err(RuntimeError::DivisionByZero { location });
+                        }
+                        Ok(Value::Integer(a.rem_euclid(*b)))
+                    }
+                    _ => {
+                        let a = self.value_to_real(&a, location)?;
+                        let b = self.value_to_real(&b, location)?;
+                        if b == 0.0 {
+                            return Err(RuntimeError::DivisionByZero { location });
+                        }
+                        Ok(Value::Real(a.rem_euclid(b)))
+                    }
+                }
+            }
+
+            Intrinsic::Max => {
+                let mut max_val = self.pop(location)?;
+                for _ in 1..arg_count {
+                    let val = self.pop(location)?;
+                    max_val = self.compare_max(max_val, val, location)?;
+                }
+                Ok(max_val)
+            }
+
+            Intrinsic::Min => {
+                let mut min_val = self.pop(location)?;
+                for _ in 1..arg_count {
+                    let val = self.pop(location)?;
+                    min_val = self.compare_min(min_val, val, location)?;
+                }
+                Ok(min_val)
+            }
+
+            Intrinsic::Floor => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Integer(arg.floor() as i64))
+            }
+
+            Intrinsic::Ceiling => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Integer(arg.ceil() as i64))
+            }
+
+            Intrinsic::Nint => {
+                let arg = self.pop_as_real(location)?;
+                Ok(Value::Integer(arg.round() as i64))
+            }
+
+            Intrinsic::Sign => {
+                let b = self.pop(location)?;
+                let a = self.pop(location)?;
+                match (&a, &b) {
+                    (Value::Integer(a), Value::Integer(b)) => {
+                        let sign = if *b >= 0 { 1 } else { -1 };
+                        Ok(Value::Integer(a.abs() * sign))
+                    }
+                    _ => {
+                        let a = self.value_to_real(&a, location)?;
+                        let b = self.value_to_real(&b, location)?;
+                        let sign = if b >= 0.0 { 1.0 } else { -1.0 };
+                        Ok(Value::Real(a.abs() * sign))
+                    }
+                }
+            }
+
+            // Type conversion functions
+            Intrinsic::Int => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(n) => Ok(Value::Integer(n)),
+                    Value::Real(n) => Ok(Value::Integer(n.trunc() as i64)),
+                    Value::Logical(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "INT requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Real => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(n) => Ok(Value::Real(n as f64)),
+                    Value::Real(n) => Ok(Value::Real(n)),
+                    Value::Logical(b) => Ok(Value::Real(if b { 1.0 } else { 0.0 })),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "REAL requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Dble => {
+                // DBLE is same as REAL in our implementation (we use f64)
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(n) => Ok(Value::Real(n as f64)),
+                    Value::Real(n) => Ok(Value::Real(n)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "DBLE requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Pop a value from the stack and convert to f64
+    fn pop_as_real(&mut self, location: SourceLocation) -> VMResult<f64> {
+        let val = self.pop(location)?;
+        self.value_to_real(&val, location)
+    }
+
+    /// Convert a value to f64
+    fn value_to_real(&self, val: &Value, location: SourceLocation) -> VMResult<f64> {
+        match val {
+            Value::Integer(n) => Ok(*n as f64),
+            Value::Real(n) => Ok(*n),
+            _ => Err(RuntimeError::TypeError {
+                message: "Expected numeric value".to_string(),
+                location,
+            }),
+        }
+    }
+
+    /// Compare two values and return the maximum
+    fn compare_max(&self, a: Value, b: Value, location: SourceLocation) -> VMResult<Value> {
+        match (&a, &b) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer((*a).max(*b))),
+            (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a.max(*b))),
+            (Value::Integer(a), Value::Real(b)) => Ok(Value::Real((*a as f64).max(*b))),
+            (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a.max(*b as f64))),
+            _ => Err(RuntimeError::TypeError {
+                message: "MAX requires numeric arguments".to_string(),
+                location,
+            }),
+        }
+    }
+
+    /// Compare two values and return the minimum
+    fn compare_min(&self, a: Value, b: Value, location: SourceLocation) -> VMResult<Value> {
+        match (&a, &b) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer((*a).min(*b))),
+            (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a.min(*b))),
+            (Value::Integer(a), Value::Real(b)) => Ok(Value::Real((*a as f64).min(*b))),
+            (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a.min(*b as f64))),
+            _ => Err(RuntimeError::TypeError {
+                message: "MIN requires numeric arguments".to_string(),
+                location,
+            }),
+        }
     }
 
     // Stack operations
