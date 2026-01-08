@@ -1805,6 +1805,270 @@ impl VM {
                 }
             }
 
+            // Character intrinsics
+            Intrinsic::Len => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => Ok(Value::Integer(s.len() as i64)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "LEN requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::LenTrim => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => Ok(Value::Integer(s.trim_end().len() as i64)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "LEN_TRIM requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Trim => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => Ok(Value::Character(s.trim_end().to_string())),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "TRIM requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Adjustl => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => {
+                        let trimmed = s.trim_start();
+                        let padding = s.len() - trimmed.len();
+                        Ok(Value::Character(format!("{}{}", trimmed, " ".repeat(padding))))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ADJUSTL requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Adjustr => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => {
+                        let trimmed = s.trim_end();
+                        let padding = s.len() - trimmed.len();
+                        Ok(Value::Character(format!("{}{}", " ".repeat(padding), trimmed)))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ADJUSTR requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Index => {
+                let substring = self.pop(location)?;
+                let string = self.pop(location)?;
+                match (&string, &substring) {
+                    (Value::Character(s), Value::Character(sub)) => {
+                        let pos = s.find(sub).map(|p| p + 1).unwrap_or(0);
+                        Ok(Value::Integer(pos as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "INDEX requires two character arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Repeat => {
+                let ncopies = self.pop(location)?;
+                let string = self.pop(location)?;
+                match (&string, &ncopies) {
+                    (Value::Character(s), Value::Integer(n)) => {
+                        if *n < 0 {
+                            return Err(RuntimeError::TypeError {
+                                message: "REPEAT: ncopies must be non-negative".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Character(s.repeat(*n as usize)))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "REPEAT requires character and integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::CharFn => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(i) => {
+                        if i < 0 || i > 127 {
+                            return Err(RuntimeError::TypeError {
+                                message: format!("CHAR: value {} out of ASCII range", i),
+                                location,
+                            });
+                        }
+                        Ok(Value::Character((i as u8 as char).to_string()))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "CHAR requires integer argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ichar => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => {
+                        if s.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "ICHAR requires non-empty string".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Integer(s.chars().next().unwrap() as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ICHAR requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            // Bit manipulation intrinsics
+            Intrinsic::Iand => {
+                let j = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &j) {
+                    (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a & b)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IAND requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ior => {
+                let j = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &j) {
+                    (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a | b)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IOR requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ieor => {
+                let j = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &j) {
+                    (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a ^ b)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IEOR requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Not => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(i) => Ok(Value::Integer(!i)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "NOT requires integer argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Btest => {
+                let pos = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &pos) {
+                    (Value::Integer(val), Value::Integer(bit)) => {
+                        if *bit < 0 || *bit >= 64 {
+                            return Err(RuntimeError::TypeError {
+                                message: "BTEST: bit position out of range".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Logical((val >> bit) & 1 == 1))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "BTEST requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ibset => {
+                let pos = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &pos) {
+                    (Value::Integer(val), Value::Integer(bit)) => {
+                        if *bit < 0 || *bit >= 64 {
+                            return Err(RuntimeError::TypeError {
+                                message: "IBSET: bit position out of range".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Integer(val | (1 << bit)))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IBSET requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ibclr => {
+                let pos = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &pos) {
+                    (Value::Integer(val), Value::Integer(bit)) => {
+                        if *bit < 0 || *bit >= 64 {
+                            return Err(RuntimeError::TypeError {
+                                message: "IBCLR: bit position out of range".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Integer(val & !(1 << bit)))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IBCLR requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ishft => {
+                let shift = self.pop(location)?;
+                let i = self.pop(location)?;
+                match (&i, &shift) {
+                    (Value::Integer(val), Value::Integer(sh)) => {
+                        let result = if *sh >= 0 {
+                            val << sh
+                        } else {
+                            val >> (-sh)
+                        };
+                        Ok(Value::Integer(result))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ISHFT requires integer arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
             Intrinsic::ThisImage => {
                 // In single-image mode, always return 1
                 // In multi-image mode, this would return the current image index

@@ -322,6 +322,8 @@ pub struct Symbol {
     pub name: String,
     pub ty: Type,
     pub is_parameter: bool,  // PARAMETER (constant)
+    pub intent: Option<Intent>,  // INTENT for procedure arguments
+    pub is_optional: bool,  // OPTIONAL attribute
     pub location: SourceLocation,
 }
 
@@ -331,12 +333,24 @@ impl Symbol {
             name,
             ty,
             is_parameter: false,
+            intent: None,
+            is_optional: false,
             location,
         }
     }
 
     pub fn with_parameter(mut self) -> Self {
         self.is_parameter = true;
+        self
+    }
+
+    pub fn with_intent(mut self, intent: Option<Intent>) -> Self {
+        self.intent = intent;
+        self
+    }
+
+    pub fn with_optional(mut self, is_optional: bool) -> Self {
+        self.is_optional = is_optional;
         self
     }
 }
@@ -469,6 +483,11 @@ pub enum SemanticError {
         name: String,
         location: SourceLocation,
     },
+    /// Assignment to INTENT(IN) argument
+    AssignmentToIntentIn {
+        name: String,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for SemanticError {
@@ -522,6 +541,13 @@ impl fmt::Display for SemanticError {
                     name, location
                 )
             }
+            SemanticError::AssignmentToIntentIn { name, location } => {
+                write!(
+                    f,
+                    "Cannot assign to INTENT(IN) argument '{}' at {}",
+                    name, location
+                )
+            }
         }
     }
 }
@@ -566,7 +592,68 @@ impl SemanticAnalyzer {
             }
         }
 
+        // Process internal procedures (CONTAINS)
+        for proc in &program.procedures {
+            if let Err(e) = self.analyze_procedure(proc) {
+                self.errors.push(e);
+            }
+        }
+
         self.errors.clone()
+    }
+
+    /// Analyze an internal procedure
+    fn analyze_procedure(&mut self, proc: &Procedure) -> SemanticResult<()> {
+        match proc {
+            Procedure::Subroutine(sub) => {
+                self.symbol_table.enter_scope();
+
+                // Process declarations (which include parameter declarations with INTENT)
+                for decl in &sub.declarations {
+                    if let Err(e) = self.analyze_declaration(decl) {
+                        self.errors.push(e);
+                    }
+                }
+
+                // Process body statements
+                for stmt in &sub.body {
+                    if let Err(e) = self.analyze_statement(stmt) {
+                        self.errors.push(e);
+                    }
+                }
+
+                self.symbol_table.exit_scope();
+                Ok(())
+            }
+            Procedure::Function(func) => {
+                self.symbol_table.enter_scope();
+
+                // Add result variable
+                let result_name = func.result_name.as_ref().unwrap_or(&func.name);
+                let result_type = func.return_type.as_ref()
+                    .map(Type::from)
+                    .unwrap_or_else(Type::integer);
+                let result_symbol = Symbol::new(result_name.clone(), result_type, func.location);
+                let _ = self.symbol_table.define(result_symbol);
+
+                // Process declarations (which include parameter declarations with INTENT)
+                for decl in &func.declarations {
+                    if let Err(e) = self.analyze_declaration(decl) {
+                        self.errors.push(e);
+                    }
+                }
+
+                // Process body statements
+                for stmt in &func.body {
+                    if let Err(e) = self.analyze_statement(stmt) {
+                        self.errors.push(e);
+                    }
+                }
+
+                self.symbol_table.exit_scope();
+                Ok(())
+            }
+        }
     }
 
     /// Analyze a declaration and add symbols to table
@@ -618,7 +705,9 @@ impl SemanticAnalyzer {
                         base_ty.clone()
                     };
 
-                    let symbol = Symbol::new(entity.name.clone(), ty.clone(), *location);
+                    let symbol = Symbol::new(entity.name.clone(), ty.clone(), *location)
+                        .with_intent(entity.attributes.intent)
+                        .with_optional(entity.attributes.is_optional);
                     self.symbol_table.define(symbol)?;
 
                     // If there's initialization, type check it
@@ -691,6 +780,14 @@ impl SemanticAnalyzer {
                 // Check if trying to assign to a constant
                 if symbol.is_parameter {
                     return Err(SemanticError::AssignmentToConstant {
+                        name: target.clone(),
+                        location: *location,
+                    });
+                }
+
+                // Check if trying to assign to an INTENT(IN) argument
+                if symbol.intent == Some(Intent::In) {
+                    return Err(SemanticError::AssignmentToIntentIn {
                         name: target.clone(),
                         location: *location,
                     });

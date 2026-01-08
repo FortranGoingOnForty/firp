@@ -654,14 +654,61 @@ impl Parser {
 
         // Check for attributes (e.g., INTEGER, PARAMETER :: ...)
         let mut is_parameter = false;
-        if self.check(&TokenType::Comma) {
+        let mut intent: Option<Intent> = None;
+        let mut is_optional = false;
+
+        // Parse comma-separated attributes
+        while self.check(&TokenType::Comma) {
             self.advance();
             // Parse attribute
             if self.check(&TokenType::Parameter) {
                 self.advance();
                 is_parameter = true;
+            } else if self.check(&TokenType::Intent) {
+                self.advance();
+                self.expect(&TokenType::LeftParen, "(")?;
+                // Parse IN, OUT, or INOUT
+                if self.check(&TokenType::In) {
+                    self.advance();
+                    if self.check(&TokenType::Out) {
+                        // INTENT(INOUT) - "IN" followed by "OUT"
+                        self.advance();
+                        intent = Some(Intent::InOut);
+                    } else {
+                        intent = Some(Intent::In);
+                    }
+                } else if self.check(&TokenType::Out) {
+                    self.advance();
+                    intent = Some(Intent::Out);
+                } else if self.check(&TokenType::InOut) {
+                    // INOUT as single token
+                    self.advance();
+                    intent = Some(Intent::InOut);
+                } else if let TokenType::Identifier(ident) = &self.peek().token_type {
+                    // Check for INOUT as single identifier
+                    if ident.to_uppercase() == "INOUT" {
+                        self.advance();
+                        intent = Some(Intent::InOut);
+                    } else {
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "IN, OUT, or INOUT".to_string(),
+                            found: self.peek().token_type.clone(),
+                            location: self.current_location(),
+                        });
+                    }
+                } else {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "IN, OUT, or INOUT".to_string(),
+                        found: self.peek().token_type.clone(),
+                        location: self.current_location(),
+                    });
+                }
+                self.expect(&TokenType::RightParen, ")")?;
+            } else if self.check(&TokenType::Optional) {
+                self.advance();
+                is_optional = true;
             }
-            // Could add more attributes here (INTENT, DIMENSION, etc.)
+            // Could add more attributes here (DIMENSION, etc.)
         }
 
         // Check for :: (optional but common in modern Fortran)
@@ -710,12 +757,16 @@ impl Parser {
                 None
             };
 
-            // Build the entity
+            // Build the entity with parsed attributes
+            let mut attributes = VarAttributes::default();
+            attributes.intent = intent;
+            attributes.is_optional = is_optional;
+
             let entity = DeclaredEntity {
                 name,
                 array_spec,
                 init: init_expr,
-                attributes: VarAttributes::default(),
+                attributes,
             };
             entities.push(entity);
 

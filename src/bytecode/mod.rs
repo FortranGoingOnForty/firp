@@ -181,6 +181,27 @@ pub enum Intrinsic {
     Transpose,
     Matmul,
 
+    // Character intrinsics
+    Len,
+    LenTrim,
+    Trim,
+    Adjustl,
+    Adjustr,
+    Index,
+    Repeat,
+    CharFn,  // CHAR(i) - integer to character
+    Ichar,   // ICHAR(c) - character to integer
+
+    // Bit manipulation intrinsics
+    Iand,
+    Ior,
+    Ieor,
+    Not,
+    Btest,
+    Ibset,
+    Ibclr,
+    Ishft,
+
     // Coarray/parallel intrinsics
     ThisImage,
     NumImages,
@@ -222,8 +243,28 @@ impl Intrinsic {
             29 => Some(Intrinsic::Reshape),
             30 => Some(Intrinsic::Transpose),
             31 => Some(Intrinsic::Matmul),
-            32 => Some(Intrinsic::ThisImage),
-            33 => Some(Intrinsic::NumImages),
+            // Character intrinsics
+            32 => Some(Intrinsic::Len),
+            33 => Some(Intrinsic::LenTrim),
+            34 => Some(Intrinsic::Trim),
+            35 => Some(Intrinsic::Adjustl),
+            36 => Some(Intrinsic::Adjustr),
+            37 => Some(Intrinsic::Index),
+            38 => Some(Intrinsic::Repeat),
+            39 => Some(Intrinsic::CharFn),
+            40 => Some(Intrinsic::Ichar),
+            // Bit manipulation intrinsics
+            41 => Some(Intrinsic::Iand),
+            42 => Some(Intrinsic::Ior),
+            43 => Some(Intrinsic::Ieor),
+            44 => Some(Intrinsic::Not),
+            45 => Some(Intrinsic::Btest),
+            46 => Some(Intrinsic::Ibset),
+            47 => Some(Intrinsic::Ibclr),
+            48 => Some(Intrinsic::Ishft),
+            // Coarray/parallel
+            49 => Some(Intrinsic::ThisImage),
+            50 => Some(Intrinsic::NumImages),
             _ => None,
         }
     }
@@ -265,6 +306,25 @@ impl Intrinsic {
             "RESHAPE" => Some(Intrinsic::Reshape),
             "TRANSPOSE" => Some(Intrinsic::Transpose),
             "MATMUL" => Some(Intrinsic::Matmul),
+            // Character intrinsics
+            "LEN" => Some(Intrinsic::Len),
+            "LEN_TRIM" => Some(Intrinsic::LenTrim),
+            "TRIM" => Some(Intrinsic::Trim),
+            "ADJUSTL" => Some(Intrinsic::Adjustl),
+            "ADJUSTR" => Some(Intrinsic::Adjustr),
+            "INDEX" => Some(Intrinsic::Index),
+            "REPEAT" => Some(Intrinsic::Repeat),
+            "CHAR" => Some(Intrinsic::CharFn),
+            "ICHAR" => Some(Intrinsic::Ichar),
+            // Bit manipulation intrinsics
+            "IAND" => Some(Intrinsic::Iand),
+            "IOR" => Some(Intrinsic::Ior),
+            "IEOR" => Some(Intrinsic::Ieor),
+            "NOT" => Some(Intrinsic::Not),
+            "BTEST" => Some(Intrinsic::Btest),
+            "IBSET" => Some(Intrinsic::Ibset),
+            "IBCLR" => Some(Intrinsic::Ibclr),
+            "ISHFT" => Some(Intrinsic::Ishft),
             // Coarray/parallel intrinsics
             "THIS_IMAGE" => Some(Intrinsic::ThisImage),
             "NUM_IMAGES" => Some(Intrinsic::NumImages),
@@ -300,6 +360,19 @@ impl Intrinsic {
             Intrinsic::Reshape => (2, 2),    // RESHAPE(source, shape)
             Intrinsic::Transpose => (1, 1),  // TRANSPOSE(matrix)
             Intrinsic::Matmul => (2, 2),     // MATMUL(matrix_a, matrix_b)
+
+            // Character intrinsics
+            Intrinsic::Len | Intrinsic::LenTrim | Intrinsic::Trim |
+            Intrinsic::Adjustl | Intrinsic::Adjustr |
+            Intrinsic::CharFn | Intrinsic::Ichar => (1, 1),
+            Intrinsic::Index => (2, 2),       // INDEX(string, substring)
+            Intrinsic::Repeat => (2, 2),      // REPEAT(string, ncopies)
+
+            // Bit manipulation intrinsics
+            Intrinsic::Iand | Intrinsic::Ior | Intrinsic::Ieor => (2, 2),
+            Intrinsic::Not => (1, 1),
+            Intrinsic::Btest | Intrinsic::Ibset | Intrinsic::Ibclr => (2, 2),
+            Intrinsic::Ishft => (2, 2),       // ISHFT(i, shift)
 
             // Coarray/parallel intrinsics (no arguments)
             Intrinsic::ThisImage | Intrinsic::NumImages => (0, 0),
@@ -342,6 +415,23 @@ impl fmt::Display for Intrinsic {
             Intrinsic::Reshape => write!(f, "RESHAPE"),
             Intrinsic::Transpose => write!(f, "TRANSPOSE"),
             Intrinsic::Matmul => write!(f, "MATMUL"),
+            Intrinsic::Len => write!(f, "LEN"),
+            Intrinsic::LenTrim => write!(f, "LEN_TRIM"),
+            Intrinsic::Trim => write!(f, "TRIM"),
+            Intrinsic::Adjustl => write!(f, "ADJUSTL"),
+            Intrinsic::Adjustr => write!(f, "ADJUSTR"),
+            Intrinsic::Index => write!(f, "INDEX"),
+            Intrinsic::Repeat => write!(f, "REPEAT"),
+            Intrinsic::CharFn => write!(f, "CHAR"),
+            Intrinsic::Ichar => write!(f, "ICHAR"),
+            Intrinsic::Iand => write!(f, "IAND"),
+            Intrinsic::Ior => write!(f, "IOR"),
+            Intrinsic::Ieor => write!(f, "IEOR"),
+            Intrinsic::Not => write!(f, "NOT"),
+            Intrinsic::Btest => write!(f, "BTEST"),
+            Intrinsic::Ibset => write!(f, "IBSET"),
+            Intrinsic::Ibclr => write!(f, "IBCLR"),
+            Intrinsic::Ishft => write!(f, "ISHFT"),
             Intrinsic::ThisImage => write!(f, "THIS_IMAGE"),
             Intrinsic::NumImages => write!(f, "NUM_IMAGES"),
         }

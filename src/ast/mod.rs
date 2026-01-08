@@ -253,6 +253,8 @@ pub struct VarAttributes {
     pub is_optional: bool,
     /// SAVE attribute
     pub is_save: bool,
+    /// INTENT attribute for procedure arguments
+    pub intent: Option<Intent>,
 }
 
 /// A single declared entity (name with optional array dimensions)
