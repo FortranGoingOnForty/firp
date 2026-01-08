@@ -420,22 +420,40 @@ impl Parser {
             });
         }
 
-        // Parse variable names
+        // Parse variable names with optional array dimensions
         let mut names = Vec::new();
+        let mut entities = Vec::new();
         let mut init_values = Vec::new();
 
         loop {
             let name = self.expect_identifier()?;
-            names.push(name);
+            names.push(name.clone());
+
+            // Check for array dimensions: name(dim1, dim2, ...)
+            let array_spec = if self.check(&TokenType::LeftParen) {
+                Some(self.parse_array_spec()?)
+            } else {
+                None
+            };
 
             // Check for initialization
-            if self.check(&TokenType::Equal) {
+            let init_expr = if self.check(&TokenType::Equal) {
                 self.advance();
                 let value = self.parse_expression()?;
-                init_values.push(Some(value));
+                init_values.push(Some(value.clone()));
+                Some(value)
             } else {
                 init_values.push(None);
-            }
+                None
+            };
+
+            // Build the entity
+            let entity = DeclaredEntity {
+                name,
+                array_spec,
+                init: init_expr,
+            };
+            entities.push(entity);
 
             if self.check(&TokenType::Comma) {
                 self.advance();
@@ -453,9 +471,49 @@ impl Parser {
         Ok(Declaration::Variable {
             type_spec,
             names,
+            entities,
             init,
             location,
         })
+    }
+
+    /// Parse array dimension specification: (dim1, dim2, ...)
+    /// Supports: (10), (1:10), (0:9, 1:5)
+    fn parse_array_spec(&mut self) -> ParseResult<ArraySpec> {
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        let mut dimensions = Vec::new();
+
+        loop {
+            let dim = self.parse_array_dim_spec()?;
+            dimensions.push(dim);
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        Ok(ArraySpec { dimensions })
+    }
+
+    /// Parse a single array dimension specification
+    /// Supports: 10 (upper only), 1:10 (lower:upper)
+    fn parse_array_dim_spec(&mut self) -> ParseResult<ArrayDimSpec> {
+        let first = self.parse_expression()?;
+
+        if self.check(&TokenType::Colon) {
+            // lower:upper form
+            self.advance();
+            let upper = self.parse_expression()?;
+            Ok(ArrayDimSpec::with_bounds(first, upper))
+        } else {
+            // upper only form
+            Ok(ArrayDimSpec::new(first))
+        }
     }
 
     /// Parse a type specification
@@ -556,7 +614,7 @@ impl Parser {
             return self.parse_print_statement();
         }
 
-        // Assignment: identifier = expression
+        // Assignment: identifier = expression or arr(i) = expression
         // Check if this could be an identifier (including keywords used as identifiers)
         let is_identifier_like = matches!(
             self.peek().token_type,
@@ -570,11 +628,30 @@ impl Parser {
         if is_identifier_like {
             let name = self.expect_identifier()?;
 
+            // Check for array indices: arr(i, j, ...)
+            let indices = if self.check(&TokenType::LeftParen) {
+                self.advance();
+                let mut idx_list = Vec::new();
+                loop {
+                    idx_list.push(self.parse_expression()?);
+                    if self.check(&TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenType::RightParen, ")")?;
+                Some(idx_list)
+            } else {
+                None
+            };
+
             if self.check(&TokenType::Equal) {
                 self.advance();
                 let value = self.parse_expression()?;
                 return Ok(Statement::Assignment {
                     target: name,
+                    indices,
                     value,
                     location,
                 });

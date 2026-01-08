@@ -387,3 +387,186 @@ fn test_parse_error_missing_equals() {
     let result = parse_program(source);
     assert!(result.is_err());
 }
+
+// Array parsing tests
+
+#[test]
+fn test_parse_1d_array_declaration() {
+    let source = r#"
+        program test
+          integer :: arr(10)
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    assert_eq!(program.declarations.len(), 1);
+
+    if let Declaration::Variable { entities, .. } = &program.declarations[0] {
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "ARR");
+        assert!(entities[0].array_spec.is_some());
+
+        let array_spec = entities[0].array_spec.as_ref().unwrap();
+        assert_eq!(array_spec.dimensions.len(), 1);
+        // Upper bound should be 10
+        if let Expr::IntegerLiteral(val, _) = &array_spec.dimensions[0].upper {
+            assert_eq!(*val, 10);
+        } else {
+            panic!("Expected integer literal for upper bound");
+        }
+    } else {
+        panic!("Expected Variable declaration");
+    }
+}
+
+#[test]
+fn test_parse_1d_array_with_explicit_bounds() {
+    let source = r#"
+        program test
+          integer :: arr(0:9)
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    if let Declaration::Variable { entities, .. } = &program.declarations[0] {
+        let array_spec = entities[0].array_spec.as_ref().unwrap();
+        assert_eq!(array_spec.dimensions.len(), 1);
+
+        // Check lower bound is 0
+        let lower = array_spec.dimensions[0].lower.as_ref().unwrap();
+        if let Expr::IntegerLiteral(val, _) = lower {
+            assert_eq!(*val, 0);
+        } else {
+            panic!("Expected integer literal for lower bound");
+        }
+
+        // Check upper bound is 9
+        if let Expr::IntegerLiteral(val, _) = &array_spec.dimensions[0].upper {
+            assert_eq!(*val, 9);
+        } else {
+            panic!("Expected integer literal for upper bound");
+        }
+    } else {
+        panic!("Expected Variable declaration");
+    }
+}
+
+#[test]
+fn test_parse_2d_array_declaration() {
+    let source = r#"
+        program test
+          real :: matrix(3, 4)
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    if let Declaration::Variable { entities, .. } = &program.declarations[0] {
+        let array_spec = entities[0].array_spec.as_ref().unwrap();
+        assert_eq!(array_spec.dimensions.len(), 2);
+    } else {
+        panic!("Expected Variable declaration");
+    }
+}
+
+#[test]
+fn test_parse_mixed_scalar_and_array() {
+    let source = r#"
+        program test
+          integer :: x, arr(5), y
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    if let Declaration::Variable { entities, .. } = &program.declarations[0] {
+        assert_eq!(entities.len(), 3);
+
+        // x is scalar
+        assert!(entities[0].array_spec.is_none());
+
+        // arr is array
+        assert!(entities[1].array_spec.is_some());
+
+        // y is scalar
+        assert!(entities[2].array_spec.is_none());
+    } else {
+        panic!("Expected Variable declaration");
+    }
+}
+
+#[test]
+fn test_parse_array_assignment() {
+    let source = r#"
+        program test
+          integer :: arr(10)
+          arr(5) = 42
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    assert_eq!(program.statements.len(), 1);
+
+    if let Statement::Assignment { target, indices, value, .. } = &program.statements[0] {
+        assert_eq!(target, "ARR");
+        assert!(indices.is_some());
+
+        let idx = indices.as_ref().unwrap();
+        assert_eq!(idx.len(), 1);
+        if let Expr::IntegerLiteral(val, _) = &idx[0] {
+            assert_eq!(*val, 5);
+        } else {
+            panic!("Expected integer literal for index");
+        }
+
+        if let Expr::IntegerLiteral(val, _) = value {
+            assert_eq!(*val, 42);
+        } else {
+            panic!("Expected integer literal for value");
+        }
+    } else {
+        panic!("Expected Assignment statement");
+    }
+}
+
+#[test]
+fn test_parse_2d_array_assignment() {
+    let source = r#"
+        program test
+          real :: mat(3, 4)
+          mat(1, 2) = 3.14
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    if let Statement::Assignment { indices, .. } = &program.statements[0] {
+        assert!(indices.is_some());
+        let idx = indices.as_ref().unwrap();
+        assert_eq!(idx.len(), 2);
+    } else {
+        panic!("Expected Assignment statement");
+    }
+}
+
+#[test]
+fn test_parse_array_with_negative_lower_bound() {
+    let source = r#"
+        program test
+          integer :: arr(-5:5)
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+
+    if let Declaration::Variable { entities, .. } = &program.declarations[0] {
+        let array_spec = entities[0].array_spec.as_ref().unwrap();
+
+        // Check lower bound is -5 (parsed as unary minus on 5)
+        let lower = array_spec.dimensions[0].lower.as_ref().unwrap();
+        assert!(matches!(lower, Expr::UnaryOp { op: UnaryOperator::Minus, .. }));
+    } else {
+        panic!("Expected Variable declaration");
+    }
+}

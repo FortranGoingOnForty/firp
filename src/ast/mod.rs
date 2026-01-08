@@ -101,13 +101,71 @@ impl TypeSpec {
     }
 }
 
+/// Array dimension specification
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayDimSpec {
+    /// Lower bound (defaults to 1 if not specified)
+    pub lower: Option<Expr>,
+    /// Upper bound (required)
+    pub upper: Expr,
+}
+
+impl ArrayDimSpec {
+    pub fn new(upper: Expr) -> Self {
+        Self { lower: None, upper }
+    }
+
+    pub fn with_bounds(lower: Expr, upper: Expr) -> Self {
+        Self { lower: Some(lower), upper }
+    }
+}
+
+/// Array specification for a declared variable
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArraySpec {
+    /// Dimensions (at least one for arrays)
+    pub dimensions: Vec<ArrayDimSpec>,
+}
+
+/// A single declared entity (name with optional array dimensions)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclaredEntity {
+    pub name: String,
+    /// Array dimensions (None for scalars)
+    pub array_spec: Option<ArraySpec>,
+    /// Initialization expression
+    pub init: Option<Expr>,
+}
+
+impl DeclaredEntity {
+    pub fn scalar(name: String) -> Self {
+        Self { name, array_spec: None, init: None }
+    }
+
+    pub fn array(name: String, dims: Vec<ArrayDimSpec>) -> Self {
+        Self {
+            name,
+            array_spec: Some(ArraySpec { dimensions: dims }),
+            init: None,
+        }
+    }
+
+    pub fn with_init(mut self, init: Expr) -> Self {
+        self.init = Some(init);
+        self
+    }
+}
+
 /// Declaration statement
 #[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
-    /// Variable declaration: INTEGER :: x, y
+    /// Variable declaration: INTEGER :: x, y, arr(10)
     Variable {
         type_spec: TypeSpec,
+        /// For backward compatibility, simple names list
         names: Vec<String>,
+        /// Full entity list with array specs
+        entities: Vec<DeclaredEntity>,
         init: Option<Vec<Option<Expr>>>,
         location: SourceLocation,
     },
@@ -125,9 +183,11 @@ pub enum Declaration {
 /// Statements
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// Assignment: x = expr
+    /// Assignment: x = expr or arr(i) = expr
     Assignment {
         target: String,
+        /// Array indices for array element assignment (None for scalar)
+        indices: Option<Vec<Expr>>,
         value: Expr,
         location: SourceLocation,
     },
@@ -250,6 +310,12 @@ pub enum Expr {
         arguments: Vec<Expr>,
         location: SourceLocation,
     },
+    /// Array element access: arr(i) or arr(i, j)
+    ArrayAccess {
+        name: String,
+        indices: Vec<Expr>,
+        location: SourceLocation,
+    },
 }
 
 impl Expr {
@@ -264,6 +330,7 @@ impl Expr {
             Expr::UnaryOp { location, .. } => location,
             Expr::Parenthesized(_, loc) => loc,
             Expr::FunctionCall { location, .. } => location,
+            Expr::ArrayAccess { location, .. } => location,
         }
     }
 }

@@ -96,6 +96,14 @@ pub enum OpCode {
     Call,
     /// Return from a subroutine/function
     Return,
+
+    // Array operations
+    /// Allocate array storage (operand = variable index, expects dims on stack)
+    AllocArray,
+    /// Load element from array (operand = variable index, expects indices on stack)
+    LoadArrayElem,
+    /// Store value into array element (operand = variable index, expects value and indices on stack)
+    StoreArrayElem,
 }
 
 impl fmt::Display for OpCode {
@@ -133,7 +141,27 @@ impl fmt::Display for OpCode {
             OpCode::Nop => write!(f, "Nop"),
             OpCode::Call => write!(f, "Call"),
             OpCode::Return => write!(f, "Return"),
+            OpCode::AllocArray => write!(f, "AllocArray"),
+            OpCode::LoadArrayElem => write!(f, "LoadArrayElem"),
+            OpCode::StoreArrayElem => write!(f, "StoreArrayElem"),
         }
+    }
+}
+
+/// Array dimension information for runtime bounds checking
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayDim {
+    pub lower: i64,
+    pub upper: i64,
+}
+
+impl ArrayDim {
+    pub fn new(lower: i64, upper: i64) -> Self {
+        Self { lower, upper }
+    }
+
+    pub fn size(&self) -> usize {
+        (self.upper - self.lower + 1).max(0) as usize
     }
 }
 
@@ -144,6 +172,11 @@ pub enum Value {
     Real(f64),
     Logical(bool),
     Character(String),
+    /// Array with elements and dimension info
+    Array {
+        elements: Vec<Value>,
+        dims: Vec<ArrayDim>,
+    },
 }
 
 impl Value {
@@ -153,6 +186,105 @@ impl Value {
             Value::Real(_) => "REAL",
             Value::Logical(_) => "LOGICAL",
             Value::Character(_) => "CHARACTER",
+            Value::Array { .. } => "ARRAY",
+        }
+    }
+
+    /// Create a new array with given dimensions, initialized to default values
+    pub fn new_array(dims: Vec<ArrayDim>, default: Value) -> Self {
+        let total_size: usize = dims.iter().map(|d| d.size()).product();
+        let elements = vec![default; total_size];
+        Value::Array { elements, dims }
+    }
+
+    /// Create a new integer array with given dimensions, initialized to 0
+    pub fn new_integer_array(dims: Vec<ArrayDim>) -> Self {
+        Self::new_array(dims, Value::Integer(0))
+    }
+
+    /// Create a new real array with given dimensions, initialized to 0.0
+    pub fn new_real_array(dims: Vec<ArrayDim>) -> Self {
+        Self::new_array(dims, Value::Real(0.0))
+    }
+
+    /// Check if this value is an array
+    pub fn is_array(&self) -> bool {
+        matches!(self, Value::Array { .. })
+    }
+
+    /// Get array rank (number of dimensions)
+    pub fn rank(&self) -> Option<usize> {
+        match self {
+            Value::Array { dims, .. } => Some(dims.len()),
+            _ => None,
+        }
+    }
+
+    /// Calculate linear index from multi-dimensional indices (column-major order like Fortran)
+    pub fn linear_index(&self, indices: &[i64]) -> Option<usize> {
+        match self {
+            Value::Array { dims, .. } => {
+                if indices.len() != dims.len() {
+                    return None;
+                }
+
+                let mut linear_idx = 0usize;
+                let mut stride = 1usize;
+
+                for (idx, dim) in indices.iter().zip(dims.iter()) {
+                    // Check bounds
+                    if *idx < dim.lower || *idx > dim.upper {
+                        return None;
+                    }
+                    linear_idx += ((idx - dim.lower) as usize) * stride;
+                    stride *= dim.size();
+                }
+
+                Some(linear_idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get an element from an array by indices
+    pub fn get_element(&self, indices: &[i64]) -> Option<&Value> {
+        match self {
+            Value::Array { elements, .. } => {
+                let linear_idx = self.linear_index(indices)?;
+                elements.get(linear_idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// Set an element in an array by indices (returns None if out of bounds or not an array)
+    pub fn set_element(&mut self, indices: &[i64], value: Value) -> Option<()> {
+        match self {
+            Value::Array { elements, dims } => {
+                // Calculate linear index inline to avoid borrow issues
+                if indices.len() != dims.len() {
+                    return None;
+                }
+
+                let mut linear_idx = 0usize;
+                let mut stride = 1usize;
+
+                for (idx, dim) in indices.iter().zip(dims.iter()) {
+                    if *idx < dim.lower || *idx > dim.upper {
+                        return None;
+                    }
+                    linear_idx += ((idx - dim.lower) as usize) * stride;
+                    stride *= dim.size();
+                }
+
+                if linear_idx < elements.len() {
+                    elements[linear_idx] = value;
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -165,6 +297,26 @@ impl fmt::Display for Value {
             Value::Logical(true) => write!(f, ".TRUE."),
             Value::Logical(false) => write!(f, ".FALSE."),
             Value::Character(s) => write!(f, "'{}'", s),
+            Value::Array { elements, dims } => {
+                // Format like Fortran array output
+                write!(f, "[")?;
+                for (i, elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, "]")?;
+                // Show shape
+                write!(f, " shape(")?;
+                for (i, dim) in dims.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", dim.size())?;
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -297,6 +449,11 @@ impl Chunk {
     /// Get variable index by name
     pub fn get_variable_index(&self, name: &str) -> Option<usize> {
         self.variables.iter().position(|v| v == name)
+    }
+
+    /// Check if a variable has been declared
+    pub fn has_variable(&self, name: &str) -> bool {
+        self.variables.iter().any(|v| v == name)
     }
 
     /// Register a procedure entry point
@@ -576,19 +733,42 @@ impl Compiler {
     /// Compile a declaration
     fn compile_declaration(&mut self, decl: &Declaration) -> CompileResult<()> {
         match decl {
-            Declaration::Variable { names, init, location, .. } => {
-                for (i, name) in names.iter().enumerate() {
+            Declaration::Variable { entities, location, .. } => {
+                for entity in entities {
                     // Allocate variable slot
-                    let var_index = self.chunk.add_variable(name.clone());
+                    let var_index = self.chunk.add_variable(entity.name.clone());
 
-                    // If there's initialization, compile it
-                    if let Some(init_exprs) = init {
-                        if let Some(Some(init_expr)) = init_exprs.get(i) {
-                            self.compile_expression(init_expr)?;
-                            self.chunk
-                                .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                    // Check if this is an array declaration
+                    if let Some(array_spec) = &entity.array_spec {
+                        // Emit array allocation
+                        // Push lower and upper bounds for each dimension FIRST
+                        for dim in &array_spec.dimensions {
+                            // Lower bound (default to 1 if not specified)
+                            if let Some(lower) = &dim.lower {
+                                self.compile_expression(lower)?;
+                            } else {
+                                let one_idx = self.chunk.add_constant(Value::Integer(1));
+                                self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, *location);
+                            }
+
+                            // Upper bound
+                            self.compile_expression(&dim.upper)?;
                         }
+
+                        // Push number of dimensions LAST (so it's on top of stack)
+                        let num_dims = array_spec.dimensions.len();
+                        let dims_idx = self.chunk.add_constant(Value::Integer(num_dims as i64));
+                        self.chunk.emit_with_operand(OpCode::LoadConst, dims_idx, *location);
+
+                        // Emit AllocArray with variable index
+                        self.chunk.emit_with_operand(OpCode::AllocArray, var_index, *location);
+                    } else if let Some(init_expr) = &entity.init {
+                        // Scalar with initialization
+                        self.compile_expression(init_expr)?;
+                        self.chunk
+                            .emit_with_operand(OpCode::StoreVar, var_index, *location);
                     }
+                    // Scalars without initialization don't need bytecode
                 }
                 Ok(())
             }
@@ -610,14 +790,39 @@ impl Compiler {
     /// Compile a statement
     fn compile_statement(&mut self, stmt: &Statement) -> CompileResult<()> {
         match stmt {
-            Statement::Assignment { target, value, location } => {
-                // Compile the value expression
-                self.compile_expression(value)?;
+            Statement::Assignment { target, indices, value, location } => {
+                if let Some(idx_exprs) = indices {
+                    // Array element assignment: arr(i, j, ...) = value
+                    // Stack order for StoreArrayElem: value, index1, index2, ..., num_indices (top)
 
-                // Get or create variable index
-                let var_index = self.chunk.add_variable(target.clone());
-                self.chunk
-                    .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                    // Push value first (goes to bottom)
+                    self.compile_expression(value)?;
+
+                    // Push each index
+                    for idx in idx_exprs {
+                        self.compile_expression(idx)?;
+                    }
+
+                    // Push number of indices LAST (so it's on top of stack)
+                    let num_idx = idx_exprs.len();
+                    let idx_count = self.chunk.add_constant(Value::Integer(num_idx as i64));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, idx_count, *location);
+
+                    // Get variable index
+                    let var_index = self.chunk.add_variable(target.clone());
+
+                    // Emit StoreArrayElem
+                    self.chunk.emit_with_operand(OpCode::StoreArrayElem, var_index, *location);
+                } else {
+                    // Scalar assignment
+                    // Compile the value expression
+                    self.compile_expression(value)?;
+
+                    // Get or create variable index
+                    let var_index = self.chunk.add_variable(target.clone());
+                    self.chunk
+                        .emit_with_operand(OpCode::StoreVar, var_index, *location);
+                }
                 Ok(())
             }
 
@@ -1165,21 +1370,65 @@ impl Compiler {
             }
 
             Expr::FunctionCall { name, arguments, location } => {
-                // Compile arguments (push onto stack)
-                for arg in arguments {
-                    self.compile_expression(arg)?;
+                // Check if this is a function call or an array access
+                // First check if it's a known procedure (function)
+                if self.chunk.get_procedure_address(name).is_some() {
+                    // This is a function call
+                    // Compile arguments (push onto stack)
+                    for arg in arguments {
+                        self.compile_expression(arg)?;
+                    }
+
+                    // Look up function address
+                    let func_address = self.chunk.get_procedure_address(name).unwrap();
+
+                    // Emit call instruction with function address
+                    // The function will leave its return value on the stack
+                    self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                } else if self.chunk.has_variable(name) {
+                    // This is array access (variable exists but not a procedure)
+                    // Push each index FIRST
+                    for arg in arguments {
+                        self.compile_expression(arg)?;
+                    }
+
+                    // Push number of indices LAST (so it's on top of stack)
+                    let num_idx = arguments.len();
+                    let idx_count = self.chunk.add_constant(Value::Integer(num_idx as i64));
+                    self.chunk.emit_with_operand(OpCode::LoadConst, idx_count, *location);
+
+                    // Get variable index
+                    let var_index = self.chunk.add_variable(name.clone());
+
+                    // Emit LoadArrayElem
+                    self.chunk.emit_with_operand(OpCode::LoadArrayElem, var_index, *location);
+                } else {
+                    // Unknown identifier - could be a function not yet compiled or an error
+                    return Err(CompileError::InvalidOperation {
+                        message: format!("Undefined function or array: {}", name),
+                        location: *location,
+                    });
+                }
+                Ok(())
+            }
+
+            Expr::ArrayAccess { name, indices, location } => {
+                // Array element access: arr(i, j, ...)
+                // Push each index FIRST
+                for idx in indices {
+                    self.compile_expression(idx)?;
                 }
 
-                // Look up function address
-                let func_address = self.chunk.get_procedure_address(name)
-                    .ok_or(CompileError::InvalidOperation {
-                        message: format!("Undefined function: {}", name),
-                        location: *location,
-                    })?;
+                // Push number of indices LAST (so it's on top of stack)
+                let num_idx = indices.len();
+                let idx_count = self.chunk.add_constant(Value::Integer(num_idx as i64));
+                self.chunk.emit_with_operand(OpCode::LoadConst, idx_count, *location);
 
-                // Emit call instruction with function address
-                // The function will leave its return value on the stack
-                self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                // Get variable index
+                let var_index = self.chunk.add_variable(name.clone());
+
+                // Emit LoadArrayElem
+                self.chunk.emit_with_operand(OpCode::LoadArrayElem, var_index, *location);
                 Ok(())
             }
         }
@@ -1291,5 +1540,139 @@ mod tests {
         assert!(output.contains("42"));
         assert!(output.contains("StoreVar"));
         assert!(output.contains("X"));
+    }
+
+    // Array tests
+
+    #[test]
+    fn test_array_dim() {
+        let dim = ArrayDim::new(1, 10);
+        assert_eq!(dim.size(), 10);
+
+        let dim2 = ArrayDim::new(-5, 5);
+        assert_eq!(dim2.size(), 11);
+
+        let dim3 = ArrayDim::new(0, 0);
+        assert_eq!(dim3.size(), 1);
+    }
+
+    #[test]
+    fn test_new_integer_array() {
+        let dims = vec![ArrayDim::new(1, 5)];
+        let arr = Value::new_integer_array(dims);
+
+        assert!(arr.is_array());
+        assert_eq!(arr.rank(), Some(1));
+        assert_eq!(arr.type_name(), "ARRAY");
+
+        if let Value::Array { elements, .. } = &arr {
+            assert_eq!(elements.len(), 5);
+            assert!(elements.iter().all(|e| *e == Value::Integer(0)));
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn test_new_real_array() {
+        let dims = vec![ArrayDim::new(1, 3)];
+        let arr = Value::new_real_array(dims);
+
+        if let Value::Array { elements, .. } = &arr {
+            assert_eq!(elements.len(), 3);
+            assert!(elements.iter().all(|e| *e == Value::Real(0.0)));
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn test_2d_array() {
+        let dims = vec![ArrayDim::new(1, 3), ArrayDim::new(1, 4)];
+        let arr = Value::new_integer_array(dims);
+
+        assert_eq!(arr.rank(), Some(2));
+
+        if let Value::Array { elements, .. } = &arr {
+            // 3 * 4 = 12 elements
+            assert_eq!(elements.len(), 12);
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn test_array_linear_index_1d() {
+        let dims = vec![ArrayDim::new(1, 5)];
+        let arr = Value::new_integer_array(dims);
+
+        // Indices [1] through [5] should map to 0..4
+        assert_eq!(arr.linear_index(&[1]), Some(0));
+        assert_eq!(arr.linear_index(&[3]), Some(2));
+        assert_eq!(arr.linear_index(&[5]), Some(4));
+
+        // Out of bounds
+        assert_eq!(arr.linear_index(&[0]), None);
+        assert_eq!(arr.linear_index(&[6]), None);
+    }
+
+    #[test]
+    fn test_array_linear_index_2d_column_major() {
+        // 3x4 array (Fortran column-major)
+        let dims = vec![ArrayDim::new(1, 3), ArrayDim::new(1, 4)];
+        let arr = Value::new_integer_array(dims);
+
+        // In column-major order:
+        // (1,1)->0, (2,1)->1, (3,1)->2, (1,2)->3, (2,2)->4, (3,2)->5, ...
+        assert_eq!(arr.linear_index(&[1, 1]), Some(0));
+        assert_eq!(arr.linear_index(&[2, 1]), Some(1));
+        assert_eq!(arr.linear_index(&[3, 1]), Some(2));
+        assert_eq!(arr.linear_index(&[1, 2]), Some(3));
+        assert_eq!(arr.linear_index(&[2, 2]), Some(4));
+        assert_eq!(arr.linear_index(&[3, 4]), Some(11));
+    }
+
+    #[test]
+    fn test_array_get_set_element() {
+        let dims = vec![ArrayDim::new(1, 5)];
+        let mut arr = Value::new_integer_array(dims);
+
+        // Set element
+        assert!(arr.set_element(&[3], Value::Integer(42)).is_some());
+
+        // Get element
+        assert_eq!(arr.get_element(&[3]), Some(&Value::Integer(42)));
+        assert_eq!(arr.get_element(&[1]), Some(&Value::Integer(0)));
+
+        // Out of bounds
+        assert_eq!(arr.get_element(&[0]), None);
+        assert!(arr.set_element(&[6], Value::Integer(99)).is_none());
+    }
+
+    #[test]
+    fn test_array_display() {
+        let dims = vec![ArrayDim::new(1, 3)];
+        let mut arr = Value::new_integer_array(dims);
+        arr.set_element(&[1], Value::Integer(10));
+        arr.set_element(&[2], Value::Integer(20));
+        arr.set_element(&[3], Value::Integer(30));
+
+        let display = format!("{}", arr);
+        assert!(display.contains("[10, 20, 30]"));
+        assert!(display.contains("shape(3)"));
+    }
+
+    #[test]
+    fn test_array_non_unit_lower_bound() {
+        // Array with non-1 lower bound: arr(-2:2) has 5 elements
+        let dims = vec![ArrayDim::new(-2, 2)];
+        let mut arr = Value::new_integer_array(dims);
+
+        assert_eq!(arr.linear_index(&[-2]), Some(0));
+        assert_eq!(arr.linear_index(&[0]), Some(2));
+        assert_eq!(arr.linear_index(&[2]), Some(4));
+
+        arr.set_element(&[-1], Value::Integer(100));
+        assert_eq!(arr.get_element(&[-1]), Some(&Value::Integer(100)));
     }
 }

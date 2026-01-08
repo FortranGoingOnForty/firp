@@ -3,7 +3,7 @@
 //! This module implements a stack-based virtual machine that executes
 //! compiled Fortran bytecode.
 
-use crate::bytecode::{Chunk, Instruction, OpCode, Value};
+use crate::bytecode::{ArrayDim, Chunk, Instruction, OpCode, Value};
 use crate::lexer::SourceLocation;
 use std::fmt;
 
@@ -68,6 +68,16 @@ pub enum RuntimeError {
         index: usize,
         location: SourceLocation,
     },
+    /// Invalid instruction (missing operand or malformed)
+    InvalidInstruction {
+        message: String,
+        location: SourceLocation,
+    },
+    /// Array index out of bounds
+    IndexOutOfBounds {
+        message: String,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -99,6 +109,12 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeError::InvalidProcedure { index, location } => {
                 write!(f, "Invalid procedure index {} at {}", index, location)
+            }
+            RuntimeError::InvalidInstruction { message, location } => {
+                write!(f, "Invalid instruction: {} at {}", message, location)
+            }
+            RuntimeError::IndexOutOfBounds { message, location } => {
+                write!(f, "Index out of bounds: {} at {}", message, location)
             }
         }
     }
@@ -437,6 +453,105 @@ impl VM {
                         break;
                     }
                 }
+
+                OpCode::AllocArray => {
+                    // Stack contains: num_dims, lower1, upper1, lower2, upper2, ...
+                    let var_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "AllocArray requires variable index".to_string(),
+                        location,
+                    })?;
+
+                    // Pop number of dimensions
+                    let num_dims = match self.pop(location)? {
+                        Value::Integer(n) => n as usize,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Expected integer for array dimension count".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop bounds for each dimension (in reverse order)
+                    let mut dims = Vec::with_capacity(num_dims);
+                    for _ in 0..num_dims {
+                        let upper = match self.pop(location)? {
+                            Value::Integer(n) => n,
+                            _ => return Err(RuntimeError::TypeError {
+                                message: "Expected integer for array upper bound".to_string(),
+                                location,
+                            }),
+                        };
+                        let lower = match self.pop(location)? {
+                            Value::Integer(n) => n,
+                            _ => return Err(RuntimeError::TypeError {
+                                message: "Expected integer for array lower bound".to_string(),
+                                location,
+                            }),
+                        };
+                        dims.push(ArrayDim::new(lower, upper));
+                    }
+
+                    // Reverse to get correct order
+                    dims.reverse();
+
+                    // Create array and store in variable
+                    let array = Value::new_integer_array(dims);
+                    self.set_variable_by_index(var_index, array, location)?;
+                    self.ip += 1;
+                }
+
+                OpCode::LoadArrayElem => {
+                    // Stack contains: num_indices, index1, index2, ...
+                    let var_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "LoadArrayElem requires variable index".to_string(),
+                        location,
+                    })?;
+
+                    // Pop indices
+                    let indices = self.pop_indices(location)?;
+
+                    // Get array from variable
+                    let array = self.get_variable_by_index(var_index, location)?;
+
+                    // Get element
+                    let element = array.get_element(&indices).ok_or(RuntimeError::IndexOutOfBounds {
+                        message: format!("Index {:?} out of bounds", indices),
+                        location,
+                    })?.clone();
+
+                    self.push(element, location)?;
+                    self.ip += 1;
+                }
+
+                OpCode::StoreArrayElem => {
+                    // Stack contains: value, num_indices, index1, index2, ...
+                    let var_index = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "StoreArrayElem requires variable index".to_string(),
+                        location,
+                    })?;
+
+                    // Pop indices
+                    let indices = self.pop_indices(location)?;
+
+                    // Pop value
+                    let value = self.pop(location)?;
+
+                    // Get array from variable (mutably)
+                    let array = self.variables
+                        .get_mut(var_index)
+                        .ok_or(RuntimeError::InvalidVariable { index: var_index, location })?
+                        .as_mut()
+                        .ok_or(RuntimeError::TypeError {
+                            message: "Uninitialized array".to_string(),
+                            location,
+                        })?;
+
+                    // Set element
+                    array.set_element(&indices, value).ok_or(RuntimeError::IndexOutOfBounds {
+                        message: format!("Index {:?} out of bounds", indices),
+                        location,
+                    })?;
+                    self.ip += 1;
+                }
             }
         }
 
@@ -489,6 +604,41 @@ impl VM {
         }
         self.variables[index] = Some(value);
         Ok(())
+    }
+
+    /// Pop array indices from stack
+    /// Stack should contain: num_indices, index1, index2, ...
+    fn pop_indices(&mut self, location: SourceLocation) -> VMResult<Vec<i64>> {
+        // Pop indices in reverse order
+        let mut indices = Vec::new();
+
+        // First, collect all indices from stack
+        // The stack has: ... index_n, index_n-1, ..., index_1, num_indices
+        // We need to pop num_indices first
+        let num_indices = match self.pop(location)? {
+            Value::Integer(n) => n as usize,
+            _ => return Err(RuntimeError::TypeError {
+                message: "Expected integer for index count".to_string(),
+                location,
+            }),
+        };
+
+        // Pop each index (they come in reverse order)
+        for _ in 0..num_indices {
+            let idx = match self.pop(location)? {
+                Value::Integer(n) => n,
+                _ => return Err(RuntimeError::TypeError {
+                    message: "Expected integer for array index".to_string(),
+                    location,
+                }),
+            };
+            indices.push(idx);
+        }
+
+        // Reverse to get correct order
+        indices.reverse();
+
+        Ok(indices)
     }
 
     // Constant operations
@@ -722,6 +872,7 @@ impl VM {
             Value::Integer(i) => *i != 0,
             Value::Real(r) => *r != 0.0,
             Value::Character(s) => !s.is_empty(),
+            Value::Array { elements, .. } => !elements.is_empty(),
         }
     }
 
@@ -731,6 +882,7 @@ impl VM {
             Value::Real(r) => *r,
             Value::Logical(b) => if *b { 1.0 } else { 0.0 },
             Value::Character(_) => 0.0,
+            Value::Array { .. } => 0.0, // Arrays can't be converted to real
         }
     }
 

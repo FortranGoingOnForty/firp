@@ -993,3 +993,139 @@ fn test_sprint08_success_criteria() {
     // factorial(5) = 120
     assert_eq!(vm.get_variable("RESULT"), Some(&firp::bytecode::Value::Integer(120)));
 }
+
+// Sprint 09: Array tests
+
+#[test]
+fn test_1d_array_declaration_and_assignment() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: arr(5)
+
+          arr(1) = 10
+          arr(2) = 20
+          arr(3) = 30
+          arr(4) = 40
+          arr(5) = 50
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Just verify it runs without error
+    // The array should be allocated and elements assigned
+}
+
+#[test]
+fn test_array_element_read_and_write() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: arr(3)
+          integer :: x
+
+          arr(1) = 100
+          arr(2) = 200
+          arr(3) = 300
+          x = arr(2)
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(200)));
+}
+
+#[test]
+fn test_array_sum_loop() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: arr(5)
+          integer :: i, total
+
+          arr(1) = 1
+          arr(2) = 2
+          arr(3) = 3
+          arr(4) = 4
+          arr(5) = 5
+
+          total = 0
+          do i = 1, 5
+            total = total + arr(i)
+          end do
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // 1+2+3+4+5 = 15
+    assert_eq!(vm.get_variable("TOTAL"), Some(&firp::bytecode::Value::Integer(15)));
+}
+
+#[test]
+fn test_array_with_explicit_bounds() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: arr(0:4)
+          integer :: x
+
+          arr(0) = 10
+          arr(1) = 20
+          arr(2) = 30
+          arr(3) = 40
+          arr(4) = 50
+          x = arr(2)
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(30)));
+}
+
+#[test]
+fn test_array_expression_in_assignment() {
+    let source = r#"
+        program test
+          implicit none
+          integer :: arr(3)
+          integer :: x
+
+          arr(1) = 10
+          arr(2) = 20
+          arr(3) = 30
+          x = arr(1) + arr(2) + arr(3)
+        end program test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // 10 + 20 + 30 = 60
+    assert_eq!(vm.get_variable("X"), Some(&firp::bytecode::Value::Integer(60)));
+}
+
+#[test]
+fn test_sprint09_success_criteria() {
+    // Sprint 09 success criteria: Basic array operations
+    let source = r#"
+        PROGRAM array_test
+          IMPLICIT NONE
+          INTEGER :: arr(10)
+          INTEGER :: i, sum
+
+          ! Initialize array elements
+          DO i = 1, 10
+            arr(i) = i * i
+          END DO
+
+          ! Sum array elements
+          sum = 0
+          DO i = 1, 10
+            sum = sum + arr(i)
+          END DO
+
+        END PROGRAM array_test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Sum of squares: 1+4+9+16+25+36+49+64+81+100 = 385
+    assert_eq!(vm.get_variable("SUM"), Some(&firp::bytecode::Value::Integer(385)));
+}

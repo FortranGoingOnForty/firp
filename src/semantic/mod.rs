@@ -5,6 +5,25 @@ use crate::lexer::SourceLocation;
 use std::collections::HashMap;
 use std::fmt;
 
+/// Array dimension bounds
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ArrayBound {
+    /// Lower bound (defaults to 1 in Fortran)
+    pub lower: i64,
+    /// Upper bound
+    pub upper: i64,
+}
+
+impl ArrayBound {
+    pub fn new(lower: i64, upper: i64) -> Self {
+        Self { lower, upper }
+    }
+
+    pub fn size(&self) -> usize {
+        (self.upper - self.lower + 1).max(0) as usize
+    }
+}
+
 /// Fortran types with kind specifications
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -20,8 +39,26 @@ pub enum Type {
     Logical { kind: Option<i32> },
     /// CHARACTER with length and optional kind
     Character { len: Option<usize>, kind: Option<i32> },
+    /// Array type
+    Array {
+        /// Element type (simplified - just the base type kind)
+        element_kind: ArrayElementKind,
+        /// Dimensions with bounds
+        dimensions: Vec<ArrayBound>,
+    },
     /// Void type (for statements that don't produce values)
     Void,
+}
+
+/// Simplified element kind for arrays (to maintain Hash/Eq)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayElementKind {
+    Integer,
+    Real,
+    DoublePrecision,
+    Complex,
+    Logical,
+    Character,
 }
 
 impl Type {
@@ -79,6 +116,48 @@ impl Type {
     /// Check if this is a logical type
     pub fn is_logical(&self) -> bool {
         matches!(self, Type::Logical { .. })
+    }
+
+    /// Check if this is an array type
+    pub fn is_array(&self) -> bool {
+        matches!(self, Type::Array { .. })
+    }
+
+    /// Get array element type (returns self if not an array)
+    pub fn element_type(&self) -> Type {
+        match self {
+            Type::Array { element_kind, .. } => match element_kind {
+                ArrayElementKind::Integer => Type::integer(),
+                ArrayElementKind::Real => Type::real(),
+                ArrayElementKind::DoublePrecision => Type::double_precision(),
+                ArrayElementKind::Complex => Type::complex(),
+                ArrayElementKind::Logical => Type::logical(),
+                ArrayElementKind::Character => Type::character(),
+            },
+            _ => self.clone(),
+        }
+    }
+
+    /// Get array rank (number of dimensions), 0 for scalars
+    pub fn rank(&self) -> usize {
+        match self {
+            Type::Array { dimensions, .. } => dimensions.len(),
+            _ => 0,
+        }
+    }
+
+    /// Create an array type from element type and dimensions
+    pub fn array(element: &Type, dimensions: Vec<ArrayBound>) -> Self {
+        let element_kind = match element {
+            Type::Integer { .. } => ArrayElementKind::Integer,
+            Type::Real { .. } => ArrayElementKind::Real,
+            Type::DoublePrecision => ArrayElementKind::DoublePrecision,
+            Type::Complex { .. } => ArrayElementKind::Complex,
+            Type::Logical { .. } => ArrayElementKind::Logical,
+            Type::Character { .. } => ArrayElementKind::Character,
+            _ => ArrayElementKind::Integer, // Default fallback
+        };
+        Type::Array { element_kind, dimensions }
     }
 
     /// Check if two types are compatible for assignment
@@ -179,6 +258,20 @@ impl fmt::Display for Type {
                 write!(f, "CHARACTER(LEN={:?},KIND={})", len, k)
             }
             Type::Void => write!(f, "VOID"),
+            Type::Array { element_kind, dimensions } => {
+                let elem_str = match element_kind {
+                    ArrayElementKind::Integer => "INTEGER",
+                    ArrayElementKind::Real => "REAL",
+                    ArrayElementKind::DoublePrecision => "DOUBLE PRECISION",
+                    ArrayElementKind::Complex => "COMPLEX",
+                    ArrayElementKind::Logical => "LOGICAL",
+                    ArrayElementKind::Character => "CHARACTER",
+                };
+                let dims: Vec<String> = dimensions.iter()
+                    .map(|d| format!("{}:{}", d.lower, d.upper))
+                    .collect();
+                write!(f, "{}, DIMENSION({})", elem_str, dims.join(", "))
+            }
         }
     }
 }
@@ -481,28 +574,64 @@ impl SemanticAnalyzer {
             }
             Declaration::Variable {
                 type_spec,
-                names,
-                init,
+                entities,
                 location,
+                ..
             } => {
-                let ty = Type::from(type_spec);
+                let base_ty = Type::from(type_spec);
 
-                // Define each variable
-                for (i, name) in names.iter().enumerate() {
-                    let symbol = Symbol::new(name.clone(), ty.clone(), *location);
+                // Define each variable/array
+                for entity in entities {
+                    // If it's an array, create an array type
+                    let ty = if let Some(array_spec) = &entity.array_spec {
+                        // For now, we'll create an Array type with the dimensions
+                        // The actual bounds are expressions that need evaluation
+                        let dims: Vec<ArrayBound> = array_spec.dimensions.iter().map(|dim| {
+                            // For compile-time constants, we can evaluate them
+                            // For now, assume constant bounds
+                            let lower = dim.lower.as_ref()
+                                .and_then(|e| self.eval_constant_int(e))
+                                .unwrap_or(1);
+                            let upper = self.eval_constant_int(&dim.upper).unwrap_or(10);
+                            ArrayBound::new(lower, upper)
+                        }).collect();
+
+                        let element_kind = match &base_ty {
+                            Type::Integer { .. } => ArrayElementKind::Integer,
+                            Type::Real { .. } => ArrayElementKind::Real,
+                            Type::DoublePrecision => ArrayElementKind::DoublePrecision,
+                            Type::Complex { .. } => ArrayElementKind::Complex,
+                            Type::Logical { .. } => ArrayElementKind::Logical,
+                            Type::Character { .. } => ArrayElementKind::Character,
+                            _ => ArrayElementKind::Integer, // Default fallback
+                        };
+
+                        Type::Array {
+                            element_kind,
+                            dimensions: dims,
+                        }
+                    } else {
+                        base_ty.clone()
+                    };
+
+                    let symbol = Symbol::new(entity.name.clone(), ty.clone(), *location);
                     self.symbol_table.define(symbol)?;
 
                     // If there's initialization, type check it
-                    if let Some(init_exprs) = init {
-                        if let Some(Some(init_expr)) = init_exprs.get(i) {
-                            let expr_type = self.check_expression(init_expr)?;
-                            if !ty.is_assignable_from(&expr_type) {
-                                return Err(SemanticError::TypeMismatch {
-                                    expected: ty.clone(),
-                                    found: expr_type,
-                                    location: *init_expr.location(),
-                                });
-                            }
+                    if let Some(init_expr) = &entity.init {
+                        let expr_type = self.check_expression(init_expr)?;
+                        // For scalar assignment compatibility check
+                        let target_ty = if ty.is_array() {
+                            ty.element_type()
+                        } else {
+                            ty.clone()
+                        };
+                        if !target_ty.is_assignable_from(&expr_type) {
+                            return Err(SemanticError::TypeMismatch {
+                                expected: target_ty,
+                                found: expr_type,
+                                location: *init_expr.location(),
+                            });
                         }
                     }
                 }
@@ -537,6 +666,7 @@ impl SemanticAnalyzer {
         match stmt {
             Statement::Assignment {
                 target,
+                indices,
                 value,
                 location,
             } => {
@@ -551,13 +681,46 @@ impl SemanticAnalyzer {
                     });
                 }
 
+                // Determine the target type (for arrays, this is the element type)
+                let target_type = if let Some(idx_exprs) = indices {
+                    // Array element assignment
+                    // Check that target is an array
+                    if !symbol.ty.is_array() {
+                        return Err(SemanticError::TypeMismatch {
+                            expected: Type::Array {
+                                element_kind: ArrayElementKind::Integer,
+                                dimensions: vec![],
+                            },
+                            found: symbol.ty.clone(),
+                            location: *location,
+                        });
+                    }
+
+                    // Check index types (must be integer)
+                    for idx in idx_exprs {
+                        let idx_type = self.check_expression(idx)?;
+                        if !idx_type.is_numeric() {
+                            return Err(SemanticError::TypeMismatch {
+                                expected: Type::integer(),
+                                found: idx_type,
+                                location: *idx.location(),
+                            });
+                        }
+                    }
+
+                    // Return element type
+                    symbol.ty.element_type()
+                } else {
+                    symbol.ty.clone()
+                };
+
                 // Type check the value
                 let value_type = self.check_expression(value)?;
 
                 // Check assignment compatibility
-                if !symbol.ty.is_assignable_from(&value_type) {
+                if !target_type.is_assignable_from(&value_type) {
                     return Err(SemanticError::TypeMismatch {
-                        expected: symbol.ty.clone(),
+                        expected: target_type,
                         found: value_type,
                         location: *value.location(),
                     });
@@ -945,6 +1108,53 @@ impl SemanticAnalyzer {
                 }
                 Ok(Type::integer())
             }
+
+            Expr::ArrayAccess { name, indices, location } => {
+                // Look up the array variable
+                let symbol = self.lookup_variable(name, *location)?;
+
+                // Check that it's an array
+                if !symbol.ty.is_array() {
+                    return Err(SemanticError::TypeMismatch {
+                        expected: Type::Array {
+                            element_kind: ArrayElementKind::Integer,
+                            dimensions: vec![],
+                        },
+                        found: symbol.ty.clone(),
+                        location: *location,
+                    });
+                }
+
+                // Check index types (must be integer/numeric)
+                for idx in indices {
+                    let idx_type = self.check_expression(idx)?;
+                    if !idx_type.is_numeric() {
+                        return Err(SemanticError::TypeMismatch {
+                            expected: Type::integer(),
+                            found: idx_type,
+                            location: *idx.location(),
+                        });
+                    }
+                }
+
+                // Return element type
+                Ok(symbol.ty.element_type())
+            }
+        }
+    }
+
+    /// Evaluate a constant integer expression (for array bounds)
+    fn eval_constant_int(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::IntegerLiteral(value, _) => Some(*value),
+            Expr::UnaryOp { op: UnaryOperator::Minus, operand, .. } => {
+                self.eval_constant_int(operand).map(|v| -v)
+            }
+            Expr::UnaryOp { op: UnaryOperator::Plus, operand, .. } => {
+                self.eval_constant_int(operand)
+            }
+            // Could add more constant evaluation (parameters, simple arithmetic)
+            _ => None,
         }
     }
 
