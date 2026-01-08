@@ -87,6 +87,72 @@ pub enum Statement {
         values: Vec<Expr>,
         location: SourceLocation,
     },
+    /// IF statement
+    If {
+        condition: Expr,
+        then_block: Vec<Statement>,
+        else_if_blocks: Vec<(Expr, Vec<Statement>)>,
+        else_block: Option<Vec<Statement>>,
+        location: SourceLocation,
+    },
+    /// DO loop (counted)
+    DoLoop {
+        variable: String,
+        start: Expr,
+        end: Expr,
+        step: Option<Expr>,
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+    /// DO WHILE loop
+    DoWhile {
+        condition: Expr,
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+    /// Infinite DO loop
+    DoInfinite {
+        body: Vec<Statement>,
+        location: SourceLocation,
+    },
+    /// SELECT CASE statement
+    SelectCase {
+        selector: Expr,
+        cases: Vec<CaseClause>,
+        default: Option<Vec<Statement>>,
+        location: SourceLocation,
+    },
+    /// EXIT statement
+    Exit {
+        location: SourceLocation,
+    },
+    /// CYCLE statement
+    Cycle {
+        location: SourceLocation,
+    },
+    /// CONTINUE statement
+    Continue {
+        location: SourceLocation,
+    },
+}
+
+/// Case clause for SELECT CASE
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseClause {
+    pub selector: CaseSelector,
+    pub body: Vec<Statement>,
+    pub location: SourceLocation,
+}
+
+/// Case selector types
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaseSelector {
+    /// Single value: CASE (5)
+    Value(Expr),
+    /// Value list: CASE (1, 3, 5)
+    Values(Vec<Expr>),
+    /// Range: CASE (1:10)
+    Range(Expr, Expr),
 }
 
 /// Expressions

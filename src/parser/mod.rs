@@ -81,8 +81,18 @@ impl Parser {
         let mut declarations = Vec::new();
         let mut statements = Vec::new();
 
-        // Parse declarations and statements until END
-        while !self.is_at_end() && !self.check(&TokenType::End) {
+        // Parse declarations and statements until END or EOF
+        loop {
+            // Check for EOF
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END PROGRAM/END (any END token stops program parsing)
+            if self.check(&TokenType::End) {
+                break;
+            }
+
             if self.is_declaration_start() {
                 declarations.push(self.parse_declaration()?);
             } else {
@@ -90,9 +100,10 @@ impl Parser {
             }
         }
 
-        // Expect END PROGRAM
+        // Expect END PROGRAM (optional in some cases)
         if self.check(&TokenType::End) {
             self.advance();
+            // Optional PROGRAM keyword
             if self.check(&TokenType::Program) {
                 self.advance();
                 // Optional program name after END PROGRAM
@@ -228,6 +239,43 @@ impl Parser {
     fn parse_statement(&mut self) -> ParseResult<Statement> {
         let location = self.current_location();
 
+        // If we're at END, this is likely a block terminator, not a statement
+        if self.check(&TokenType::End) {
+            return Err(ParseError::UnexpectedToken {
+                expected: "statement".to_string(),
+                found: TokenType::End,
+                location,
+            });
+        }
+
+        // Control flow statements
+        if self.check(&TokenType::If) {
+            return self.parse_if_statement();
+        }
+
+        if self.check(&TokenType::Do) {
+            return self.parse_do_statement();
+        }
+
+        if self.check(&TokenType::Select) {
+            return self.parse_select_case();
+        }
+
+        if self.check(&TokenType::Exit) {
+            self.advance();
+            return Ok(Statement::Exit { location });
+        }
+
+        if self.check(&TokenType::Cycle) {
+            self.advance();
+            return Ok(Statement::Cycle { location });
+        }
+
+        if self.check(&TokenType::Continue) {
+            self.advance();
+            return Ok(Statement::Continue { location });
+        }
+
         // PRINT statement
         if self.check(&TokenType::Print) {
             return self.parse_print_statement();
@@ -300,6 +348,296 @@ impl Parser {
         Ok(Statement::Print {
             format: None,
             values,
+            location,
+        })
+    }
+
+    /// Parse IF statement
+    fn parse_if_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::If, "IF")?;
+
+        // Parse condition (in parentheses or not, Fortran is flexible)
+        let condition = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let cond = self.parse_expression()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            cond
+        } else {
+            self.parse_expression()?
+        };
+
+        // Check if this is a single-line IF statement (no THEN)
+        if !self.check(&TokenType::Then) {
+            // Single-line IF: IF (condition) statement
+            let statement = self.parse_statement()?;
+            return Ok(Statement::If {
+                condition,
+                then_block: vec![statement],
+                else_if_blocks: Vec::new(),
+                else_block: None,
+                location,
+            });
+        }
+
+        self.expect(&TokenType::Then, "THEN")?;
+
+        // Parse THEN block
+        let mut then_block = Vec::new();
+        loop {
+            // Stop at: EOF, ELSEIF (single token), ELSE IF (two tokens),
+            // ELSE (not followed by IF), or END IF
+            if self.is_at_end()
+                || self.check(&TokenType::ElseIf)
+                || self.is_else_if()
+                || (self.check(&TokenType::Else) && !self.is_else_if())
+                || self.is_end_if()
+            {
+                break;
+            }
+            then_block.push(self.parse_statement()?);
+        }
+
+        // Parse ELSE IF blocks
+        let mut else_if_blocks = Vec::new();
+        while self.check(&TokenType::ElseIf) || self.is_else_if() {
+            // Handle both "ELSEIF" (single token) and "ELSE IF" (two tokens)
+            if self.check(&TokenType::ElseIf) {
+                self.advance();
+            } else {
+                // Must be ELSE followed by IF
+                self.advance(); // consume ELSE
+                self.advance(); // consume IF
+            }
+
+            let elif_condition = if self.check(&TokenType::LeftParen) {
+                self.advance();
+                let cond = self.parse_expression()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                cond
+            } else {
+                self.parse_expression()?
+            };
+
+            self.expect(&TokenType::Then, "THEN")?;
+
+            let mut elif_block = Vec::new();
+            while !self.is_at_end()
+                && !self.check(&TokenType::ElseIf)
+                && !self.is_else_if()
+                && !(self.check(&TokenType::Else) && !self.is_else_if())
+                && !self.is_end_if()
+            {
+                elif_block.push(self.parse_statement()?);
+            }
+
+            else_if_blocks.push((elif_condition, elif_block));
+        }
+
+        // Parse ELSE block (but not ELSE IF)
+        let else_block = if self.check(&TokenType::Else) && !self.is_else_if() {
+            self.advance();
+            let mut block = Vec::new();
+            while !self.is_at_end() && !self.is_end_if() {
+                block.push(self.parse_statement()?);
+            }
+            Some(block)
+        } else {
+            None
+        };
+
+        // Expect END IF
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::If, "IF")?;
+
+        Ok(Statement::If {
+            condition,
+            then_block,
+            else_if_blocks,
+            else_block,
+            location,
+        })
+    }
+
+    /// Parse DO statement (loop, while, or infinite)
+    fn parse_do_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Do, "DO")?;
+
+        // Check what kind of DO loop this is
+
+        // DO WHILE
+        if self.check(&TokenType::While) {
+            self.advance();
+            let condition = if self.check(&TokenType::LeftParen) {
+                self.advance();
+                let cond = self.parse_expression()?;
+                self.expect(&TokenType::RightParen, ")")?;
+                cond
+            } else {
+                self.parse_expression()?
+            };
+
+            let mut body = Vec::new();
+            while !self.is_at_end() && !self.is_end_do() {
+                body.push(self.parse_statement()?);
+            }
+
+            self.expect(&TokenType::End, "END")?;
+            self.expect(&TokenType::Do, "DO")?;
+
+            return Ok(Statement::DoWhile {
+                condition,
+                body,
+                location,
+            });
+        }
+
+        // Check if this is a counted DO loop (has loop variable)
+        let is_counted_loop = matches!(self.peek().token_type, TokenType::Identifier(_));
+
+        if is_counted_loop {
+            // DO i = start, end [, step]
+            let variable = self.expect_identifier()?;
+            self.expect(&TokenType::Equal, "=")?;
+
+            let start = self.parse_expression()?;
+            self.expect(&TokenType::Comma, ",")?;
+
+            let end = self.parse_expression()?;
+
+            let step = if self.check(&TokenType::Comma) {
+                self.advance();
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+
+            let mut body = Vec::new();
+            while !self.is_at_end() && !self.is_end_do() {
+                body.push(self.parse_statement()?);
+            }
+
+            self.expect(&TokenType::End, "END")?;
+            self.expect(&TokenType::Do, "DO")?;
+
+            return Ok(Statement::DoLoop {
+                variable,
+                start,
+                end,
+                step,
+                body,
+                location,
+            });
+        }
+
+        // Infinite DO loop (DO ... END DO)
+        let mut body = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenType::End) {
+            body.push(self.parse_statement()?);
+        }
+
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Do, "DO")?;
+
+        Ok(Statement::DoInfinite { body, location })
+    }
+
+    /// Parse SELECT CASE statement
+    fn parse_select_case(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Select, "SELECT")?;
+        self.expect(&TokenType::Case, "CASE")?;
+
+        // Parse selector expression
+        let selector = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let sel = self.parse_expression()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            sel
+        } else {
+            self.parse_expression()?
+        };
+
+        let mut cases = Vec::new();
+        let mut default = None;
+
+        // Parse case clauses
+        while self.check(&TokenType::Case) {
+            self.advance();
+
+            // Check for DEFAULT
+            if self.check(&TokenType::Default) {
+                self.advance();
+                let mut body = Vec::new();
+                while !self.is_at_end() && !self.check(&TokenType::Case) && !self.is_end_select() {
+                    body.push(self.parse_statement()?);
+                }
+                default = Some(body);
+                continue;
+            }
+
+            // Parse case selector
+            self.expect(&TokenType::LeftParen, "(")?;
+
+            let case_selector = if self.check(&TokenType::Colon) {
+                // Range with no start (:end)
+                self.advance();
+                let end = self.parse_expression()?;
+                let start = Expr::IntegerLiteral(std::i64::MIN, location);
+                CaseSelector::Range(start, end)
+            } else {
+                let first = self.parse_expression()?;
+
+                if self.check(&TokenType::Colon) {
+                    // Range (start:end)
+                    self.advance();
+                    let end = if self.check(&TokenType::RightParen) {
+                        Expr::IntegerLiteral(std::i64::MAX, location)
+                    } else {
+                        self.parse_expression()?
+                    };
+                    CaseSelector::Range(first, end)
+                } else if self.check(&TokenType::Comma) {
+                    // Value list (val1, val2, ...)
+                    let mut values = vec![first];
+                    while self.check(&TokenType::Comma) {
+                        self.advance();
+                        if self.check(&TokenType::RightParen) {
+                            break;
+                        }
+                        values.push(self.parse_expression()?);
+                    }
+                    CaseSelector::Values(values)
+                } else {
+                    // Single value
+                    CaseSelector::Value(first)
+                }
+            };
+
+            self.expect(&TokenType::RightParen, ")")?;
+
+            // Parse case body
+            let mut body = Vec::new();
+            while !self.is_at_end() && !self.check(&TokenType::Case) && !self.is_end_select() {
+                body.push(self.parse_statement()?);
+            }
+
+            cases.push(CaseClause {
+                selector: case_selector,
+                body,
+                location,
+            });
+        }
+
+        // Expect END SELECT
+        self.expect(&TokenType::End, "END")?;
+        self.expect(&TokenType::Select, "SELECT")?;
+
+        Ok(Statement::SelectCase {
+            selector,
+            cases,
+            default,
             location,
         })
     }
@@ -592,6 +930,56 @@ impl Parser {
 
     fn current_location(&self) -> SourceLocation {
         self.peek().location
+    }
+
+    /// Check if we're at "ELSE IF" (two tokens)
+    fn is_else_if(&self) -> bool {
+        if !self.check(&TokenType::Else) {
+            return false;
+        }
+        // Peek ahead to see if next token is IF
+        if self.position + 1 < self.tokens.len() {
+            matches!(self.tokens[self.position + 1].token_type, TokenType::If)
+        } else {
+            false
+        }
+    }
+
+    /// Check if we're at "END IF"
+    fn is_end_if(&self) -> bool {
+        if !self.check(&TokenType::End) {
+            return false;
+        }
+        // Peek ahead to see if next token is IF
+        if self.position + 1 < self.tokens.len() {
+            matches!(self.tokens[self.position + 1].token_type, TokenType::If)
+        } else {
+            false
+        }
+    }
+
+    /// Check if we're at "END DO"
+    fn is_end_do(&self) -> bool {
+        if !self.check(&TokenType::End) {
+            return false;
+        }
+        if self.position + 1 < self.tokens.len() {
+            matches!(self.tokens[self.position + 1].token_type, TokenType::Do)
+        } else {
+            false
+        }
+    }
+
+    /// Check if we're at "END SELECT"
+    fn is_end_select(&self) -> bool {
+        if !self.check(&TokenType::End) {
+            return false;
+        }
+        if self.position + 1 < self.tokens.len() {
+            matches!(self.tokens[self.position + 1].token_type, TokenType::Select)
+        } else {
+            false
+        }
     }
 
     fn expect(&mut self, token_type: &TokenType, name: &str) -> ParseResult<()> {
