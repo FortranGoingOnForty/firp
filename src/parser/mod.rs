@@ -616,6 +616,7 @@ impl Parser {
                 | TokenType::Parameter
                 | TokenType::Type
                 | TokenType::Class
+                | TokenType::Interface
         )
     }
 

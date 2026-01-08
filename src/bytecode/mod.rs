@@ -932,6 +932,8 @@ pub struct ModuleSymbol {
 pub struct ModuleRegistry {
     /// Map of module name -> list of exported symbols
     modules: HashMap<String, Vec<ModuleSymbol>>,
+    /// Map of module name -> operator interfaces (operator key -> procedure names)
+    module_interfaces: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 impl ModuleRegistry {
@@ -954,6 +956,16 @@ impl ModuleRegistry {
         self.modules.get(module_name)?
             .iter()
             .find(|s| s.name == symbol_name)
+    }
+
+    /// Register operator interfaces for a module
+    pub fn register_interfaces(&mut self, module_name: String, interfaces: HashMap<String, Vec<String>>) {
+        self.module_interfaces.insert(module_name, interfaces);
+    }
+
+    /// Get operator interfaces from a module
+    pub fn get_module_interfaces(&self, module_name: &str) -> Option<&HashMap<String, Vec<String>>> {
+        self.module_interfaces.get(module_name)
     }
 }
 
@@ -1080,6 +1092,14 @@ impl Compiler {
         // Register module symbols (procedures will be added in second pass)
         self.module_registry.register_module(module.name.clone(), exported_symbols);
 
+        // Register module interfaces for operator overloading
+        if !self.chunk.operator_interfaces.is_empty() {
+            self.module_registry.register_interfaces(
+                module.name.clone(),
+                self.chunk.operator_interfaces.clone()
+            );
+        }
+
         Ok(())
     }
 
@@ -1161,6 +1181,18 @@ impl Compiler {
                         })?;
 
                     self.import_symbol(symbol, &item.local_name)?;
+                }
+            }
+        }
+
+        // Import operator interfaces from the module
+        if let Some(interfaces) = self.module_registry.get_module_interfaces(&use_stmt.module_name).cloned() {
+            for (op_key, proc_names) in interfaces {
+                for proc_name in proc_names {
+                    self.chunk.operator_interfaces
+                        .entry(op_key.clone())
+                        .or_insert_with(Vec::new)
+                        .push(proc_name);
                 }
             }
         }
@@ -2083,6 +2115,32 @@ impl Compiler {
             }
 
             Expr::BinaryOp { op, left, right, location } => {
+                // Check for operator overloading only when operands are derived type variables
+                // (not component accesses, literals, or other expressions)
+                let use_overloaded = if self.is_derived_type_expr(left) && self.is_derived_type_expr(right) {
+                    let overloadable_op = Self::binary_to_overloadable(op);
+                    if let Some(procedures) = self.chunk.get_operator_procedures(&overloadable_op) {
+                        if let Some(proc_name) = procedures.first() {
+                            if let Some(proc_addr) = self.chunk.get_procedure_address(proc_name) {
+                                // Compile arguments (left, right)
+                                self.compile_expression(left)?;
+                                self.compile_expression(right)?;
+                                // Call the overloaded operator procedure
+                                self.chunk.emit_with_operand(OpCode::Call, proc_addr, *location);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    false
+                } else {
+                    false
+                };
+
+                if use_overloaded {
+                    return Ok(());
+                }
+
+                // Fall back to built-in operator
                 // Compile left operand
                 self.compile_expression(left)?;
                 // Compile right operand
@@ -2265,6 +2323,60 @@ impl Compiler {
     /// Get the compiled chunk (consumes the compiler)
     pub fn into_chunk(self) -> Chunk {
         self.chunk
+    }
+
+    /// Convert BinaryOperator to OverloadableOperator for operator overloading lookup
+    fn binary_to_overloadable(op: &BinaryOperator) -> OverloadableOperator {
+        match op {
+            BinaryOperator::Add => OverloadableOperator::Add,
+            BinaryOperator::Subtract => OverloadableOperator::Subtract,
+            BinaryOperator::Multiply => OverloadableOperator::Multiply,
+            BinaryOperator::Divide => OverloadableOperator::Divide,
+            BinaryOperator::Power => OverloadableOperator::Power,
+            BinaryOperator::Equal => OverloadableOperator::Equal,
+            BinaryOperator::NotEqual => OverloadableOperator::NotEqual,
+            BinaryOperator::Less => OverloadableOperator::Less,
+            BinaryOperator::LessEqual => OverloadableOperator::LessEqual,
+            BinaryOperator::Greater => OverloadableOperator::Greater,
+            BinaryOperator::GreaterEqual => OverloadableOperator::GreaterEqual,
+            BinaryOperator::And => OverloadableOperator::And,
+            BinaryOperator::Or => OverloadableOperator::Or,
+            BinaryOperator::Eqv => OverloadableOperator::Eqv,
+            BinaryOperator::Neqv => OverloadableOperator::Neqv,
+        }
+    }
+
+    /// Check if an expression is a derived type variable (not a component access or primitive)
+    fn is_derived_type_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(name, ..) => {
+                // Check if this variable is declared as a derived type
+                // We check if there are any non-primitive types registered
+                self.chunk.types.iter().any(|t| {
+                    // If we have a variable with this name and there's a derived type
+                    self.chunk.get_variable_index(name).is_some()
+                        && t.name.to_uppercase() != "INTEGER"
+                        && t.name.to_uppercase() != "REAL"
+                        && t.name.to_uppercase() != "LOGICAL"
+                        && t.name.to_uppercase() != "CHARACTER"
+                })
+            }
+            // Component accesses like p%x are NOT derived types (they're primitive components)
+            Expr::ComponentAccess { .. } => false,
+            // Literals are not derived types
+            Expr::IntegerLiteral(..)
+            | Expr::RealLiteral(..)
+            | Expr::LogicalLiteral(..)
+            | Expr::StringLiteral(..) => false,
+            // Binary operations result in primitives (unless they're overloaded, but we can't know that here)
+            Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => false,
+            // Function calls could return derived types, but we don't have type info
+            Expr::FunctionCall { .. } => false,
+            // Type constructors return derived types
+            Expr::TypeConstructor { .. } => true,
+            // Default to false for safety
+            _ => false,
+        }
     }
 }
 

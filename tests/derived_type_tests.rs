@@ -36,6 +36,22 @@ fn compile_and_run(source: &str) -> Result<VM, String> {
     Ok(vm)
 }
 
+fn compile_and_run_unit(source: &str) -> Result<VM, String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
+
+    let mut parser = Parser::new(tokens);
+    let unit = parser.parse_compilation_unit().map_err(|e| format!("Parser error: {}", e))?;
+
+    let mut compiler = Compiler::new();
+    let chunk = compiler.compile_unit(&unit).map_err(|e| format!("Compile error: {}", e))?;
+
+    let mut vm = VM::new();
+    vm.run(chunk).map_err(|e| format!("Runtime error: {}", e))?;
+
+    Ok(vm)
+}
+
 fn get_output(vm: &VM) -> String {
     vm.output().join("\n")
 }
@@ -524,4 +540,135 @@ fn test_execute_modify_component() {
     let output = get_output(&vm);
     assert!(output.contains("100"), "Output should contain modified x: {}", output);
     assert!(output.contains("2"), "Output should contain original y: {}", output);
+}
+
+// =====================================================================
+// Operator Overloading Parsing Tests
+// =====================================================================
+
+#[test]
+fn test_parse_operator_interface() {
+    let source = r#"
+        MODULE vector_ops
+          IMPLICIT NONE
+
+          TYPE :: Vector
+            REAL :: x
+            REAL :: y
+          END TYPE Vector
+
+          INTERFACE OPERATOR(+)
+            MODULE PROCEDURE add_vectors
+          END INTERFACE
+
+        CONTAINS
+
+          FUNCTION add_vectors(v1, v2) RESULT(v3)
+            TYPE(Vector) :: v1, v2
+            TYPE(Vector) :: v3
+            v3%x = v1%x + v2%x
+            v3%y = v1%y + v2%y
+          END FUNCTION add_vectors
+
+        END MODULE vector_ops
+    "#;
+
+    let module = parse_module(source).expect("Should parse successfully");
+    assert_eq!(module.name, "VECTOR_OPS");
+
+    // Check for the interface declaration
+    let has_interface = module.declarations.iter().any(|d| {
+        matches!(d, Declaration::Interface(_))
+    });
+    assert!(has_interface, "Module should have an interface declaration");
+}
+
+// =====================================================================
+// Operator Overloading Execution Tests
+// =====================================================================
+
+#[test]
+#[ignore] // Derived type function parameters not yet implemented
+fn test_execute_operator_overloading_simple() {
+    // Simplified test: just test calling a function that works with derived types
+    let source = r#"
+        PROGRAM test_derived_func
+          IMPLICIT NONE
+
+          TYPE :: Vec2
+            REAL :: x
+            REAL :: y
+          END TYPE Vec2
+
+          TYPE(Vec2) :: v1, v2, v3
+          v1 = Vec2(1.0, 2.0)
+          v2 = Vec2(3.0, 4.0)
+
+          ! Direct function call instead of operator
+          v3 = add_vec2(v1, v2)
+          PRINT *, v3%x
+          PRINT *, v3%y
+
+        CONTAINS
+
+          FUNCTION add_vec2(a, b) RESULT(c)
+            TYPE(Vec2) :: a, b
+            TYPE(Vec2) :: c
+            c%x = a%x + b%x
+            c%y = a%y + b%y
+          END FUNCTION add_vec2
+
+        END PROGRAM test_derived_func
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("4"), "Output should contain v3%x = 4: {}", output);
+    assert!(output.contains("6"), "Output should contain v3%y = 6: {}", output);
+}
+
+#[test]
+#[ignore] // Requires derived type function parameters (not yet implemented)
+fn test_execute_operator_overloading() {
+    let source = r#"
+        MODULE vector_math
+          IMPLICIT NONE
+
+          TYPE :: Vec2
+            REAL :: x
+            REAL :: y
+          END TYPE Vec2
+
+          INTERFACE OPERATOR(+)
+            MODULE PROCEDURE add_vec2
+          END INTERFACE
+
+        CONTAINS
+
+          FUNCTION add_vec2(a, b) RESULT(c)
+            TYPE(Vec2) :: a, b
+            TYPE(Vec2) :: c
+            c%x = a%x + b%x
+            c%y = a%y + b%y
+          END FUNCTION add_vec2
+
+        END MODULE vector_math
+
+        PROGRAM test_overload
+          USE vector_math
+          IMPLICIT NONE
+
+          TYPE(Vec2) :: v1, v2, v3
+          v1 = Vec2(1.0, 2.0)
+          v2 = Vec2(3.0, 4.0)
+          v3 = v1 + v2
+          PRINT *, v3%x
+          PRINT *, v3%y
+        END PROGRAM test_overload
+    "#;
+
+    let vm = compile_and_run_unit(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    assert!(output.contains("4"), "Output should contain v3%x = 4: {}", output);
+    assert!(output.contains("6"), "Output should contain v3%y = 6: {}", output);
 }
