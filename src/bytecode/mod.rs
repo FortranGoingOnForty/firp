@@ -90,6 +90,12 @@ pub enum OpCode {
     Halt,
     /// No operation
     Nop,
+
+    // Subroutine/function operations
+    /// Call a subroutine/function (operand = procedure index)
+    Call,
+    /// Return from a subroutine/function
+    Return,
 }
 
 impl fmt::Display for OpCode {
@@ -125,6 +131,8 @@ impl fmt::Display for OpCode {
             OpCode::Print => write!(f, "Print"),
             OpCode::Halt => write!(f, "Halt"),
             OpCode::Nop => write!(f, "Nop"),
+            OpCode::Call => write!(f, "Call"),
+            OpCode::Return => write!(f, "Return"),
         }
     }
 }
@@ -241,6 +249,8 @@ pub struct Chunk {
     pub instructions: Vec<Instruction>,
     pub constants: ConstantPool,
     pub variables: Vec<String>, // Variable names by index
+    /// Procedure entry points (name -> instruction address)
+    pub procedures: HashMap<String, usize>,
 }
 
 impl Chunk {
@@ -287,6 +297,16 @@ impl Chunk {
     /// Get variable index by name
     pub fn get_variable_index(&self, name: &str) -> Option<usize> {
         self.variables.iter().position(|v| v == name)
+    }
+
+    /// Register a procedure entry point
+    pub fn add_procedure(&mut self, name: String, address: usize) {
+        self.procedures.insert(name, address);
+    }
+
+    /// Get procedure entry address by name
+    pub fn get_procedure_address(&self, name: &str) -> Option<usize> {
+        self.procedures.get(name).copied()
     }
 
     /// Patch a jump instruction with the actual target
@@ -438,16 +458,119 @@ impl Compiler {
             self.compile_declaration(decl)?;
         }
 
-        // Compile statements
+        // Jump over procedures to main code if there are procedures
+        let loc = program.location;
+        let jump_to_main = if !program.procedures.is_empty() {
+            Some(self.chunk.emit_with_operand(OpCode::Jump, 0, loc))
+        } else {
+            None
+        };
+
+        // Compile procedures first (so their addresses are known)
+        for proc in &program.procedures {
+            self.compile_procedure(proc)?;
+        }
+
+        // Patch jump to main
+        if let Some(jump_idx) = jump_to_main {
+            self.chunk.patch_jump(jump_idx, self.chunk.current_offset());
+        }
+
+        // Compile main statements
         for stmt in &program.statements {
             self.compile_statement(stmt)?;
         }
 
-        // Emit halt at end
-        let loc = program.location;
+        // Emit halt at end of main program
         self.chunk.emit(OpCode::Halt, loc);
 
         Ok(std::mem::take(&mut self.chunk))
+    }
+
+    /// Compile a procedure definition
+    fn compile_procedure(&mut self, proc: &Procedure) -> CompileResult<()> {
+        match proc {
+            Procedure::Subroutine(sub) => self.compile_subroutine(sub),
+            Procedure::Function(func) => self.compile_function(func),
+        }
+    }
+
+    /// Compile a subroutine definition
+    fn compile_subroutine(&mut self, sub: &SubroutineDef) -> CompileResult<()> {
+        let entry_address = self.chunk.current_offset();
+
+        // Register procedure entry point
+        self.chunk.add_procedure(sub.name.clone(), entry_address);
+
+        // Allocate parameter slots and pop arguments into them (in reverse order)
+        let param_indices: Vec<_> = sub.parameters.iter()
+            .map(|param| self.chunk.add_variable(param.name.clone()))
+            .collect();
+
+        // Pop arguments from stack into parameters (reverse order because stack is LIFO)
+        for &param_idx in param_indices.iter().rev() {
+            self.chunk.emit_with_operand(OpCode::StoreVar, param_idx, sub.location);
+        }
+
+        // Compile local declarations
+        for decl in &sub.declarations {
+            self.compile_declaration(decl)?;
+        }
+
+        // Compile body statements
+        for stmt in &sub.body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Emit return at end
+        self.chunk.emit(OpCode::Return, sub.location);
+
+        Ok(())
+    }
+
+    /// Compile a function definition
+    fn compile_function(&mut self, func: &FunctionDef) -> CompileResult<()> {
+        let entry_address = self.chunk.current_offset();
+
+        // Register procedure entry point
+        self.chunk.add_procedure(func.name.clone(), entry_address);
+
+        // Allocate parameter slots and pop arguments into them (in reverse order)
+        let param_indices: Vec<_> = func.parameters.iter()
+            .map(|param| self.chunk.add_variable(param.name.clone()))
+            .collect();
+
+        // Pop arguments from stack into parameters (reverse order because stack is LIFO)
+        for &param_idx in param_indices.iter().rev() {
+            self.chunk.emit_with_operand(OpCode::StoreVar, param_idx, func.location);
+        }
+
+        // Allocate result variable (function name or RESULT variable)
+        let result_name = func.result_name.as_ref().unwrap_or(&func.name);
+        self.chunk.add_variable(result_name.clone());
+
+        // Compile local declarations
+        for decl in &func.declarations {
+            self.compile_declaration(decl)?;
+        }
+
+        // Compile body statements
+        for stmt in &func.body {
+            self.compile_statement(stmt)?;
+        }
+
+        // Load result value onto stack before return
+        let result_idx = self.chunk.get_variable_index(result_name)
+            .ok_or(CompileError::InvalidOperation {
+                message: format!("Result variable {} not found", result_name),
+                location: func.location,
+            })?;
+        self.chunk.emit_with_operand(OpCode::LoadVar, result_idx, func.location);
+
+        // Emit return at end
+        self.chunk.emit(OpCode::Return, func.location);
+
+        Ok(())
     }
 
     /// Compile a declaration
@@ -590,6 +713,35 @@ impl Compiler {
             Statement::Continue { location } => {
                 // Continue is a no-op
                 self.chunk.emit(OpCode::Nop, *location);
+                Ok(())
+            }
+
+            Statement::Call { name, arguments, location } => {
+                // Compile arguments (push onto stack)
+                for arg in arguments {
+                    self.compile_expression(arg)?;
+                }
+
+                // Look up procedure address
+                let proc_address = self.chunk.get_procedure_address(name)
+                    .ok_or(CompileError::InvalidOperation {
+                        message: format!("Undefined procedure: {}", name),
+                        location: *location,
+                    })?;
+
+                // Emit call instruction with procedure address
+                self.chunk.emit_with_operand(OpCode::Call, proc_address, *location);
+                Ok(())
+            }
+
+            Statement::Return { value, location } => {
+                // If there's a return value, compile it
+                if let Some(val) = value {
+                    self.compile_expression(val)?;
+                }
+
+                // Emit return instruction
+                self.chunk.emit(OpCode::Return, *location);
                 Ok(())
             }
         }
@@ -1010,6 +1162,25 @@ impl Compiler {
 
             Expr::Parenthesized(inner, _) => {
                 self.compile_expression(inner)
+            }
+
+            Expr::FunctionCall { name, arguments, location } => {
+                // Compile arguments (push onto stack)
+                for arg in arguments {
+                    self.compile_expression(arg)?;
+                }
+
+                // Look up function address
+                let func_address = self.chunk.get_procedure_address(name)
+                    .ok_or(CompileError::InvalidOperation {
+                        message: format!("Undefined function: {}", name),
+                        location: *location,
+                    })?;
+
+                // Emit call instruction with function address
+                // The function will leave its return value on the stack
+                self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
+                Ok(())
             }
         }
     }

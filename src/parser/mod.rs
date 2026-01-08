@@ -80,11 +80,20 @@ impl Parser {
 
         let mut declarations = Vec::new();
         let mut statements = Vec::new();
+        let mut procedures = Vec::new();
 
-        // Parse declarations and statements until END or EOF
+        // Parse declarations and statements until END, CONTAINS, or EOF
         loop {
             // Check for EOF
             if self.is_at_end() {
+                break;
+            }
+
+            // Check for CONTAINS (internal procedures follow)
+            if self.check(&TokenType::Contains) {
+                self.advance();
+                // Parse internal procedures
+                procedures = self.parse_procedures()?;
                 break;
             }
 
@@ -117,8 +126,238 @@ impl Parser {
             name,
             declarations,
             statements,
+            procedures,
             location,
         })
+    }
+
+    /// Parse internal procedures after CONTAINS
+    fn parse_procedures(&mut self) -> ParseResult<Vec<Procedure>> {
+        let mut procedures = Vec::new();
+
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END PROGRAM (end of procedures)
+            if self.check(&TokenType::End) {
+                break;
+            }
+
+            // Parse RECURSIVE prefix (optional)
+            let is_recursive = if self.check(&TokenType::Recursive) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            // Parse SUBROUTINE or FUNCTION
+            if self.check(&TokenType::Subroutine) {
+                procedures.push(Procedure::Subroutine(self.parse_subroutine()?));
+            } else if self.check(&TokenType::Function) {
+                procedures.push(Procedure::Function(self.parse_function(is_recursive)?));
+            } else if is_recursive {
+                // RECURSIVE without FUNCTION is an error
+                return Err(ParseError::UnexpectedToken {
+                    expected: "FUNCTION after RECURSIVE".to_string(),
+                    found: self.peek().token_type.clone(),
+                    location: self.current_location(),
+                });
+            } else {
+                // Unknown token in procedures section
+                return Err(ParseError::UnexpectedToken {
+                    expected: "SUBROUTINE or FUNCTION".to_string(),
+                    found: self.peek().token_type.clone(),
+                    location: self.current_location(),
+                });
+            }
+        }
+
+        Ok(procedures)
+    }
+
+    /// Parse a subroutine definition
+    fn parse_subroutine(&mut self) -> ParseResult<SubroutineDef> {
+        let location = self.current_location();
+        self.expect(&TokenType::Subroutine, "SUBROUTINE")?;
+
+        let name = self.expect_identifier()?;
+
+        // Parse parameter list
+        let parameters = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let params = self.parse_parameter_names()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        // Parse declarations and body
+        let mut declarations = Vec::new();
+        let mut body = Vec::new();
+
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END SUBROUTINE
+            if self.check(&TokenType::End) {
+                break;
+            }
+
+            if self.is_declaration_start() {
+                declarations.push(self.parse_declaration()?);
+            } else {
+                body.push(self.parse_statement()?);
+            }
+        }
+
+        // Expect END SUBROUTINE
+        if self.check(&TokenType::End) {
+            self.advance();
+            if self.check(&TokenType::Subroutine) {
+                self.advance();
+                // Optional subroutine name
+                if let TokenType::Identifier(_) = self.peek().token_type {
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(SubroutineDef {
+            name,
+            parameters,
+            declarations,
+            body,
+            location,
+        })
+    }
+
+    /// Parse a function definition
+    fn parse_function(&mut self, is_recursive: bool) -> ParseResult<FunctionDef> {
+        let location = self.current_location();
+
+        // Optional return type prefix
+        let return_type = if self.is_type_spec_start() {
+            Some(self.parse_type_spec()?)
+        } else {
+            None
+        };
+
+        self.expect(&TokenType::Function, "FUNCTION")?;
+
+        let name = self.expect_identifier()?;
+
+        // Parse parameter list
+        let parameters = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let params = self.parse_parameter_names()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        // Parse optional RESULT clause
+        let result_name = if self.check(&TokenType::Result) {
+            self.advance();
+            self.expect(&TokenType::LeftParen, "(")?;
+            let result = self.expect_identifier()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            Some(result)
+        } else {
+            None
+        };
+
+        // Parse declarations and body
+        let mut declarations = Vec::new();
+        let mut body = Vec::new();
+
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for END FUNCTION
+            if self.check(&TokenType::End) {
+                break;
+            }
+
+            if self.is_declaration_start() {
+                declarations.push(self.parse_declaration()?);
+            } else {
+                body.push(self.parse_statement()?);
+            }
+        }
+
+        // Expect END FUNCTION
+        if self.check(&TokenType::End) {
+            self.advance();
+            if self.check(&TokenType::Function) {
+                self.advance();
+                // Optional function name
+                if let TokenType::Identifier(_) = self.peek().token_type {
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(FunctionDef {
+            name,
+            parameters,
+            return_type,
+            result_name,
+            is_recursive,
+            declarations,
+            body,
+            location,
+        })
+    }
+
+    /// Parse parameter names (just identifiers for now)
+    fn parse_parameter_names(&mut self) -> ParseResult<Vec<Parameter>> {
+        let mut params = Vec::new();
+
+        // Empty parameter list
+        if self.check(&TokenType::RightParen) {
+            return Ok(params);
+        }
+
+        loop {
+            let location = self.current_location();
+            let name = self.expect_identifier()?;
+            params.push(Parameter {
+                name,
+                type_spec: None,
+                intent: None,
+                location,
+            });
+
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(params)
+    }
+
+    /// Check if current token starts a type specification
+    fn is_type_spec_start(&self) -> bool {
+        matches!(
+            self.peek().token_type,
+            TokenType::Integer
+                | TokenType::Real
+                | TokenType::Double
+                | TokenType::Complex
+                | TokenType::Logical
+                | TokenType::Character
+        )
     }
 
     /// Check if current token starts a declaration
@@ -276,6 +515,16 @@ impl Parser {
             return Ok(Statement::Continue { location });
         }
 
+        // CALL statement
+        if self.check(&TokenType::Call) {
+            return self.parse_call_statement();
+        }
+
+        // RETURN statement
+        if self.check(&TokenType::Return) {
+            return self.parse_return_statement();
+        }
+
         // PRINT statement
         if self.check(&TokenType::Print) {
             return self.parse_print_statement();
@@ -350,6 +599,88 @@ impl Parser {
             values,
             location,
         })
+    }
+
+    /// Parse CALL statement: CALL subroutine(args)
+    fn parse_call_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Call, "CALL")?;
+
+        let name = self.expect_identifier()?;
+
+        // Parse optional argument list
+        let arguments = if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let args = self.parse_argument_list()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            args
+        } else {
+            Vec::new()
+        };
+
+        Ok(Statement::Call {
+            name,
+            arguments,
+            location,
+        })
+    }
+
+    /// Parse RETURN statement: RETURN [expr]
+    fn parse_return_statement(&mut self) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Return, "RETURN")?;
+
+        // Check if there's a return value expression
+        // A return value is present if the next token looks like the start of an expression
+        let value = if self.is_expression_start() {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::Return { value, location })
+    }
+
+    /// Check if current token could start an expression
+    fn is_expression_start(&self) -> bool {
+        matches!(
+            self.peek().token_type,
+            TokenType::IntegerLiteral(_)
+                | TokenType::RealLiteral(_)
+                | TokenType::StringLiteral(_)
+                | TokenType::True
+                | TokenType::False
+                | TokenType::Identifier(_)
+                | TokenType::LeftParen
+                | TokenType::Plus
+                | TokenType::Minus
+                | TokenType::Not
+                | TokenType::Result
+                | TokenType::Stat
+                | TokenType::Kind
+                | TokenType::Len
+        )
+    }
+
+    /// Parse a comma-separated argument list
+    fn parse_argument_list(&mut self) -> ParseResult<Vec<Expr>> {
+        let mut args = Vec::new();
+
+        // Empty argument list
+        if self.check(&TokenType::RightParen) {
+            return Ok(args);
+        }
+
+        loop {
+            args.push(self.parse_expression()?);
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(args)
     }
 
     /// Parse IF statement
@@ -841,10 +1172,24 @@ impl Parser {
                 Ok(Expr::LogicalLiteral(false, location))
             }
 
-            // Identifier
+            // Identifier (or function call if followed by parentheses)
             TokenType::Identifier(name) => {
+                let name = name.clone();
                 self.advance();
-                Ok(Expr::Identifier(name.clone(), location))
+
+                // Check if this is a function call
+                if self.check(&TokenType::LeftParen) {
+                    self.advance();
+                    let arguments = self.parse_argument_list()?;
+                    self.expect(&TokenType::RightParen, ")")?;
+                    Ok(Expr::FunctionCall {
+                        name,
+                        arguments,
+                        location,
+                    })
+                } else {
+                    Ok(Expr::Identifier(name, location))
+                }
             }
 
             // Keywords that can be used as identifiers
@@ -857,7 +1202,20 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 self.advance();
-                Ok(Expr::Identifier(name.to_string(), location))
+
+                // Check if this is a function call
+                if self.check(&TokenType::LeftParen) {
+                    self.advance();
+                    let arguments = self.parse_argument_list()?;
+                    self.expect(&TokenType::RightParen, ")")?;
+                    Ok(Expr::FunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                        location,
+                    })
+                } else {
+                    Ok(Expr::Identifier(name.to_string(), location))
+                }
             }
 
             // Parenthesized expression

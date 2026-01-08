@@ -798,6 +798,23 @@ impl SemanticAnalyzer {
                 // CONTINUE is always valid (no-op)
                 Ok(())
             }
+
+            Statement::Call { arguments, .. } => {
+                // TODO: Full implementation in Sprint 08
+                // For now, just type check the arguments
+                for arg in arguments {
+                    self.check_expression(arg)?;
+                }
+                Ok(())
+            }
+
+            Statement::Return { value, .. } => {
+                // TODO: Full implementation in Sprint 08
+                if let Some(val) = value {
+                    self.check_expression(val)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -919,6 +936,15 @@ impl SemanticAnalyzer {
             }
 
             Expr::Parenthesized(inner, _) => self.check_expression(inner),
+
+            Expr::FunctionCall { arguments, .. } => {
+                // TODO: Full implementation in Sprint 08
+                // For now, just type check arguments and return integer
+                for arg in arguments {
+                    self.check_expression(arg)?;
+                }
+                Ok(Type::integer())
+            }
         }
     }
 

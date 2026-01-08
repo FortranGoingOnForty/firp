@@ -8,7 +8,57 @@ pub struct Program {
     pub name: Option<String>,
     pub declarations: Vec<Declaration>,
     pub statements: Vec<Statement>,
+    /// Contained procedures (after CONTAINS)
+    pub procedures: Vec<Procedure>,
     pub location: SourceLocation,
+}
+
+/// A procedure (subroutine or function)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Procedure {
+    Subroutine(SubroutineDef),
+    Function(FunctionDef),
+}
+
+/// Subroutine definition
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubroutineDef {
+    pub name: String,
+    pub parameters: Vec<Parameter>,
+    pub declarations: Vec<Declaration>,
+    pub body: Vec<Statement>,
+    pub location: SourceLocation,
+}
+
+/// Function definition
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDef {
+    pub name: String,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<TypeSpec>,
+    /// RESULT variable name (defaults to function name)
+    pub result_name: Option<String>,
+    pub is_recursive: bool,
+    pub declarations: Vec<Declaration>,
+    pub body: Vec<Statement>,
+    pub location: SourceLocation,
+}
+
+/// Parameter declaration for subroutine/function
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parameter {
+    pub name: String,
+    pub type_spec: Option<TypeSpec>,
+    pub intent: Option<Intent>,
+    pub location: SourceLocation,
+}
+
+/// INTENT attribute for parameters
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    In,
+    Out,
+    InOut,
 }
 
 /// Type specification for variables
@@ -134,6 +184,17 @@ pub enum Statement {
     Continue {
         location: SourceLocation,
     },
+    /// CALL statement: CALL subroutine(args)
+    Call {
+        name: String,
+        arguments: Vec<Expr>,
+        location: SourceLocation,
+    },
+    /// RETURN statement
+    Return {
+        value: Option<Expr>,
+        location: SourceLocation,
+    },
 }
 
 /// Case clause for SELECT CASE
@@ -183,6 +244,12 @@ pub enum Expr {
     },
     /// Parenthesized expression
     Parenthesized(Box<Expr>, SourceLocation),
+    /// Function call: func(args)
+    FunctionCall {
+        name: String,
+        arguments: Vec<Expr>,
+        location: SourceLocation,
+    },
 }
 
 impl Expr {
@@ -196,6 +263,7 @@ impl Expr {
             Expr::BinaryOp { location, .. } => location,
             Expr::UnaryOp { location, .. } => location,
             Expr::Parenthesized(_, loc) => loc,
+            Expr::FunctionCall { location, .. } => location,
         }
     }
 }

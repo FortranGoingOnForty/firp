@@ -10,6 +10,20 @@ use std::fmt;
 /// Maximum stack size
 const STACK_SIZE: usize = 256;
 
+/// Maximum call stack depth
+const MAX_CALL_DEPTH: usize = 64;
+
+/// Call frame for tracking procedure calls
+#[derive(Debug, Clone)]
+pub struct CallFrame {
+    /// Return address (instruction pointer to return to)
+    pub return_address: usize,
+    /// Base index for local variables
+    pub locals_base: usize,
+    /// Number of arguments passed
+    pub arg_count: usize,
+}
+
 /// Runtime error types
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeError {
@@ -45,6 +59,15 @@ pub enum RuntimeError {
         target: usize,
         location: SourceLocation,
     },
+    /// Call stack overflow (too many nested calls)
+    CallStackOverflow {
+        location: SourceLocation,
+    },
+    /// Invalid procedure call
+    InvalidProcedure {
+        index: usize,
+        location: SourceLocation,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -71,6 +94,12 @@ impl fmt::Display for RuntimeError {
             RuntimeError::InvalidJump { target, location } => {
                 write!(f, "Invalid jump target {} at {}", target, location)
             }
+            RuntimeError::CallStackOverflow { location } => {
+                write!(f, "Call stack overflow at {}", location)
+            }
+            RuntimeError::InvalidProcedure { index, location } => {
+                write!(f, "Invalid procedure index {} at {}", index, location)
+            }
         }
     }
 }
@@ -93,6 +122,10 @@ pub struct VM {
     trace: bool,
     /// Output buffer for PRINT statements
     output: Vec<String>,
+    /// Call stack for tracking procedure calls
+    call_stack: Vec<CallFrame>,
+    /// Procedure entry points (address -> procedure index)
+    procedure_addresses: Vec<usize>,
 }
 
 impl VM {
@@ -105,6 +138,8 @@ impl VM {
             chunk: None,
             trace: false,
             output: Vec::new(),
+            call_stack: Vec::with_capacity(MAX_CALL_DEPTH),
+            procedure_addresses: Vec::new(),
         }
     }
 
@@ -120,6 +155,8 @@ impl VM {
         self.variables.clear();
         self.chunk = None;
         self.output.clear();
+        self.call_stack.clear();
+        self.procedure_addresses.clear();
     }
 
     /// Run a compiled chunk
@@ -365,6 +402,40 @@ impl VM {
                         println!("OUTPUT: {}", line);
                     }
                     self.ip += 1;
+                }
+
+                OpCode::Call => {
+                    // operand is the procedure entry address
+                    let proc_address = operand.ok_or(RuntimeError::InvalidProcedure {
+                        index: 0,
+                        location,
+                    })?;
+
+                    // Check call stack depth
+                    if self.call_stack.len() >= MAX_CALL_DEPTH {
+                        return Err(RuntimeError::CallStackOverflow { location });
+                    }
+
+                    // Create call frame with return address (next instruction)
+                    let frame = CallFrame {
+                        return_address: self.ip + 1,
+                        locals_base: self.variables.len(),
+                        arg_count: 0, // Arguments handled separately
+                    };
+                    self.call_stack.push(frame);
+
+                    // Jump to procedure
+                    self.ip = proc_address;
+                }
+
+                OpCode::Return => {
+                    // Pop call frame and return
+                    if let Some(frame) = self.call_stack.pop() {
+                        self.ip = frame.return_address;
+                    } else {
+                        // Return from main program - halt
+                        break;
+                    }
                 }
             }
         }
