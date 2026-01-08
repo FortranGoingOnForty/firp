@@ -678,3 +678,29 @@ fn test_intent_in_violation() {
     assert!(err.contains("INTENT(IN)") || err.contains("Semantic"),
             "Error should mention INTENT(IN): {}", err);
 }
+
+// =====================================================================
+// OPTIONAL & PRESENT Tests
+// =====================================================================
+
+#[test]
+fn test_present_intrinsic() {
+    let source = r#"
+        PROGRAM test_present
+          IMPLICIT NONE
+          INTEGER :: x
+
+          x = 42
+          IF (PRESENT(x)) THEN
+            PRINT *, "x is present"
+          ELSE
+            PRINT *, "x is not present"
+          END IF
+        END PROGRAM test_present
+    "#;
+
+    let result = compile_and_run(source);
+    assert!(result.is_ok(), "Should compile and run: {:?}", result.err());
+    let output = get_output(&result.unwrap());
+    assert!(output.contains("present"), "Expected 'present' in output, got: {}", output);
+}

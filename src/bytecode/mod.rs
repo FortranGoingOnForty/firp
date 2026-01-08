@@ -205,6 +205,9 @@ pub enum Intrinsic {
     // Coarray/parallel intrinsics
     ThisImage,
     NumImages,
+
+    // Inquiry intrinsics
+    Present,  // PRESENT(a) - check if optional argument is present
 }
 
 impl Intrinsic {
@@ -265,6 +268,7 @@ impl Intrinsic {
             // Coarray/parallel
             49 => Some(Intrinsic::ThisImage),
             50 => Some(Intrinsic::NumImages),
+            51 => Some(Intrinsic::Present),
             _ => None,
         }
     }
@@ -328,6 +332,7 @@ impl Intrinsic {
             // Coarray/parallel intrinsics
             "THIS_IMAGE" => Some(Intrinsic::ThisImage),
             "NUM_IMAGES" => Some(Intrinsic::NumImages),
+            "PRESENT" => Some(Intrinsic::Present),
             _ => None,
         }
     }
@@ -376,6 +381,7 @@ impl Intrinsic {
 
             // Coarray/parallel intrinsics (no arguments)
             Intrinsic::ThisImage | Intrinsic::NumImages => (0, 0),
+            Intrinsic::Present => (1, 1),
         }
     }
 }
@@ -434,6 +440,7 @@ impl fmt::Display for Intrinsic {
             Intrinsic::Ishft => write!(f, "ISHFT"),
             Intrinsic::ThisImage => write!(f, "THIS_IMAGE"),
             Intrinsic::NumImages => write!(f, "NUM_IMAGES"),
+            Intrinsic::Present => write!(f, "PRESENT"),
         }
     }
 }

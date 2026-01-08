@@ -3109,13 +3109,15 @@ impl Parser {
                 Ok(expr)
             }
 
-            // Keywords that can be used as identifiers
-            TokenType::Result | TokenType::Stat | TokenType::Kind | TokenType::Len => {
+            // Keywords that can be used as identifiers or intrinsic function calls
+            TokenType::Result | TokenType::Stat | TokenType::Kind | TokenType::Len
+            | TokenType::Present => {
                 let name = match &token.token_type {
                     TokenType::Result => "RESULT",
                     TokenType::Stat => "STAT",
                     TokenType::Kind => "KIND",
                     TokenType::Len => "LEN",
+                    TokenType::Present => "PRESENT",
                     _ => unreachable!(),
                 };
                 self.advance();

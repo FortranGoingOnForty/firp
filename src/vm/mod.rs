@@ -2080,6 +2080,17 @@ impl VM {
                 // In multi-image mode, this would return the total number of images
                 Ok(Value::Integer(1))
             }
+
+            Intrinsic::Present => {
+                // PRESENT(a) - check if optional argument is present
+                // In full implementation, this would check if argument was passed
+                // For now, return true if argument is not Null
+                let arg = self.pop(location)?;
+                // Check if the value is "present" (not null)
+                // For basic implementation, any non-null value is "present"
+                let is_present = !matches!(arg, Value::Null);
+                Ok(Value::Logical(is_present))
+            }
         }
     }
 
