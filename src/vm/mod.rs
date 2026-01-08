@@ -2142,7 +2142,534 @@ impl VM {
                 }
                 Ok(Value::Null)
             }
+
+            // ==================== Sprint 17: Numeric Inquiry Intrinsics ====================
+
+            Intrinsic::Huge => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(_) => Ok(Value::Integer(i64::MAX)),
+                    Value::Real(_) => Ok(Value::Real(f64::MAX)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "HUGE requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Tiny => {
+                let _arg = self.pop(location)?;
+                // TINY returns smallest positive real
+                Ok(Value::Real(f64::MIN_POSITIVE))
+            }
+
+            Intrinsic::Epsilon => {
+                let _arg = self.pop(location)?;
+                // Machine epsilon for f64
+                Ok(Value::Real(f64::EPSILON))
+            }
+
+            Intrinsic::Digits => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(_) => Ok(Value::Integer(63)),  // i64 has 63 value bits (1 sign)
+                    Value::Real(_) => Ok(Value::Integer(53)),     // f64 mantissa has 53 bits
+                    _ => Err(RuntimeError::TypeError {
+                        message: "DIGITS requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Precision => {
+                let _arg = self.pop(location)?;
+                // f64 has approximately 15-17 decimal digits of precision
+                Ok(Value::Integer(15))
+            }
+
+            Intrinsic::Range => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(_) => Ok(Value::Integer(18)),   // log10(2^63) ~ 18
+                    Value::Real(_) => Ok(Value::Integer(307)),     // f64 exponent range
+                    _ => Err(RuntimeError::TypeError {
+                        message: "RANGE requires numeric argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Radix => {
+                let _arg = self.pop(location)?;
+                // Binary representation
+                Ok(Value::Integer(2))
+            }
+
+            Intrinsic::BitSize => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(_) => Ok(Value::Integer(64)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "BIT_SIZE requires integer argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            // ==================== Sprint 17: Additional Bit Intrinsics ====================
+
+            Intrinsic::Ishftc => {
+                // ISHFTC(i, shift, [size]) - circular bit shift
+                let size = if arg_count == 3 {
+                    match self.pop(location)? {
+                        Value::Integer(s) => s as u32,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "ISHFTC size must be integer".to_string(),
+                            location,
+                        }),
+                    }
+                } else {
+                    64  // Default to full width
+                };
+
+                let shift = match self.pop(location)? {
+                    Value::Integer(s) => s,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "ISHFTC shift must be integer".to_string(),
+                        location,
+                    }),
+                };
+
+                let i = match self.pop(location)? {
+                    Value::Integer(v) => v as u64,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "ISHFTC requires integer argument".to_string(),
+                        location,
+                    }),
+                };
+
+                // Circular shift within 'size' bits
+                let size = size.min(64);
+                if size == 0 {
+                    return Ok(Value::Integer(i as i64));
+                }
+                let mask = if size >= 64 { !0u64 } else { (1u64 << size) - 1 };
+                let val = i & mask;
+                let shift_mod = ((shift % size as i64) + size as i64) % size as i64;
+                let result = if shift_mod == 0 {
+                    val
+                } else {
+                    let left = (val << shift_mod) & mask;
+                    let right = val >> (size as i64 - shift_mod);
+                    left | right
+                };
+                Ok(Value::Integer(result as i64))
+            }
+
+            Intrinsic::Mvbits => {
+                // MVBITS(from, frompos, len, to, topos)
+                // Move len bits from position frompos in 'from' to position topos in 'to'
+                let topos = match self.pop(location)? {
+                    Value::Integer(v) => v as u32,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "MVBITS topos must be integer".to_string(),
+                        location,
+                    }),
+                };
+                let to = match self.pop(location)? {
+                    Value::Integer(v) => v as u64,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "MVBITS to must be integer".to_string(),
+                        location,
+                    }),
+                };
+                let len = match self.pop(location)? {
+                    Value::Integer(v) => v as u32,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "MVBITS len must be integer".to_string(),
+                        location,
+                    }),
+                };
+                let frompos = match self.pop(location)? {
+                    Value::Integer(v) => v as u32,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "MVBITS frompos must be integer".to_string(),
+                        location,
+                    }),
+                };
+                let from = match self.pop(location)? {
+                    Value::Integer(v) => v as u64,
+                    _ => return Err(RuntimeError::TypeError {
+                        message: "MVBITS from must be integer".to_string(),
+                        location,
+                    }),
+                };
+
+                // Extract bits from 'from' starting at frompos
+                let mask = if len >= 64 { !0u64 } else { (1u64 << len) - 1 };
+                let bits = (from >> frompos) & mask;
+                // Clear target bits and set new ones
+                let clear_mask = !(mask << topos);
+                let result = (to & clear_mask) | (bits << topos);
+                Ok(Value::Integer(result as i64))
+            }
+
+            // ==================== Sprint 17: Additional Character Intrinsics ====================
+
+            Intrinsic::Scan => {
+                // SCAN(string, set) - find first char from set
+                let set = self.pop(location)?;
+                let string = self.pop(location)?;
+                match (&string, &set) {
+                    (Value::Character(s), Value::Character(chars)) => {
+                        let pos = s.chars()
+                            .position(|c| chars.contains(c))
+                            .map(|p| p + 1)  // Fortran 1-based indexing
+                            .unwrap_or(0);
+                        Ok(Value::Integer(pos as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "SCAN requires character arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Verify => {
+                // VERIFY(string, set) - find first char NOT in set
+                let set = self.pop(location)?;
+                let string = self.pop(location)?;
+                match (&string, &set) {
+                    (Value::Character(s), Value::Character(chars)) => {
+                        let pos = s.chars()
+                            .position(|c| !chars.contains(c))
+                            .map(|p| p + 1)  // Fortran 1-based indexing
+                            .unwrap_or(0);
+                        Ok(Value::Integer(pos as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "VERIFY requires character arguments".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Achar => {
+                // ACHAR(i) - ASCII code to character
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Integer(i) => {
+                        if i < 0 || i > 127 {
+                            return Err(RuntimeError::TypeError {
+                                message: format!("ACHAR: value {} out of ASCII range (0-127)", i),
+                                location,
+                            });
+                        }
+                        Ok(Value::Character((i as u8 as char).to_string()))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ACHAR requires integer argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Iachar => {
+                // IACHAR(c) - character to ASCII code
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Character(s) => {
+                        if s.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "IACHAR requires non-empty string".to_string(),
+                                location,
+                            });
+                        }
+                        Ok(Value::Integer(s.chars().next().unwrap() as i64))
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "IACHAR requires character argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            // ==================== Sprint 16: Array Inquiry Intrinsics ====================
+
+            Intrinsic::Shape => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { dims, .. } => {
+                        let shape_elements: Vec<Value> = dims.iter()
+                            .map(|d| Value::Integer(d.size() as i64))
+                            .collect();
+                        let shape_dims = vec![ArrayDim::new(1, shape_elements.len() as i64)];
+                        Ok(Value::Array {
+                            elements: shape_elements,
+                            dims: shape_dims,
+                        })
+                    }
+                    _ => {
+                        // Scalar has empty shape
+                        Ok(Value::Array {
+                            elements: vec![],
+                            dims: vec![ArrayDim::new(1, 0)],
+                        })
+                    }
+                }
+            }
+
+            Intrinsic::Lbound => {
+                let dim_arg = if arg_count == 2 {
+                    Some(self.pop(location)?)
+                } else {
+                    None
+                };
+                let arr = self.pop(location)?;
+
+                match arr {
+                    Value::Array { dims, .. } => {
+                        if let Some(Value::Integer(d)) = dim_arg {
+                            // Return single dimension's lower bound
+                            let idx = (d - 1) as usize;
+                            if idx >= dims.len() {
+                                return Err(RuntimeError::TypeError {
+                                    message: format!("LBOUND: dimension {} out of range (1-{})", d, dims.len()),
+                                    location,
+                                });
+                            }
+                            Ok(Value::Integer(dims[idx].lower))
+                        } else {
+                            // Return array of all lower bounds
+                            let bounds: Vec<Value> = dims.iter()
+                                .map(|d| Value::Integer(d.lower))
+                                .collect();
+                            Ok(Value::Array {
+                                elements: bounds.clone(),
+                                dims: vec![ArrayDim::new(1, bounds.len() as i64)],
+                            })
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "LBOUND requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Ubound => {
+                let dim_arg = if arg_count == 2 {
+                    Some(self.pop(location)?)
+                } else {
+                    None
+                };
+                let arr = self.pop(location)?;
+
+                match arr {
+                    Value::Array { dims, .. } => {
+                        if let Some(Value::Integer(d)) = dim_arg {
+                            // Return single dimension's upper bound
+                            let idx = (d - 1) as usize;
+                            if idx >= dims.len() {
+                                return Err(RuntimeError::TypeError {
+                                    message: format!("UBOUND: dimension {} out of range (1-{})", d, dims.len()),
+                                    location,
+                                });
+                            }
+                            Ok(Value::Integer(dims[idx].upper))
+                        } else {
+                            // Return array of all upper bounds
+                            let bounds: Vec<Value> = dims.iter()
+                                .map(|d| Value::Integer(d.upper))
+                                .collect();
+                            Ok(Value::Array {
+                                elements: bounds.clone(),
+                                dims: vec![ArrayDim::new(1, bounds.len() as i64)],
+                            })
+                        }
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "UBOUND requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Rank => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { dims, .. } => Ok(Value::Integer(dims.len() as i64)),
+                    _ => Ok(Value::Integer(0)),  // Scalars have rank 0
+                }
+            }
+
+            Intrinsic::Any => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        let result = elements.iter().any(|e| match e {
+                            Value::Logical(b) => *b,
+                            _ => false,
+                        });
+                        Ok(Value::Logical(result))
+                    }
+                    Value::Logical(b) => Ok(Value::Logical(b)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ANY requires logical array".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::All => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        let result = elements.iter().all(|e| match e {
+                            Value::Logical(b) => *b,
+                            _ => false,
+                        });
+                        Ok(Value::Logical(result))
+                    }
+                    Value::Logical(b) => Ok(Value::Logical(b)),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "ALL requires logical array".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Count => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, .. } => {
+                        let count = elements.iter().filter(|e| match e {
+                            Value::Logical(b) => *b,
+                            _ => false,
+                        }).count();
+                        Ok(Value::Integer(count as i64))
+                    }
+                    Value::Logical(b) => Ok(Value::Integer(if b { 1 } else { 0 })),
+                    _ => Err(RuntimeError::TypeError {
+                        message: "COUNT requires logical array".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Maxloc => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, dims, .. } => {
+                        if elements.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "MAXLOC: empty array".to_string(),
+                                location,
+                            });
+                        }
+
+                        let mut max_idx = 0;
+                        let mut max_val = f64::NEG_INFINITY;
+
+                        for (i, elem) in elements.iter().enumerate() {
+                            let val = match elem {
+                                Value::Integer(n) => *n as f64,
+                                Value::Real(n) => *n,
+                                _ => continue,
+                            };
+                            if val > max_val {
+                                max_val = val;
+                                max_idx = i;
+                            }
+                        }
+
+                        // Convert flat index to multi-dimensional indices (Fortran 1-based)
+                        let indices = self.flat_to_multidim(max_idx, &dims);
+                        let result: Vec<Value> = indices.iter()
+                            .map(|i| Value::Integer(*i))
+                            .collect();
+
+                        Ok(Value::Array {
+                            elements: result.clone(),
+                            dims: vec![ArrayDim::new(1, result.len() as i64)],
+                        })
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "MAXLOC requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Minloc => {
+                let arg = self.pop(location)?;
+                match arg {
+                    Value::Array { elements, dims, .. } => {
+                        if elements.is_empty() {
+                            return Err(RuntimeError::TypeError {
+                                message: "MINLOC: empty array".to_string(),
+                                location,
+                            });
+                        }
+
+                        let mut min_idx = 0;
+                        let mut min_val = f64::INFINITY;
+
+                        for (i, elem) in elements.iter().enumerate() {
+                            let val = match elem {
+                                Value::Integer(n) => *n as f64,
+                                Value::Real(n) => *n,
+                                _ => continue,
+                            };
+                            if val < min_val {
+                                min_val = val;
+                                min_idx = i;
+                            }
+                        }
+
+                        // Convert flat index to multi-dimensional indices (Fortran 1-based)
+                        let indices = self.flat_to_multidim(min_idx, &dims);
+                        let result: Vec<Value> = indices.iter()
+                            .map(|i| Value::Integer(*i))
+                            .collect();
+
+                        Ok(Value::Array {
+                            elements: result.clone(),
+                            dims: vec![ArrayDim::new(1, result.len() as i64)],
+                        })
+                    }
+                    _ => Err(RuntimeError::TypeError {
+                        message: "MINLOC requires array argument".to_string(),
+                        location,
+                    }),
+                }
+            }
+
+            Intrinsic::Allocated => {
+                let arg = self.pop(location)?;
+                // For our current implementation, arrays are always "allocated" once they exist
+                let is_allocated = matches!(arg, Value::Array { .. });
+                Ok(Value::Logical(is_allocated))
+            }
         }
+    }
+
+    /// Helper function to convert flat index to multi-dimensional indices
+    fn flat_to_multidim(&self, flat_idx: usize, dims: &[ArrayDim]) -> Vec<i64> {
+        let mut indices = vec![0i64; dims.len()];
+        let mut remaining = flat_idx;
+
+        for (i, dim) in dims.iter().enumerate() {
+            let size = dim.size();
+            if size > 0 {
+                indices[i] = (remaining % size) as i64 + dim.lower;
+                remaining /= size;
+            } else {
+                indices[i] = dim.lower;
+            }
+        }
+
+        indices
     }
 
     /// Pop a value from the stack and convert to f64

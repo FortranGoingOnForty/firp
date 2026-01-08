@@ -214,6 +214,38 @@ pub enum Intrinsic {
     Present,  // PRESENT(a) - check if optional argument is present
     Associated, // ASSOCIATED(ptr) or ASSOCIATED(ptr, target) - check if pointer is associated
     Null,       // NULL() or NULL(mold) - return null pointer
+
+    // Numeric inquiry intrinsics (Sprint 17)
+    Huge,       // HUGE(x) - largest number of same type
+    Tiny,       // TINY(x) - smallest positive real
+    Epsilon,    // EPSILON(x) - machine epsilon
+    Digits,     // DIGITS(x) - number of significant digits
+    Precision,  // PRECISION(x) - decimal precision
+    Range,      // RANGE(x) - decimal exponent range
+    Radix,      // RADIX(x) - base of representation
+    BitSize,    // BIT_SIZE(i) - bit size of integer
+
+    // Additional bit intrinsics (Sprint 17)
+    Ishftc,     // ISHFTC(i, shift, [size]) - circular bit shift
+    Mvbits,     // MVBITS(from, frompos, len, to, topos) - move bits
+
+    // Additional character intrinsics (Sprint 17)
+    Scan,       // SCAN(string, set) - find first char from set
+    Verify,     // VERIFY(string, set) - find first char not in set
+    Achar,      // ACHAR(i) - ASCII code to character
+    Iachar,     // IACHAR(c) - character to ASCII code
+
+    // Array inquiry intrinsics (Sprint 16)
+    Shape,      // SHAPE(array) - array of dimension sizes
+    Lbound,     // LBOUND(array, [dim]) - lower bound(s)
+    Ubound,     // UBOUND(array, [dim]) - upper bound(s)
+    Rank,       // RANK(array) - number of dimensions
+    Any,        // ANY(mask) - logical OR reduction
+    All,        // ALL(mask) - logical AND reduction
+    Count,      // COUNT(mask) - count true elements
+    Maxloc,     // MAXLOC(array) - location of maximum
+    Minloc,     // MINLOC(array) - location of minimum
+    Allocated,  // ALLOCATED(array) - allocation status
 }
 
 impl Intrinsic {
@@ -277,6 +309,34 @@ impl Intrinsic {
             51 => Some(Intrinsic::Present),
             52 => Some(Intrinsic::Associated),
             53 => Some(Intrinsic::Null),
+            // Numeric inquiry intrinsics (Sprint 17)
+            54 => Some(Intrinsic::Huge),
+            55 => Some(Intrinsic::Tiny),
+            56 => Some(Intrinsic::Epsilon),
+            57 => Some(Intrinsic::Digits),
+            58 => Some(Intrinsic::Precision),
+            59 => Some(Intrinsic::Range),
+            60 => Some(Intrinsic::Radix),
+            61 => Some(Intrinsic::BitSize),
+            // Additional bit intrinsics (Sprint 17)
+            62 => Some(Intrinsic::Ishftc),
+            63 => Some(Intrinsic::Mvbits),
+            // Additional character intrinsics (Sprint 17)
+            64 => Some(Intrinsic::Scan),
+            65 => Some(Intrinsic::Verify),
+            66 => Some(Intrinsic::Achar),
+            67 => Some(Intrinsic::Iachar),
+            // Array inquiry intrinsics (Sprint 16)
+            68 => Some(Intrinsic::Shape),
+            69 => Some(Intrinsic::Lbound),
+            70 => Some(Intrinsic::Ubound),
+            71 => Some(Intrinsic::Rank),
+            72 => Some(Intrinsic::Any),
+            73 => Some(Intrinsic::All),
+            74 => Some(Intrinsic::Count),
+            75 => Some(Intrinsic::Maxloc),
+            76 => Some(Intrinsic::Minloc),
+            77 => Some(Intrinsic::Allocated),
             _ => None,
         }
     }
@@ -343,6 +403,34 @@ impl Intrinsic {
             "PRESENT" => Some(Intrinsic::Present),
             "ASSOCIATED" => Some(Intrinsic::Associated),
             "NULL" => Some(Intrinsic::Null),
+            // Numeric inquiry intrinsics (Sprint 17)
+            "HUGE" => Some(Intrinsic::Huge),
+            "TINY" => Some(Intrinsic::Tiny),
+            "EPSILON" => Some(Intrinsic::Epsilon),
+            "DIGITS" => Some(Intrinsic::Digits),
+            "PRECISION" => Some(Intrinsic::Precision),
+            "RANGE" => Some(Intrinsic::Range),
+            "RADIX" => Some(Intrinsic::Radix),
+            "BIT_SIZE" => Some(Intrinsic::BitSize),
+            // Additional bit intrinsics (Sprint 17)
+            "ISHFTC" => Some(Intrinsic::Ishftc),
+            "MVBITS" => Some(Intrinsic::Mvbits),
+            // Additional character intrinsics (Sprint 17)
+            "SCAN" => Some(Intrinsic::Scan),
+            "VERIFY" => Some(Intrinsic::Verify),
+            "ACHAR" => Some(Intrinsic::Achar),
+            "IACHAR" => Some(Intrinsic::Iachar),
+            // Array inquiry intrinsics (Sprint 16)
+            "SHAPE" => Some(Intrinsic::Shape),
+            "LBOUND" => Some(Intrinsic::Lbound),
+            "UBOUND" => Some(Intrinsic::Ubound),
+            "RANK" => Some(Intrinsic::Rank),
+            "ANY" => Some(Intrinsic::Any),
+            "ALL" => Some(Intrinsic::All),
+            "COUNT" => Some(Intrinsic::Count),
+            "MAXLOC" => Some(Intrinsic::Maxloc),
+            "MINLOC" => Some(Intrinsic::Minloc),
+            "ALLOCATED" => Some(Intrinsic::Allocated),
             _ => None,
         }
     }
@@ -394,6 +482,25 @@ impl Intrinsic {
             Intrinsic::Present => (1, 1),
             Intrinsic::Associated => (1, 2), // ASSOCIATED(ptr) or ASSOCIATED(ptr, target)
             Intrinsic::Null => (0, 1),       // NULL() or NULL(mold)
+
+            // Numeric inquiry intrinsics (Sprint 17) - all take 1 argument
+            Intrinsic::Huge | Intrinsic::Tiny | Intrinsic::Epsilon |
+            Intrinsic::Digits | Intrinsic::Precision | Intrinsic::Range |
+            Intrinsic::Radix | Intrinsic::BitSize => (1, 1),
+
+            // Additional bit intrinsics (Sprint 17)
+            Intrinsic::Ishftc => (2, 3),     // ISHFTC(i, shift, [size])
+            Intrinsic::Mvbits => (5, 5),     // MVBITS(from, frompos, len, to, topos)
+
+            // Additional character intrinsics (Sprint 17)
+            Intrinsic::Scan | Intrinsic::Verify => (2, 2),  // (string, set)
+            Intrinsic::Achar | Intrinsic::Iachar => (1, 1),
+
+            // Array inquiry intrinsics (Sprint 16)
+            Intrinsic::Shape | Intrinsic::Rank | Intrinsic::Allocated => (1, 1),
+            Intrinsic::Lbound | Intrinsic::Ubound => (1, 2), // (array, [dim])
+            Intrinsic::Any | Intrinsic::All | Intrinsic::Count => (1, 1),
+            Intrinsic::Maxloc | Intrinsic::Minloc => (1, 1),
         }
     }
 }
@@ -455,6 +562,34 @@ impl fmt::Display for Intrinsic {
             Intrinsic::Present => write!(f, "PRESENT"),
             Intrinsic::Associated => write!(f, "ASSOCIATED"),
             Intrinsic::Null => write!(f, "NULL"),
+            // Numeric inquiry intrinsics (Sprint 17)
+            Intrinsic::Huge => write!(f, "HUGE"),
+            Intrinsic::Tiny => write!(f, "TINY"),
+            Intrinsic::Epsilon => write!(f, "EPSILON"),
+            Intrinsic::Digits => write!(f, "DIGITS"),
+            Intrinsic::Precision => write!(f, "PRECISION"),
+            Intrinsic::Range => write!(f, "RANGE"),
+            Intrinsic::Radix => write!(f, "RADIX"),
+            Intrinsic::BitSize => write!(f, "BIT_SIZE"),
+            // Additional bit intrinsics (Sprint 17)
+            Intrinsic::Ishftc => write!(f, "ISHFTC"),
+            Intrinsic::Mvbits => write!(f, "MVBITS"),
+            // Additional character intrinsics (Sprint 17)
+            Intrinsic::Scan => write!(f, "SCAN"),
+            Intrinsic::Verify => write!(f, "VERIFY"),
+            Intrinsic::Achar => write!(f, "ACHAR"),
+            Intrinsic::Iachar => write!(f, "IACHAR"),
+            // Array inquiry intrinsics (Sprint 16)
+            Intrinsic::Shape => write!(f, "SHAPE"),
+            Intrinsic::Lbound => write!(f, "LBOUND"),
+            Intrinsic::Ubound => write!(f, "UBOUND"),
+            Intrinsic::Rank => write!(f, "RANK"),
+            Intrinsic::Any => write!(f, "ANY"),
+            Intrinsic::All => write!(f, "ALL"),
+            Intrinsic::Count => write!(f, "COUNT"),
+            Intrinsic::Maxloc => write!(f, "MAXLOC"),
+            Intrinsic::Minloc => write!(f, "MINLOC"),
+            Intrinsic::Allocated => write!(f, "ALLOCATED"),
         }
     }
 }
