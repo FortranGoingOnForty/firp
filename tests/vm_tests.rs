@@ -1463,3 +1463,195 @@ fn test_file_real_values() {
 
     let _ = fs::remove_file(test_file);
 }
+
+// ========== DO CONCURRENT TESTS (Sprint 15) ==========
+
+#[test]
+fn test_do_concurrent_simple() {
+    let source = r#"
+        program test_concurrent
+          implicit none
+          integer :: arr(10)
+          integer :: i
+          do concurrent (i = 1:10)
+            arr(i) = i * 2
+          end do
+          print *, arr(5)
+        end program test_concurrent
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // arr(5) = 5 * 2 = 10
+    assert_eq!(vm.get_variable("ARR"), Some(&firp::bytecode::Value::Array {
+        elements: vec![
+            firp::bytecode::Value::Integer(2),
+            firp::bytecode::Value::Integer(4),
+            firp::bytecode::Value::Integer(6),
+            firp::bytecode::Value::Integer(8),
+            firp::bytecode::Value::Integer(10),
+            firp::bytecode::Value::Integer(12),
+            firp::bytecode::Value::Integer(14),
+            firp::bytecode::Value::Integer(16),
+            firp::bytecode::Value::Integer(18),
+            firp::bytecode::Value::Integer(20),
+        ],
+        dims: vec![firp::bytecode::ArrayDim::new(1, 10)],
+    }));
+}
+
+#[test]
+fn test_do_concurrent_sum() {
+    let source = r#"
+        program test_concurrent_sum
+          implicit none
+          integer :: arr(5)
+          integer :: i, total
+          do concurrent (i = 1:5)
+            arr(i) = i
+          end do
+          total = arr(1) + arr(2) + arr(3) + arr(4) + arr(5)
+          print *, total
+        end program test_concurrent_sum
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // total = 1 + 2 + 3 + 4 + 5 = 15
+    assert_eq!(vm.get_variable("TOTAL"), Some(&firp::bytecode::Value::Integer(15)));
+}
+
+#[test]
+fn test_do_concurrent_2d() {
+    let source = r#"
+        program test_concurrent_2d
+          implicit none
+          integer :: mat(3, 3)
+          integer :: i, j
+          do concurrent (i = 1:3, j = 1:3)
+            mat(i, j) = i * 10 + j
+          end do
+          print *, mat(2, 3)
+        end program test_concurrent_2d
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // mat(2, 3) = 2 * 10 + 3 = 23
+    // Check that the matrix was populated correctly
+    if let Some(firp::bytecode::Value::Array { elements, .. }) = vm.get_variable("MAT") {
+        // Column-major order: mat(2,3) is at index (3-1)*3 + (2-1) = 6 + 1 = 7
+        assert_eq!(elements[7], firp::bytecode::Value::Integer(23));
+    } else {
+        panic!("Expected array");
+    }
+}
+
+#[test]
+fn test_do_concurrent_with_step() {
+    let source = r#"
+        program test_concurrent_step
+          implicit none
+          integer :: arr(10)
+          integer :: i, count
+          ! Initialize all to zero
+          do i = 1, 10
+            arr(i) = 0
+          end do
+          ! Set odd indices
+          do concurrent (i = 1:10:2)
+            arr(i) = 1
+          end do
+          count = arr(1) + arr(2) + arr(3) + arr(4) + arr(5)
+          print *, count
+        end program test_concurrent_step
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // arr(1)=1, arr(2)=0, arr(3)=1, arr(4)=0, arr(5)=1 -> count = 3
+    assert_eq!(vm.get_variable("COUNT"), Some(&firp::bytecode::Value::Integer(3)));
+}
+
+// ========== IMAGE INTRINSICS TESTS (Sprint 15) ==========
+
+#[test]
+fn test_this_image() {
+    let source = r#"
+        program test_this_image
+          implicit none
+          integer :: img
+          img = this_image()
+          print *, img
+        end program test_this_image
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // In single-image mode, THIS_IMAGE() returns 1
+    assert_eq!(vm.get_variable("IMG"), Some(&firp::bytecode::Value::Integer(1)));
+}
+
+#[test]
+fn test_num_images() {
+    let source = r#"
+        program test_num_images
+          implicit none
+          integer :: n
+          n = num_images()
+          print *, n
+        end program test_num_images
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // In single-image mode, NUM_IMAGES() returns 1
+    assert_eq!(vm.get_variable("N"), Some(&firp::bytecode::Value::Integer(1)));
+}
+
+#[test]
+fn test_image_intrinsics_in_condition() {
+    let source = r#"
+        program test_image_cond
+          implicit none
+          integer :: result
+          result = 0
+          if (this_image() == 1) then
+            result = 42
+          end if
+          print *, result
+        end program test_image_cond
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // Since THIS_IMAGE() == 1, result should be 42
+    assert_eq!(vm.get_variable("RESULT"), Some(&firp::bytecode::Value::Integer(42)));
+}
+
+#[test]
+fn test_sprint15_success_criteria() {
+    // Comprehensive test for Sprint 15 features
+    let source = r#"
+        program sprint15_test
+          implicit none
+          integer :: arr(10)
+          integer :: i, sum_val, img, num
+
+          ! Test DO CONCURRENT
+          do concurrent (i = 1:10)
+            arr(i) = i
+          end do
+
+          ! Test SUM intrinsic
+          sum_val = sum(arr)
+
+          ! Test image intrinsics
+          img = this_image()
+          num = num_images()
+
+          print *, sum_val
+          print *, img
+          print *, num
+        end program sprint15_test
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    // sum_val = 1+2+3+4+5+6+7+8+9+10 = 55
+    assert_eq!(vm.get_variable("SUM_VAL"), Some(&firp::bytecode::Value::Integer(55)));
+    assert_eq!(vm.get_variable("IMG"), Some(&firp::bytecode::Value::Integer(1)));
+    assert_eq!(vm.get_variable("NUM"), Some(&firp::bytecode::Value::Integer(1)));
+}

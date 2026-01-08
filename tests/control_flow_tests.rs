@@ -522,3 +522,178 @@ fn test_parse_do_while_without_parentheses() {
         _ => panic!("Expected DoWhile statement"),
     }
 }
+
+// ========== DO CONCURRENT TESTS (Sprint 15) ==========
+
+#[test]
+fn test_parse_do_concurrent_simple() {
+    let source = r#"
+        program test
+          integer :: i
+          integer :: arr(10)
+          do concurrent (i = 1:10)
+            arr(i) = i * 2
+          end do
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[0] {
+        Statement::DoConcurrent { controls, body, .. } => {
+            assert_eq!(controls.len(), 1);
+            assert_eq!(controls[0].variable, "I");
+            assert_eq!(body.len(), 1);
+        }
+        _ => panic!("Expected DoConcurrent statement"),
+    }
+}
+
+#[test]
+fn test_parse_do_concurrent_multiple_indices() {
+    let source = r#"
+        program test
+          integer :: i, j
+          integer :: matrix(10, 10)
+          do concurrent (i = 1:10, j = 1:10)
+            matrix(i, j) = i + j
+          end do
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[0] {
+        Statement::DoConcurrent { controls, .. } => {
+            assert_eq!(controls.len(), 2);
+            assert_eq!(controls[0].variable, "I");
+            assert_eq!(controls[1].variable, "J");
+        }
+        _ => panic!("Expected DoConcurrent statement"),
+    }
+}
+
+#[test]
+fn test_parse_do_concurrent_with_step() {
+    let source = r#"
+        program test
+          integer :: i
+          integer :: arr(10)
+          do concurrent (i = 1:10:2)
+            arr(i) = i
+          end do
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[0] {
+        Statement::DoConcurrent { controls, .. } => {
+            assert_eq!(controls.len(), 1);
+            assert!(controls[0].step.is_some());
+        }
+        _ => panic!("Expected DoConcurrent statement"),
+    }
+}
+
+#[test]
+fn test_parse_do_concurrent_with_locality() {
+    let source = r#"
+        program test
+          integer :: i, temp, sum
+          integer :: arr(10)
+          sum = 0
+          do concurrent (i = 1:10) local(temp) shared(sum)
+            temp = i * 2
+            arr(i) = temp
+          end do
+        end program test
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[1] {
+        Statement::DoConcurrent { controls, locality, .. } => {
+            assert_eq!(controls.len(), 1);
+            assert_eq!(locality.len(), 2);
+            assert!(matches!(&locality[0], LocalitySpec::Local(vars) if vars == &vec!["TEMP".to_string()]));
+            assert!(matches!(&locality[1], LocalitySpec::Shared(vars) if vars == &vec!["SUM".to_string()]));
+        }
+        _ => panic!("Expected DoConcurrent statement"),
+    }
+}
+
+// ========== SYNC AND CRITICAL TESTS (Sprint 15) ==========
+
+#[test]
+fn test_parse_sync_all() {
+    let source = r#"
+        program test_sync
+          implicit none
+          sync all
+          print *, "synced"
+        end program test_sync
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    assert!(matches!(&program.statements[0], Statement::SyncAll { .. }));
+}
+
+#[test]
+fn test_parse_sync_images() {
+    let source = r#"
+        program test_sync_images
+          implicit none
+          sync images (1)
+          print *, "synced with image 1"
+        end program test_sync_images
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[0] {
+        Statement::SyncImages { images, .. } => {
+            assert!(images.is_some());
+            assert_eq!(images.as_ref().unwrap().len(), 1);
+        }
+        _ => panic!("Expected SyncImages statement"),
+    }
+}
+
+#[test]
+fn test_parse_sync_images_all() {
+    let source = r#"
+        program test_sync_all_images
+          implicit none
+          sync images (*)
+          print *, "synced with all"
+        end program test_sync_all_images
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[0] {
+        Statement::SyncImages { images, .. } => {
+            assert!(images.is_none()); // * means all images
+        }
+        _ => panic!("Expected SyncImages statement"),
+    }
+}
+
+#[test]
+fn test_parse_critical_section() {
+    let source = r#"
+        program test_critical
+          implicit none
+          integer :: counter
+          counter = 0
+          critical
+            counter = counter + 1
+          end critical
+          print *, counter
+        end program test_critical
+    "#;
+
+    let program = parse_program(source).expect("Should parse successfully");
+    match &program.statements[1] {
+        Statement::Critical { body, .. } => {
+            assert_eq!(body.len(), 1);
+            assert!(matches!(&body[0], Statement::Assignment { .. }));
+        }
+        _ => panic!("Expected Critical statement"),
+    }
+}
