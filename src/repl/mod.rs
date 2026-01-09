@@ -39,6 +39,8 @@ pub struct Repl {
     accumulated_procs: Vec<String>,
     /// Previous output line count (to show only new output)
     prev_output_count: usize,
+    /// Current block nesting depth (for auto-indentation)
+    current_depth: usize,
     /// Source map for diagnostic rendering
     source_map: SourceMap,
     /// Input counter for unique file names
@@ -66,6 +68,7 @@ impl Repl {
             accumulated_stmts: Vec::new(),
             accumulated_procs: Vec::new(),
             prev_output_count: 0,
+            current_depth: 0,
             source_map: SourceMap::new(),
             input_counter: 0,
             profiling_enabled: false,
@@ -96,7 +99,21 @@ impl Repl {
         loop {
             let prompt = if self.in_multiline { ".. " } else { ":: " };
 
-            match self.editor.readline(prompt) {
+            // Calculate indentation for auto-indent
+            let indent = if self.in_multiline {
+                "  ".repeat(self.current_depth)
+            } else {
+                String::new()
+            };
+
+            // Read line with initial indentation
+            let readline_result = if indent.is_empty() {
+                self.editor.readline(prompt)
+            } else {
+                self.editor.readline_with_initial(prompt, (&indent, ""))
+            };
+
+            match readline_result {
                 Ok(line) => {
                     if line.trim().is_empty() && !self.in_multiline {
                         continue;
@@ -110,19 +127,56 @@ impl Repl {
                         continue;
                     }
 
-                    // Add to history
-                    let _ = self.editor.add_history_entry(&line);
+                    // Check if this line should be dedented (END, ELSE, CASE, CONTAINS)
+                    let trimmed_upper = line.trim().to_uppercase();
+                    let is_dedent_line = self.is_dedent_keyword(&trimmed_upper);
 
-                    // Accumulate input
+                    // If it's a dedent line and was auto-indented, reprint with correct indent
+                    if is_dedent_line && self.in_multiline && self.current_depth > 0 {
+                        // Calculate the correct indent (one level less)
+                        let correct_indent = "  ".repeat(self.current_depth - 1);
+                        let display_line = format!("{}{}", correct_indent, line.trim());
+
+                        // Move cursor up, clear line, and reprint with correct indentation
+                        // \x1b[A = move up, \x1b[2K = clear line, \r = carriage return
+                        print!("\x1b[A\x1b[2K\r.. {}\n", display_line);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    }
+
+                    // Add to history (store the trimmed version)
+                    let _ = self.editor.add_history_entry(line.trim());
+
+                    // Calculate depth change from this line
+                    let (depth_increase, depth_decrease) = self.calculate_depth_change(&trimmed_upper);
+
+                    // For dedent lines (END, ELSE, CASE), decrease depth BEFORE accumulating
+                    // so the line appears at the correct level
+                    if is_dedent_line && self.current_depth > 0 {
+                        self.current_depth = self.current_depth.saturating_sub(depth_decrease);
+                    }
+
+                    // Accumulate input with proper indentation
                     if !self.input_buffer.is_empty() {
                         self.input_buffer.push('\n');
                     }
-                    self.input_buffer.push_str(&line);
+                    // Store with consistent indentation based on depth at time of entry
+                    let stored_indent = "  ".repeat(self.current_depth);
+                    self.input_buffer.push_str(&format!("{}{}", stored_indent, line.trim()));
+
+                    // Now apply depth increase for next line
+                    self.current_depth += depth_increase;
+
+                    // For non-dedent lines, apply decrease after (for things like ELSE which both close and open)
+                    if !is_dedent_line {
+                        self.current_depth = self.current_depth.saturating_sub(depth_decrease);
+                    }
 
                     // Check if input is complete
                     if self.is_input_complete(&self.input_buffer) {
                         let input = std::mem::take(&mut self.input_buffer);
                         self.in_multiline = false;
+                        self.current_depth = 0;
                         self.execute_input(&input);
                     } else {
                         self.in_multiline = true;
@@ -134,6 +188,7 @@ impl Repl {
                         println!("^C");
                         self.input_buffer.clear();
                         self.in_multiline = false;
+                        self.current_depth = 0;
                     } else {
                         println!("^C (use :quit to exit)");
                     }
@@ -152,6 +207,87 @@ impl Repl {
 
         self.save_history();
         Ok(())
+    }
+
+    /// Check if a line (uppercase) is a dedent keyword
+    fn is_dedent_keyword(&self, line: &str) -> bool {
+        line.starts_with("END ")
+            || line.starts_with("END")  // ENDIF, ENDDO, etc.
+            || line.starts_with("ELSE")
+            || line.starts_with("CASE ")
+            || line.starts_with("CASE(")
+            || line == "CASE"
+            || line.starts_with("CONTAINS")
+    }
+
+    /// Calculate depth change from a line: returns (increase, decrease)
+    fn calculate_depth_change(&self, line: &str) -> (usize, usize) {
+        let mut increase = 0;
+        let mut decrease = 0;
+
+        // Block openers
+        if !line.starts_with("END") {
+            if line.starts_with("PROGRAM ") || line == "PROGRAM" {
+                increase = 1;
+            } else if line.starts_with("SUBROUTINE ") || line.contains(" SUBROUTINE ") {
+                increase = 1;
+            } else if line.starts_with("FUNCTION ") || line.contains(" FUNCTION ") {
+                increase = 1;
+            } else if line.starts_with("MODULE ") && !line.starts_with("MODULE PROCEDURE") {
+                increase = 1;
+            } else if line.starts_with("IF ") && line.contains(" THEN") {
+                increase = 1;
+            } else if line.starts_with("DO ") || line == "DO" {
+                increase = 1;
+            } else if line.starts_with("SELECT ") {
+                increase = 1;
+            } else if line.starts_with("TYPE ") && !line.starts_with("TYPE(") && !line.contains("::") {
+                increase = 1;
+            } else if line == "TYPE" {
+                increase = 1;
+            } else if line.starts_with("ELSE") && !line.starts_with("ELSEIF") && !line.starts_with("ELSE IF") {
+                // Plain ELSE opens a new block (but also closes IF block - handled separately)
+            } else if line.starts_with("ELSE IF") || line.starts_with("ELSEIF") {
+                // ELSE IF closes previous IF block and opens new one
+                if line.contains(" THEN") {
+                    // It opens a new block
+                    increase = 1;
+                    decrease = 1;  // Closes the previous block
+                }
+            } else if line.starts_with("CASE ") || line.starts_with("CASE(") || line == "CASE DEFAULT" {
+                // CASE is at same level as SELECT, body is indented
+                increase = 1;
+                decrease = 1;  // Close previous CASE
+            }
+        }
+
+        // Block closers
+        if line.starts_with("END PROGRAM") || line.starts_with("ENDPROGRAM") {
+            decrease = 1;
+        } else if line.starts_with("END SUBROUTINE") || line.starts_with("ENDSUBROUTINE") {
+            decrease = 1;
+        } else if line.starts_with("END FUNCTION") || line.starts_with("ENDFUNCTION") {
+            decrease = 1;
+        } else if line.starts_with("END MODULE") || line.starts_with("ENDMODULE") {
+            decrease = 1;
+        } else if line.starts_with("END IF") || line.starts_with("ENDIF") {
+            decrease = 1;
+        } else if line.starts_with("END DO") || line.starts_with("ENDDO") {
+            decrease = 1;
+        } else if line.starts_with("END SELECT") || line.starts_with("ENDSELECT") {
+            decrease = 1;
+        } else if line.starts_with("END TYPE") || line.starts_with("ENDTYPE") {
+            decrease = 1;
+        } else if line == "END" {
+            decrease = 1;
+        } else if line.starts_with("ELSE") && !line.contains(" IF") && !line.contains("IF ") {
+            // Plain ELSE - closes IF block, but body is still indented
+            // We don't decrease here because the ELSE body needs indent
+        } else if line.starts_with("CONTAINS") {
+            // CONTAINS doesn't change depth, procedures inside are at same level
+        }
+
+        (increase, decrease)
     }
 
     /// Print welcome message
@@ -289,6 +425,7 @@ impl Repl {
         self.accumulated_stmts.clear();
         self.accumulated_procs.clear();
         self.prev_output_count = 0;
+        self.current_depth = 0;
     }
 
     /// Reset REPL completely
@@ -302,6 +439,7 @@ impl Repl {
         self.accumulated_stmts.clear();
         self.accumulated_procs.clear();
         self.prev_output_count = 0;
+        self.current_depth = 0;
     }
 
     /// Load and execute a file
