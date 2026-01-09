@@ -482,3 +482,136 @@ fn test_program_use_statement_parsing() {
     assert_eq!(program.uses[1].module_name, "ANOTHER_MODULE");
     assert!(program.uses[1].only.is_some());
 }
+
+#[test]
+fn test_use_only_rejects_private_symbols() {
+    // Attempting to import a PRIVATE symbol via USE...ONLY should fail
+    let source = r#"
+        MODULE my_module
+          PRIVATE
+          INTEGER :: secret_var = 42
+          PUBLIC :: public_var
+          INTEGER :: public_var = 100
+        END MODULE my_module
+
+        PROGRAM test_private
+          USE my_module, ONLY: secret_var
+          IMPLICIT NONE
+          PRINT *, secret_var
+        END PROGRAM
+    "#;
+
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().expect("Should tokenize");
+    let mut parser = Parser::new(tokens);
+    let unit = parser.parse_compilation_unit().expect("Should parse");
+
+    let mut compiler = Compiler::new();
+    let result = compiler.compile_unit(&unit);
+
+    // Should fail because secret_var is PRIVATE
+    assert!(result.is_err(), "Should reject importing PRIVATE symbol");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("PRIVATE") || err_msg.contains("secret_var"),
+        "Error should mention PRIVATE visibility, got: {}", err_msg
+    );
+}
+
+#[test]
+fn test_use_only_allows_public_symbols() {
+    // Importing a PUBLIC symbol via USE...ONLY should succeed
+    let source = r#"
+        MODULE my_module
+          PRIVATE
+          INTEGER :: secret_var = 42
+          PUBLIC :: public_var
+          INTEGER :: public_var = 100
+        END MODULE my_module
+
+        PROGRAM test_public
+          USE my_module, ONLY: public_var
+          IMPLICIT NONE
+          PRINT *, public_var
+        END PROGRAM
+    "#;
+
+    let vm = compile_and_run_unit(source).expect("Should compile and run");
+    let output = vm.output().join("\n");
+    assert!(output.contains("100"), "Expected public_var value 100, got: {}", output);
+}
+
+#[test]
+fn test_parse_type_with_component_visibility() {
+    // Test that component visibility attributes are parsed correctly
+    let source = r#"
+        MODULE mymod
+          IMPLICIT NONE
+          TYPE :: MyType
+            INTEGER, PUBLIC :: x
+            INTEGER, PRIVATE :: y
+            REAL :: z
+          END TYPE MyType
+        END MODULE mymod
+    "#;
+
+    let module = parse_module(source).expect("Should parse successfully");
+    assert_eq!(module.name, "MYMOD");
+
+    // Find the type definition in the declarations
+    let type_decl = module.declarations.iter().find(|d| {
+        matches!(d, Declaration::DerivedType(t) if t.name == "MYTYPE")
+    });
+    assert!(type_decl.is_some(), "Should have a DerivedType declaration");
+
+    if let Some(Declaration::DerivedType(type_def)) = type_decl {
+        assert_eq!(type_def.components.len(), 3);
+
+        // Check component x has PUBLIC visibility
+        let comp_x = type_def.components.iter().find(|c| c.name == "X");
+        assert!(comp_x.is_some());
+        assert_eq!(comp_x.unwrap().visibility, Some(Visibility::Public));
+
+        // Check component y has PRIVATE visibility
+        let comp_y = type_def.components.iter().find(|c| c.name == "Y");
+        assert!(comp_y.is_some());
+        assert_eq!(comp_y.unwrap().visibility, Some(Visibility::Private));
+
+        // Check component z has no explicit visibility (None)
+        let comp_z = type_def.components.iter().find(|c| c.name == "Z");
+        assert!(comp_z.is_some());
+        assert_eq!(comp_z.unwrap().visibility, None);
+    }
+}
+
+#[test]
+fn test_type_component_visibility_in_runtime() {
+    // Test that component visibility is tracked in the runtime type definition
+    let source = r#"
+        MODULE test_mod
+          IMPLICIT NONE
+          TYPE :: Point
+            REAL, PUBLIC :: x
+            REAL, PRIVATE :: internal_val
+          END TYPE Point
+        CONTAINS
+          FUNCTION create_point() RESULT(p)
+            TYPE(Point) :: p
+            p%x = 10.0
+            p%internal_val = 5.0
+          END FUNCTION
+        END MODULE test_mod
+
+        PROGRAM test_visibility
+          USE test_mod
+          IMPLICIT NONE
+          TYPE(Point) :: pt
+          pt = create_point()
+          PRINT *, pt%x
+        END PROGRAM
+    "#;
+
+    let vm = compile_and_run_unit(source).expect("Should compile and run");
+    let output = vm.output().join("\n");
+    assert!(output.contains("10"), "Expected pt%x = 10, got: {}", output);
+}

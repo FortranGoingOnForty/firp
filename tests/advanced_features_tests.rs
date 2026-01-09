@@ -32,7 +32,7 @@ fn compile_and_run_with_semantic(source: &str) -> Result<VM, String> {
 
     // Run semantic analysis
     let mut analyzer = SemanticAnalyzer::new();
-    let errors = analyzer.analyze(&program);
+    let (errors, _warnings) = analyzer.analyze(&program);
     if !errors.is_empty() {
         return Err(format!("Semantic error: {}", errors[0]));
     }

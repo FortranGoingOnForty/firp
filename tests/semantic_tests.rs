@@ -9,16 +9,18 @@ fn analyze_program(source: &str) -> Result<(), Vec<SemanticError>> {
     let tokens = lexer.tokenize().map_err(|e| vec![SemanticError::UndeclaredVariable {
         name: format!("Lexer error: {}", e),
         location: firp::lexer::SourceLocation { line: 0, column: 0 },
+        suggestions: None,
     }])?;
 
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program().map_err(|e| vec![SemanticError::UndeclaredVariable {
         name: format!("Parser error: {}", e),
         location: firp::lexer::SourceLocation { line: 0, column: 0 },
+        suggestions: None,
     }])?;
 
     let mut analyzer = SemanticAnalyzer::new();
-    let errors = analyzer.analyze(&program);
+    let (errors, _warnings) = analyzer.analyze(&program);
 
     if errors.is_empty() {
         Ok(())

@@ -1655,3 +1655,62 @@ fn test_sprint15_success_criteria() {
     assert_eq!(vm.get_variable("IMG"), Some(&firp::bytecode::Value::Integer(1)));
     assert_eq!(vm.get_variable("NUM"), Some(&firp::bytecode::Value::Integer(1)));
 }
+
+fn compile_and_run_parallel(source: &str) -> Result<VM, String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
+
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().map_err(|e| format!("Parser error: {}", e))?;
+
+    let mut compiler = Compiler::new();
+    let chunk = compiler.compile(&program).map_err(|e| format!("Compile error: {}", e))?;
+
+    let mut vm = VM::new();
+    vm.set_parallel_mode(true);  // Enable parallel execution
+    vm.run(chunk).map_err(|e| format!("Runtime error: {}", e))?;
+
+    Ok(vm)
+}
+
+#[test]
+fn test_do_concurrent_parallel_mode() {
+    // Test DO CONCURRENT with parallel mode enabled
+    let source = r#"
+        program test_parallel
+          implicit none
+          integer :: arr(10)
+          integer :: i
+          do concurrent (i = 1:10)
+            arr(i) = i * 2
+          end do
+          print *, arr(5)
+        end program test_parallel
+    "#;
+
+    let vm = compile_and_run_parallel(source).expect("Should run successfully with parallel mode");
+    let output = vm.output().join("\n");
+    // arr(5) = 5 * 2 = 10
+    assert!(output.contains("10"), "Expected arr(5) = 10, got: {}", output);
+}
+
+#[test]
+fn test_do_concurrent_parallel_output_order() {
+    // Test that output is collected in correct order even with parallel execution
+    let source = r#"
+        program test_parallel_output
+          implicit none
+          integer :: i
+          do concurrent (i = 1:5)
+            print *, i
+          end do
+        end program test_parallel_output
+    "#;
+
+    let vm = compile_and_run_parallel(source).expect("Should run successfully");
+    let output = vm.output();
+    // In parallel mode, output should still be in order
+    assert_eq!(output.len(), 5, "Expected 5 lines of output");
+    assert!(output[0].contains("1"), "Expected first line to contain 1");
+    assert!(output[4].contains("5"), "Expected last line to contain 5");
+}

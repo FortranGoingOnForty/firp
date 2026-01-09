@@ -746,6 +746,54 @@ fn test_execute_generic_interface() {
     assert!(output.contains("30"), "Output should contain 30: {}", output);
 }
 
+#[test]
+fn test_generic_interface_type_resolution() {
+    // Test that the correct procedure is selected based on argument types
+    let source = r#"
+        PROGRAM test_generic_types
+          IMPLICIT NONE
+
+          INTERFACE compute
+            MODULE PROCEDURE compute_int, compute_real
+          END INTERFACE compute
+
+          INTEGER :: i, iresult
+          REAL :: r, rresult
+
+          i = 5
+          r = 3.5
+
+          ! Call with INTEGER - should select compute_int
+          iresult = compute(i)
+          PRINT *, iresult
+
+          ! Call with REAL - should select compute_real
+          rresult = compute(r)
+          PRINT *, rresult
+
+        CONTAINS
+
+          FUNCTION compute_int(x) RESULT(y)
+            INTEGER :: x, y
+            y = x * 2
+          END FUNCTION compute_int
+
+          FUNCTION compute_real(x) RESULT(y)
+            REAL :: x, y
+            y = x * 3.0
+          END FUNCTION compute_real
+
+        END PROGRAM test_generic_types
+    "#;
+
+    let vm = compile_and_run(source).expect("Should run successfully");
+    let output = get_output(&vm);
+    // compute_int(5) = 5 * 2 = 10
+    assert!(output.contains("10"), "Output should contain 10 for integer computation: {}", output);
+    // compute_real(3.5) = 3.5 * 3.0 = 10.5
+    assert!(output.contains("10.5"), "Output should contain 10.5 for real computation: {}", output);
+}
+
 // ========== POINTER TESTS (Sprint 14) ==========
 
 #[test]
