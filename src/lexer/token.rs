@@ -1,17 +1,170 @@
 //! Token types and definitions for the Fortran lexer
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Source location for error reporting
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Lightweight, Copy-able location tracking for use throughout the compiler.
+/// For rich error display, use Span which includes file info.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceLocation {
+    /// Line number (1-indexed)
     pub line: usize,
+    /// Column number (1-indexed)
     pub column: usize,
+}
+
+impl SourceLocation {
+    /// Create a new source location
+    pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
 }
 
 impl fmt::Display for SourceLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "line {}, column {}", self.line, self.column)
+    }
+}
+
+/// A span representing a range in source code with optional file info
+///
+/// Used by the diagnostic system for rich error display with source context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// Source file name (shared reference for efficiency)
+    pub file: Option<Arc<str>>,
+    /// Start location
+    pub start_line: usize,
+    pub start_column: usize,
+    pub start_offset: usize,
+    /// End location
+    pub end_line: usize,
+    pub end_column: usize,
+    pub end_offset: usize,
+}
+
+impl Span {
+    /// Create a new span
+    pub fn new(
+        file: Option<Arc<str>>,
+        start_line: usize,
+        start_column: usize,
+        start_offset: usize,
+        end_line: usize,
+        end_column: usize,
+        end_offset: usize,
+    ) -> Self {
+        Self {
+            file,
+            start_line,
+            start_column,
+            start_offset,
+            end_line,
+            end_column,
+            end_offset,
+        }
+    }
+
+    /// Create a span from a SourceLocation (point span)
+    pub fn from_location(loc: SourceLocation) -> Self {
+        Self {
+            file: None,
+            start_line: loc.line,
+            start_column: loc.column,
+            start_offset: 0,
+            end_line: loc.line,
+            end_column: loc.column,
+            end_offset: 0,
+        }
+    }
+
+    /// Create a span from a SourceLocation with file info
+    pub fn from_location_with_file(loc: SourceLocation, file: Arc<str>, offset: usize) -> Self {
+        Self {
+            file: Some(file),
+            start_line: loc.line,
+            start_column: loc.column,
+            start_offset: offset,
+            end_line: loc.line,
+            end_column: loc.column,
+            end_offset: offset,
+        }
+    }
+
+    /// Merge two spans into one covering both
+    pub fn merge(&self, other: &Span) -> Span {
+        let (start_line, start_column, start_offset) =
+            if self.start_offset <= other.start_offset {
+                (self.start_line, self.start_column, self.start_offset)
+            } else {
+                (other.start_line, other.start_column, other.start_offset)
+            };
+        let (end_line, end_column, end_offset) =
+            if self.end_offset >= other.end_offset {
+                (self.end_line, self.end_column, self.end_offset)
+            } else {
+                (other.end_line, other.end_column, other.end_offset)
+            };
+        Span {
+            file: self.file.clone(),
+            start_line,
+            start_column,
+            start_offset,
+            end_line,
+            end_column,
+            end_offset,
+        }
+    }
+
+    /// Get the file name
+    pub fn file(&self) -> Option<&str> {
+        self.file.as_ref().map(|f| f.as_ref())
+    }
+
+    /// Get the number of bytes in this span
+    pub fn len(&self) -> usize {
+        self.end_offset.saturating_sub(self.start_offset)
+    }
+
+    /// Check if span is empty (zero-width)
+    pub fn is_empty(&self) -> bool {
+        self.start_offset == self.end_offset
+    }
+
+    /// Get start as SourceLocation
+    pub fn start(&self) -> SourceLocation {
+        SourceLocation::new(self.start_line, self.start_column)
+    }
+
+    /// Get end as SourceLocation
+    pub fn end(&self) -> SourceLocation {
+        SourceLocation::new(self.end_line, self.end_column)
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(file) = self.file() {
+            write!(f, "{}:{}:{}", file, self.start_line, self.start_column)
+        } else {
+            write!(f, "line {}, column {}", self.start_line, self.start_column)
+        }
+    }
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Self {
+            file: None,
+            start_line: 1,
+            start_column: 1,
+            start_offset: 0,
+            end_line: 1,
+            end_column: 1,
+            end_offset: 0,
+        }
     }
 }
 

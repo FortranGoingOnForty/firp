@@ -325,6 +325,8 @@ pub struct Symbol {
     pub intent: Option<Intent>,  // INTENT for procedure arguments
     pub is_optional: bool,  // OPTIONAL attribute
     pub location: SourceLocation,
+    pub is_used: bool,  // Track if variable is used after declaration
+    pub is_argument: bool,  // Is this a procedure argument?
 }
 
 impl Symbol {
@@ -336,6 +338,8 @@ impl Symbol {
             intent: None,
             is_optional: false,
             location,
+            is_used: false,
+            is_argument: false,
         }
     }
 
@@ -351,6 +355,11 @@ impl Symbol {
 
     pub fn with_optional(mut self, is_optional: bool) -> Self {
         self.is_optional = is_optional;
+        self
+    }
+
+    pub fn with_argument(mut self, is_argument: bool) -> Self {
+        self.is_argument = is_argument;
         self
     }
 }
@@ -443,6 +452,42 @@ impl SymbolTable {
             _ => None,
         }
     }
+
+    /// Get all available symbol names from all scopes (for suggestions)
+    pub fn get_all_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            names.extend(scope.keys().cloned());
+        }
+        names
+    }
+
+    /// Mark a symbol as used
+    pub fn mark_used(&mut self, name: &str) {
+        let name_upper = name.to_uppercase();
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(symbol) = scope.get_mut(&name_upper) {
+                symbol.is_used = true;
+                return;
+            }
+        }
+    }
+
+    /// Get the current (innermost) scope for inspection
+    pub fn current_scope(&self) -> Option<&HashMap<String, Symbol>> {
+        self.scopes.last()
+    }
+
+    /// Get a mutable reference to lookup result for modification
+    pub fn lookup_mut(&mut self, name: &str) -> Option<&mut Symbol> {
+        let name_upper = name.to_uppercase();
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(symbol) = scope.get_mut(&name_upper) {
+                return Some(symbol);
+            }
+        }
+        None
+    }
 }
 
 impl Default for SymbolTable {
@@ -458,6 +503,7 @@ pub enum SemanticError {
     UndeclaredVariable {
         name: String,
         location: SourceLocation,
+        suggestions: Option<Vec<String>>,
     },
     /// Variable declared multiple times in same scope
     DuplicateDeclaration {
@@ -493,12 +539,16 @@ pub enum SemanticError {
 impl fmt::Display for SemanticError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SemanticError::UndeclaredVariable { name, location } => {
-                write!(
-                    f,
-                    "Undeclared variable '{}' at {}",
-                    name, location
-                )
+            SemanticError::UndeclaredVariable { name, location, suggestions } => {
+                write!(f, "Undeclared variable '{}' at {}", name, location)?;
+                if let Some(sugg) = suggestions {
+                    if sugg.len() == 1 {
+                        write!(f, " (did you mean '{}'?)", sugg[0])?;
+                    } else if !sugg.is_empty() {
+                        write!(f, " (did you mean one of: {}?)", sugg.join(", "))?;
+                    }
+                }
+                Ok(())
             }
             SemanticError::DuplicateDeclaration {
                 name,
@@ -556,10 +606,25 @@ impl std::error::Error for SemanticError {}
 
 pub type SemanticResult<T> = Result<T, SemanticError>;
 
+/// Semantic warning for non-fatal issues
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticWarning {
+    pub code: crate::diagnostic::codes::ErrorCode,
+    pub message: String,
+    pub location: SourceLocation,
+}
+
+impl fmt::Display for SemanticWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Warning {}: {} at {}", self.code, self.message, self.location)
+    }
+}
+
 /// Semantic analyzer that performs type checking and validation
 pub struct SemanticAnalyzer {
     symbol_table: SymbolTable,
     errors: Vec<SemanticError>,
+    warnings: Vec<SemanticWarning>,
     in_loop: bool,  // Track if we're inside a loop (for EXIT/CYCLE validation)
 }
 
@@ -569,14 +634,16 @@ impl SemanticAnalyzer {
         Self {
             symbol_table: SymbolTable::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
             in_loop: false,
         }
     }
 
     /// Analyze a complete program
-    /// Returns errors collected during analysis (or empty vec if successful)
-    pub fn analyze(&mut self, program: &Program) -> Vec<SemanticError> {
+    /// Returns (errors, warnings) collected during analysis
+    pub fn analyze(&mut self, program: &Program) -> (Vec<SemanticError>, Vec<SemanticWarning>) {
         self.errors.clear();
+        self.warnings.clear();
 
         // Process declarations
         for decl in &program.declarations {
@@ -599,7 +666,31 @@ impl SemanticAnalyzer {
             }
         }
 
-        self.errors.clone()
+        // Check for unused variables in global/program scope
+        self.check_unused_variables();
+
+        (self.errors.clone(), self.warnings.clone())
+    }
+
+    /// Check for unused variables in current scope and emit warnings
+    fn check_unused_variables(&mut self) {
+        if let Some(scope) = self.symbol_table.current_scope() {
+            for (name, symbol) in scope {
+                // Skip if variable is used, is a PARAMETER constant, or is a procedure argument
+                if symbol.is_used || symbol.is_parameter || symbol.is_argument {
+                    continue;
+                }
+                // Skip variables starting with underscore (convention for unused)
+                if name.starts_with('_') {
+                    continue;
+                }
+                self.warnings.push(SemanticWarning {
+                    code: crate::diagnostic::codes::W0001_UNUSED_VARIABLE,
+                    message: format!("unused variable '{}'", symbol.name),
+                    location: symbol.location,
+                });
+            }
+        }
     }
 
     /// Analyze an internal procedure
@@ -622,18 +713,21 @@ impl SemanticAnalyzer {
                     }
                 }
 
+                // Check for unused variables before leaving scope
+                self.check_unused_variables();
                 self.symbol_table.exit_scope();
                 Ok(())
             }
             Procedure::Function(func) => {
                 self.symbol_table.enter_scope();
 
-                // Add result variable
+                // Add result variable (mark as used since it's the return value)
                 let result_name = func.result_name.as_ref().unwrap_or(&func.name);
                 let result_type = func.return_type.as_ref()
                     .map(Type::from)
                     .unwrap_or_else(Type::integer);
-                let result_symbol = Symbol::new(result_name.clone(), result_type, func.location);
+                let mut result_symbol = Symbol::new(result_name.clone(), result_type, func.location);
+                result_symbol.is_used = true;  // Result variable is implicitly used
                 let _ = self.symbol_table.define(result_symbol);
 
                 // Process declarations (which include parameter declarations with INTENT)
@@ -650,6 +744,8 @@ impl SemanticAnalyzer {
                     }
                 }
 
+                // Check for unused variables before leaving scope
+                self.check_unused_variables();
                 self.symbol_table.exit_scope();
                 Ok(())
             }
@@ -1318,6 +1414,11 @@ impl SemanticAnalyzer {
                 self.symbol_table.exit_scope();
                 Ok(())
             }
+
+            Statement::Format { .. } => {
+                // FORMAT statements are declarations, no semantic analysis needed
+                Ok(())
+            }
         }
     }
 
@@ -1331,6 +1432,8 @@ impl SemanticAnalyzer {
 
             Expr::Identifier(name, location) => {
                 let symbol = self.lookup_variable(name, *location)?;
+                // Mark variable as used
+                self.symbol_table.mark_used(name);
                 Ok(symbol.ty.clone())
             }
 
@@ -1641,11 +1744,16 @@ impl SemanticAnalyzer {
             return Ok(symbol.clone());
         }
 
-        // Variable not found
+        // Variable not found - compute suggestions
+        let scope_names = self.symbol_table.get_all_names();
+        let suggestions = crate::diagnostic::suggest::suggest_similar_identifiers(name, &scope_names);
+        let suggestions = if suggestions.is_empty() { None } else { Some(suggestions) };
+
         if self.symbol_table.is_implicit_none() {
             Err(SemanticError::UndeclaredVariable {
                 name: name.to_string(),
                 location,
+                suggestions,
             })
         } else {
             // Use implicit typing
@@ -1659,6 +1767,7 @@ impl SemanticAnalyzer {
                 Err(SemanticError::UndeclaredVariable {
                     name: name.to_string(),
                     location,
+                    suggestions,
                 })
             }
         }
@@ -1672,6 +1781,11 @@ impl SemanticAnalyzer {
     /// Get collected errors
     pub fn errors(&self) -> &[SemanticError] {
         &self.errors
+    }
+
+    /// Get collected warnings
+    pub fn warnings(&self) -> &[SemanticWarning] {
+        &self.warnings
     }
 }
 
@@ -1795,7 +1909,7 @@ mod tests {
     #[test]
     fn test_symbol_table_define_and_lookup() {
         let mut table = SymbolTable::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let symbol = Symbol::new("X".to_string(), Type::integer(), loc);
         table.define(symbol).unwrap();
@@ -1813,7 +1927,7 @@ mod tests {
     #[test]
     fn test_symbol_table_duplicate_declaration() {
         let mut table = SymbolTable::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let symbol1 = Symbol::new("X".to_string(), Type::integer(), loc);
         table.define(symbol1).unwrap();
@@ -1830,7 +1944,7 @@ mod tests {
     #[test]
     fn test_symbol_table_scoping() {
         let mut table = SymbolTable::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         // Define in outer scope
         let symbol1 = Symbol::new("X".to_string(), Type::integer(), loc);

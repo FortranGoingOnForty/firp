@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Token, TokenType, SourceLocation};
+use crate::diagnostic::{DiagnosticBag, Diagnostic};
 use std::fmt;
 
 /// Parser error types
@@ -458,8 +459,8 @@ impl Parser {
                 break;
             }
 
-            // Check for END SUBROUTINE
-            if self.check(&TokenType::End) {
+            // Check for END SUBROUTINE (not END IF, END DO, etc.)
+            if self.check(&TokenType::End) && self.is_end_subroutine() {
                 break;
             }
 
@@ -543,8 +544,8 @@ impl Parser {
                 break;
             }
 
-            // Check for END FUNCTION
-            if self.check(&TokenType::End) {
+            // Check for END FUNCTION (not END IF, END DO, etc.)
+            if self.check(&TokenType::End) && self.is_end_function() {
                 break;
             }
 
@@ -627,6 +628,54 @@ impl Parser {
                 | TokenType::Character
                 | TokenType::Type
                 | TokenType::Class
+        )
+    }
+
+    /// Check if current position is END FUNCTION (not END IF, END DO, etc.)
+    /// Assumes current token is END
+    fn is_end_function(&self) -> bool {
+        let next = &self.peek_next().token_type;
+        // END FUNCTION or END followed by identifier (function name) or EOF
+        // NOT END IF, END DO, END SELECT, END WHERE, END FORALL, END BLOCK, etc.
+        !matches!(
+            next,
+            TokenType::If
+                | TokenType::Do
+                | TokenType::Select
+                | TokenType::Where
+                | TokenType::Forall
+                | TokenType::Block
+                | TokenType::Associate
+                | TokenType::Critical
+                | TokenType::Type
+                | TokenType::Interface
+                | TokenType::Module
+                | TokenType::Program
+                | TokenType::Subroutine
+        )
+    }
+
+    /// Check if current position is END SUBROUTINE (not END IF, END DO, etc.)
+    /// Assumes current token is END
+    fn is_end_subroutine(&self) -> bool {
+        let next = &self.peek_next().token_type;
+        // END SUBROUTINE or END followed by identifier (subroutine name) or EOF
+        // NOT END IF, END DO, END SELECT, END WHERE, END FORALL, END BLOCK, etc.
+        !matches!(
+            next,
+            TokenType::If
+                | TokenType::Do
+                | TokenType::Select
+                | TokenType::Where
+                | TokenType::Forall
+                | TokenType::Block
+                | TokenType::Associate
+                | TokenType::Critical
+                | TokenType::Type
+                | TokenType::Interface
+                | TokenType::Module
+                | TokenType::Program
+                | TokenType::Function
         )
     }
 
@@ -1003,12 +1052,28 @@ impl Parser {
 
         let type_spec = self.parse_type_spec()?;
 
+        // Track visibility attribute
+        let mut visibility = None;
+
         // Optional attributes
         if self.check(&TokenType::Comma) {
             self.advance();
-            // Skip attributes for now (POINTER, ALLOCATABLE, etc.)
+            // Parse attributes, looking for PUBLIC/PRIVATE
             while !self.check(&TokenType::DoubleColon) && !self.is_at_end() {
-                self.advance();
+                if self.check(&TokenType::Public) {
+                    visibility = Some(Visibility::Public);
+                    self.advance();
+                } else if self.check(&TokenType::Private) {
+                    visibility = Some(Visibility::Private);
+                    self.advance();
+                } else {
+                    // Skip other attributes (POINTER, ALLOCATABLE, etc.)
+                    self.advance();
+                }
+                // Skip comma between attributes if present
+                if self.check(&TokenType::Comma) {
+                    self.advance();
+                }
             }
         }
 
@@ -1039,6 +1104,7 @@ impl Parser {
             type_spec,
             array_spec,
             init,
+            visibility,
             location,
         })
     }
@@ -1262,6 +1328,19 @@ impl Parser {
             });
         }
 
+        // Check for labeled FORMAT statement: label FORMAT(...)
+        if let TokenType::IntegerLiteral(label_str) = &self.peek().token_type {
+            // Look ahead to see if next token is FORMAT
+            if matches!(self.peek_next().token_type, TokenType::Format) {
+                let label_value = label_str.parse::<i64>().map_err(|_| ParseError::InvalidNumber {
+                    value: label_str.clone(),
+                    location,
+                })?;
+                self.advance(); // consume the label
+                return self.parse_format_statement(label_value);
+            }
+        }
+
         // Control flow statements
         if self.check(&TokenType::If) {
             return self.parse_if_statement();
@@ -1449,15 +1528,32 @@ impl Parser {
     }
 
     /// Parse PRINT statement
+    /// Supports: PRINT *, x  (list-directed)
+    ///           PRINT '(I5)', x  (inline format)
+    ///           PRINT 100, x  (label reference)
     fn parse_print_statement(&mut self) -> ParseResult<Statement> {
         let location = self.current_location();
         self.expect(&TokenType::Print, "PRINT")?;
 
-        // TODO: Parse format spec
-        // For now, expect * for list-directed
-        if self.check(&TokenType::Star) {
+        // Parse format specification
+        let format = if self.check(&TokenType::Star) {
             self.advance();
-        }
+            FormatSpec::ListDirected
+        } else if let TokenType::StringLiteral(s) = &self.peek().token_type.clone() {
+            let fmt_str = s.clone();
+            self.advance();
+            FormatSpec::String(fmt_str)
+        } else if let TokenType::IntegerLiteral(label_str) = &self.peek().token_type.clone() {
+            let label = label_str.parse::<i64>().map_err(|_| ParseError::InvalidNumber {
+                value: label_str.clone(),
+                location,
+            })?;
+            self.advance();
+            FormatSpec::Label(label)
+        } else {
+            // Default to list-directed if no format specified
+            FormatSpec::ListDirected
+        };
 
         if self.check(&TokenType::Comma) {
             self.advance();
@@ -1475,7 +1571,7 @@ impl Parser {
         }
 
         Ok(Statement::Print {
-            format: None,
+            format,
             values,
             location,
         })
@@ -1623,6 +1719,292 @@ impl Parser {
         } else {
             Err(ParseError::UnexpectedToken {
                 expected: "format specification (*, string, or label)".to_string(),
+                found: self.peek().token_type.clone(),
+                location: self.current_location(),
+            })
+        }
+    }
+
+    /// Parse FORMAT statement: label FORMAT(descriptors)
+    fn parse_format_statement(&mut self, label: i64) -> ParseResult<Statement> {
+        let location = self.current_location();
+        self.expect(&TokenType::Format, "FORMAT")?;
+        self.expect(&TokenType::LeftParen, "(")?;
+
+        let descriptors = self.parse_format_descriptors()?;
+
+        self.expect(&TokenType::RightParen, ")")?;
+
+        Ok(Statement::Format {
+            label,
+            descriptors,
+            location,
+        })
+    }
+
+    /// Parse format descriptor list: I5, F10.2, A, etc.
+    fn parse_format_descriptors(&mut self) -> ParseResult<Vec<FormatDescriptor>> {
+        let mut descriptors = Vec::new();
+
+        loop {
+            if self.check(&TokenType::RightParen) {
+                break;
+            }
+
+            // Parse a single descriptor or group
+            let desc = self.parse_single_format_descriptor()?;
+            descriptors.push(desc);
+
+            // Continue if there's a comma
+            if self.check(&TokenType::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(descriptors)
+    }
+
+    /// Parse a single format descriptor
+    fn parse_single_format_descriptor(&mut self) -> ParseResult<FormatDescriptor> {
+        let location = self.current_location();
+
+        // Check for repeat count
+        let repeat = if let TokenType::IntegerLiteral(n_str) = &self.peek().token_type {
+            let count = n_str.parse::<usize>().map_err(|_| ParseError::InvalidNumber {
+                value: n_str.clone(),
+                location,
+            })?;
+            self.advance();
+            Some(count)
+        } else {
+            None
+        };
+
+        // Check for string literal
+        if let TokenType::StringLiteral(s) = &self.peek().token_type.clone() {
+            let lit = s.clone();
+            self.advance();
+            return Ok(FormatDescriptor::Literal(lit));
+        }
+
+        // Check for slash (newline)
+        if self.check(&TokenType::Slash) {
+            self.advance();
+            return Ok(FormatDescriptor::Newline);
+        }
+
+        // Check for colon
+        if self.check(&TokenType::Colon) {
+            self.advance();
+            return Ok(FormatDescriptor::Colon);
+        }
+
+        // Check for group: n(...)
+        if self.check(&TokenType::LeftParen) {
+            self.advance();
+            let items = self.parse_format_descriptors()?;
+            self.expect(&TokenType::RightParen, ")")?;
+            return Ok(FormatDescriptor::Group {
+                repeat: repeat.unwrap_or(1),
+                items,
+            });
+        }
+
+        // Parse format code (identifier like I5, F10.2, A, X, etc.)
+        // The lexer combines code+width into a single identifier (e.g., "I5", "F10")
+        let full_code = if let TokenType::Identifier(name) = &self.peek().token_type.clone() {
+            let c = name.to_uppercase();
+            self.advance();
+            c
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "format descriptor (I, F, E, A, X, etc.)".to_string(),
+                found: self.peek().token_type.clone(),
+                location,
+            });
+        };
+
+        // Parse the descriptor - extract code letter, embedded width, and optional decimals
+        // E.g., "I5" -> code="I", width=5; "F10.4" -> code="F", width=10, decimals=4
+        let (code, embedded_width, embedded_decimals) = self.split_format_code(&full_code);
+
+        // Parse descriptor based on code
+        match code {
+            "I" => {
+                // Integer: Iw[.m]
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(6));
+                let min_digits = embedded_decimals.or_else(|| {
+                    if self.check(&TokenType::Dot) {
+                        self.advance();
+                        Some(self.parse_format_width().unwrap_or(1))
+                    } else {
+                        None
+                    }
+                });
+                Ok(FormatDescriptor::Integer {
+                    width: repeat.unwrap_or(1) * width,
+                    min_digits,
+                })
+            }
+            "F" => {
+                // Real: Fw.d
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(12));
+                let decimals = embedded_decimals.unwrap_or_else(|| {
+                    if self.check(&TokenType::Dot) {
+                        self.advance();
+                        self.parse_format_width().unwrap_or(6)
+                    } else {
+                        6
+                    }
+                });
+                Ok(FormatDescriptor::Float {
+                    width: repeat.unwrap_or(1) * width,
+                    decimals,
+                })
+            }
+            "E" => {
+                // Exponential: Ew.d[Ee]
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(12));
+                let decimals = embedded_decimals.unwrap_or_else(|| {
+                    if self.check(&TokenType::Dot) {
+                        self.advance();
+                        self.parse_format_width().unwrap_or(6)
+                    } else {
+                        6
+                    }
+                });
+                // Optional Ee for exponent width
+                let exp_width = if let TokenType::Identifier(e) = &self.peek().token_type {
+                    if e.to_uppercase() == "E" {
+                        self.advance();
+                        Some(self.parse_format_width().unwrap_or(2))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(FormatDescriptor::Exponential {
+                    width: repeat.unwrap_or(1) * width,
+                    decimals,
+                    exp_width,
+                })
+            }
+            "D" => {
+                // Double: Dw.d
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(22));
+                let decimals = embedded_decimals.unwrap_or_else(|| {
+                    if self.check(&TokenType::Dot) {
+                        self.advance();
+                        self.parse_format_width().unwrap_or(15)
+                    } else {
+                        15
+                    }
+                });
+                Ok(FormatDescriptor::Double {
+                    width: repeat.unwrap_or(1) * width,
+                    decimals,
+                })
+            }
+            "G" => {
+                // General: Gw.d
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(12));
+                let decimals = embedded_decimals.unwrap_or_else(|| {
+                    if self.check(&TokenType::Dot) {
+                        self.advance();
+                        self.parse_format_width().unwrap_or(6)
+                    } else {
+                        6
+                    }
+                });
+                Ok(FormatDescriptor::General {
+                    width: repeat.unwrap_or(1) * width,
+                    decimals,
+                })
+            }
+            "A" => {
+                // Character: A[w] - width may be embedded (A10) or separate
+                let width = embedded_width.or_else(|| {
+                    if let TokenType::IntegerLiteral(_) = &self.peek().token_type {
+                        self.parse_format_width().ok()
+                    } else {
+                        None
+                    }
+                });
+                Ok(FormatDescriptor::String { width })
+            }
+            "L" => {
+                // Logical: Lw
+                let width = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(1));
+                Ok(FormatDescriptor::Logical { width })
+            }
+            "X" => {
+                // Skip: nX (repeat is the count, or embedded width)
+                Ok(FormatDescriptor::Skip(embedded_width.or(repeat).unwrap_or(1)))
+            }
+            "T" => {
+                // Tab to position: Tc
+                let pos = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(1));
+                Ok(FormatDescriptor::Tab(pos))
+            }
+            "TL" => {
+                // Tab left: TLn
+                let n = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(1));
+                Ok(FormatDescriptor::TabLeft(n))
+            }
+            "TR" => {
+                // Tab right: TRn
+                let n = embedded_width.unwrap_or_else(|| self.parse_format_width().unwrap_or(1));
+                Ok(FormatDescriptor::TabRight(n))
+            }
+            "SP" => Ok(FormatDescriptor::Sign(SignControl::Plus)),
+            "SS" => Ok(FormatDescriptor::Sign(SignControl::Suppress)),
+            "S" => Ok(FormatDescriptor::Sign(SignControl::Default)),
+            "BN" => Ok(FormatDescriptor::Blank(BlankControl::Null)),
+            "BZ" => Ok(FormatDescriptor::Blank(BlankControl::Zero)),
+            _ => Err(ParseError::UnexpectedToken {
+                expected: "valid format descriptor (I, F, E, D, G, A, L, X, T, etc.)".to_string(),
+                found: TokenType::Identifier(code.to_string()),
+                location,
+            }),
+        }
+    }
+
+    /// Split a format code like "I5", "F10", "A" into (code, optional_width, optional_decimals)
+    fn split_format_code<'a>(&self, s: &'a str) -> (&'a str, Option<usize>, Option<usize>) {
+        // Find the first digit position
+        if let Some(digit_pos) = s.find(|c: char| c.is_ascii_digit()) {
+            let code = &s[..digit_pos];
+            let rest = &s[digit_pos..];
+
+            // Check if there's a dot for decimals (e.g., "10.4")
+            if let Some(dot_pos) = rest.find('.') {
+                let width = rest[..dot_pos].parse::<usize>().ok();
+                let decimals = rest[dot_pos+1..].parse::<usize>().ok();
+                (code, width, decimals)
+            } else {
+                let width = rest.parse::<usize>().ok();
+                (code, width, None)
+            }
+        } else {
+            (s, None, None)
+        }
+    }
+
+    /// Parse a width/precision number for format descriptors
+    fn parse_format_width(&mut self) -> ParseResult<usize> {
+        if let TokenType::IntegerLiteral(n_str) = &self.peek().token_type {
+            let width = n_str.parse::<usize>().map_err(|_| ParseError::InvalidNumber {
+                value: n_str.clone(),
+                location: self.current_location(),
+            })?;
+            self.advance();
+            Ok(width)
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "integer width".to_string(),
                 found: self.peek().token_type.clone(),
                 location: self.current_location(),
             })
@@ -3285,6 +3667,14 @@ impl Parser {
         }
     }
 
+    fn previous(&self) -> &Token {
+        if self.position > 0 {
+            &self.tokens[self.position - 1]
+        } else {
+            &self.tokens[0]
+        }
+    }
+
     fn advance(&mut self) -> Token {
         if !self.is_at_end() {
             self.position += 1;
@@ -3307,14 +3697,19 @@ impl Parser {
         self.peek().location
     }
 
-    /// Check if we're at "ELSE IF" (two tokens)
+    /// Check if we're at "ELSE IF" (two tokens on the same line)
+    /// Note: ELSE on one line followed by IF on the next line is NOT ELSE IF,
+    /// but rather an else block containing a nested if statement.
     fn is_else_if(&self) -> bool {
         if !self.check(&TokenType::Else) {
             return false;
         }
-        // Peek ahead to see if next token is IF
+        // Peek ahead to see if next token is IF on the same line
         if self.position + 1 < self.tokens.len() {
-            matches!(self.tokens[self.position + 1].token_type, TokenType::If)
+            let else_token = &self.tokens[self.position];
+            let next_token = &self.tokens[self.position + 1];
+            matches!(next_token.token_type, TokenType::If)
+                && else_token.location.line == next_token.location.line
         } else {
             false
         }
@@ -3402,6 +3797,193 @@ impl Parser {
                 location: self.current_location(),
             }),
         }
+    }
+
+    // ========================================================================
+    // Error Recovery Methods
+    // ========================================================================
+
+    /// Synchronize the parser after an error by advancing to a recovery point.
+    /// Recovery points are:
+    /// - END statements
+    /// - PROGRAM, MODULE, SUBROUTINE, FUNCTION keywords
+    /// - Statement boundaries (after newlines at certain keywords)
+    fn synchronize(&mut self) {
+        self.advance();
+
+        while !self.is_at_end() {
+            // After END statements, we've likely recovered
+            match &self.previous().token_type {
+                TokenType::End => return,
+                _ => {}
+            }
+
+            // At the start of a new program unit or major statement
+            match &self.peek().token_type {
+                TokenType::Program
+                | TokenType::Module
+                | TokenType::Subroutine
+                | TokenType::Function
+                | TokenType::End
+                | TokenType::If
+                | TokenType::Do
+                | TokenType::Select
+                | TokenType::Integer
+                | TokenType::Real
+                | TokenType::Double
+                | TokenType::Complex
+                | TokenType::Character
+                | TokenType::Logical
+                | TokenType::Type
+                | TokenType::Class
+                | TokenType::Interface
+                | TokenType::Use
+                | TokenType::Implicit
+                | TokenType::Contains => return,
+                _ => {}
+            }
+
+            self.advance();
+        }
+    }
+
+    /// Parse a compilation unit with error recovery, collecting multiple errors.
+    /// Returns the AST (which may be partial) and all diagnostics found.
+    pub fn parse_compilation_unit_with_recovery(&mut self) -> (Option<CompilationUnit>, DiagnosticBag) {
+        let mut diagnostics = DiagnosticBag::new();
+        let mut modules = Vec::new();
+
+        // Parse any modules first
+        while self.check(&TokenType::Module) {
+            match self.parse_module() {
+                Ok(module) => modules.push(module),
+                Err(e) => {
+                    diagnostics.add(Diagnostic::from(&e));
+                    self.synchronize();
+                }
+            }
+        }
+
+        // Parse program if present
+        let program = if !self.is_at_end() {
+            match self.parse_program() {
+                Ok(prog) => Some(prog),
+                Err(e) => {
+                    diagnostics.add(Diagnostic::from(&e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let unit = if modules.is_empty() && program.is_none() {
+            None
+        } else {
+            Some(CompilationUnit { modules, program })
+        };
+
+        (unit, diagnostics)
+    }
+
+    /// Parse a program with error recovery for statements.
+    /// This allows collecting multiple errors within a single program.
+    pub fn parse_program_with_recovery(&mut self) -> (Option<Program>, DiagnosticBag) {
+        let mut diagnostics = DiagnosticBag::new();
+        let location = self.current_location();
+
+        // Optionally parse PROGRAM declaration
+        let name = if self.check(&TokenType::Program) {
+            self.advance();
+            match self.expect_identifier() {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    diagnostics.add(Diagnostic::from(&e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut uses = Vec::new();
+        let mut declarations = Vec::new();
+        let mut statements = Vec::new();
+        let mut procedures = Vec::new();
+
+        // Parse USE statements first
+        while self.check(&TokenType::Use) {
+            match self.parse_use_statement() {
+                Ok(use_stmt) => uses.push(use_stmt),
+                Err(e) => {
+                    diagnostics.add(Diagnostic::from(&e));
+                    self.synchronize();
+                }
+            }
+        }
+
+        // Parse declarations and statements until END, CONTAINS, or EOF
+        loop {
+            if self.is_at_end() {
+                break;
+            }
+
+            if self.check(&TokenType::Contains) {
+                self.advance();
+                // Parse internal procedures with recovery
+                match self.parse_procedures() {
+                    Ok(procs) => procedures = procs,
+                    Err(e) => {
+                        diagnostics.add(Diagnostic::from(&e));
+                    }
+                }
+                break;
+            }
+
+            if self.check(&TokenType::End) {
+                break;
+            }
+
+            if self.is_declaration_start() {
+                match self.parse_declaration() {
+                    Ok(decl) => declarations.push(decl),
+                    Err(e) => {
+                        diagnostics.add(Diagnostic::from(&e));
+                        self.synchronize();
+                    }
+                }
+            } else {
+                match self.parse_statement() {
+                    Ok(stmt) => statements.push(stmt),
+                    Err(e) => {
+                        diagnostics.add(Diagnostic::from(&e));
+                        self.synchronize();
+                    }
+                }
+            }
+        }
+
+        // Handle END PROGRAM
+        if self.check(&TokenType::End) {
+            self.advance();
+            if self.check(&TokenType::Program) {
+                self.advance();
+                if let TokenType::Identifier(_) = self.peek().token_type {
+                    self.advance();
+                }
+            }
+        }
+
+        let program = Program {
+            name,
+            uses,
+            declarations,
+            statements,
+            procedures,
+            location,
+        };
+
+        (Some(program), diagnostics)
     }
 }
 
@@ -3511,5 +4093,63 @@ mod tests {
         assert_eq!(program.name, Some("TEST".to_string()));
         assert_eq!(program.declarations.len(), 1);
         assert_eq!(program.statements.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_with_recovery_collects_errors() {
+        // Program with multiple errors - parser should recover and collect them
+        let source = r#"
+            program test
+              integer :: x
+              x = @@@  ! Error: unexpected characters
+              y = 5    ! No declaration for y (semantic error, not parser)
+            end program test
+        "#;
+
+        // Lexer will fail on @@@, so let's test with a syntax error instead
+        let source_with_parse_error = r#"
+            program test
+              integer :: x
+              x =
+              y = 5
+            end program test
+        "#;
+
+        let mut lexer = Lexer::new(source_with_parse_error);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let (result, diagnostics) = parser.parse_program_with_recovery();
+
+        // Should have parsed something and collected errors
+        assert!(result.is_some());
+        assert!(diagnostics.has_errors());
+        assert!(diagnostics.error_count() >= 1);
+    }
+
+    #[test]
+    fn test_parse_compilation_unit_with_recovery() {
+        let source = r#"
+            module my_mod
+              integer :: mod_var
+            end module
+
+            program test
+              integer :: x
+              x = 5
+            end program test
+        "#;
+
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let (result, diagnostics) = parser.parse_compilation_unit_with_recovery();
+
+        // Should parse without errors
+        assert!(result.is_some());
+        assert!(!diagnostics.has_errors());
+
+        let unit = result.unwrap();
+        assert_eq!(unit.modules.len(), 1);
+        assert!(unit.program.is_some());
     }
 }

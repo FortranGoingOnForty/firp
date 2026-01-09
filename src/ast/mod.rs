@@ -107,6 +107,8 @@ pub struct TypeComponent {
     pub array_spec: Option<ArraySpec>,
     /// Default initialization value
     pub init: Option<Expr>,
+    /// Visibility (PUBLIC or PRIVATE)
+    pub visibility: Option<Visibility>,
     pub location: SourceLocation,
 }
 
@@ -408,7 +410,8 @@ pub enum Statement {
     },
     /// PRINT statement
     Print {
-        format: Option<String>,
+        /// Format specification (ListDirected, String, or Label)
+        format: FormatSpec,
         values: Vec<Expr>,
         location: SourceLocation,
     },
@@ -618,6 +621,15 @@ pub enum Statement {
         body: Vec<Statement>,
         location: SourceLocation,
     },
+
+    /// FORMAT statement: label FORMAT(descriptors)
+    Format {
+        /// Statement label (required for FORMAT)
+        label: i64,
+        /// Parsed format descriptors
+        descriptors: Vec<FormatDescriptor>,
+        location: SourceLocation,
+    },
 }
 
 /// FORALL index specification
@@ -638,6 +650,65 @@ pub enum FormatSpec {
     String(String),
     /// Label reference to FORMAT statement
     Label(i64),
+}
+
+/// Individual format descriptor for FORMAT statements
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormatDescriptor {
+    /// Integer: Iw[.m] - width, optional minimum digits
+    Integer { width: usize, min_digits: Option<usize> },
+    /// Real: Fw.d - width, decimal places
+    Float { width: usize, decimals: usize },
+    /// Exponential: Ew.d[Ee] - width, decimals, optional exponent width
+    Exponential { width: usize, decimals: usize, exp_width: Option<usize> },
+    /// Double precision exponential: Dw.d
+    Double { width: usize, decimals: usize },
+    /// Character/String: A[w] - optional width
+    String { width: Option<usize> },
+    /// Logical: Lw - width
+    Logical { width: usize },
+    /// General: Gw.d - width, decimals
+    General { width: usize, decimals: usize },
+    /// Skip spaces: nX
+    Skip(usize),
+    /// Newline: /
+    Newline,
+    /// Tab to position: Tc
+    Tab(usize),
+    /// Tab right: TRn
+    TabRight(usize),
+    /// Tab left: TLn
+    TabLeft(usize),
+    /// Literal string: 'text' or "text"
+    Literal(std::string::String),
+    /// Repeat group: n(...)
+    Group { repeat: usize, items: Vec<FormatDescriptor> },
+    /// Colon - stop if no more items
+    Colon,
+    /// Sign control: SP, SS, S
+    Sign(SignControl),
+    /// Blank interpretation: BN, BZ
+    Blank(BlankControl),
+}
+
+/// Sign control for format descriptors
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignControl {
+    /// SP - always print sign
+    Plus,
+    /// SS - suppress plus sign
+    Suppress,
+    /// S - processor default
+    Default,
+}
+
+/// Blank interpretation for format descriptors
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlankControl {
+    /// BN - blanks are null (ignored)
+    Null,
+    /// BZ - blanks are zeros
+    Zero,
 }
 
 /// Case clause for SELECT CASE
@@ -925,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_expr_location() {
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
         let expr = Expr::IntegerLiteral(42, loc);
         assert_eq!(expr.location(), &loc);
     }

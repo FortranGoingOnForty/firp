@@ -2,9 +2,10 @@
 
 pub mod token;
 
-pub use token::{Token, TokenType, SourceLocation};
+pub use token::{Token, TokenType, SourceLocation, Span};
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Lexer error types
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +42,13 @@ pub type LexerResult<T> = Result<T, LexerError>;
 /// The Lexer tokenizes Fortran source code
 pub struct Lexer {
     source: Vec<char>,
+    /// Original source text for error display
+    source_text: Arc<str>,
+    /// Source file name
+    filename: Option<Arc<str>>,
     position: usize,
+    /// Byte offset from start of source
+    byte_offset: usize,
     line: usize,
     column: usize,
 }
@@ -51,10 +58,36 @@ impl Lexer {
     pub fn new(source: &str) -> Self {
         Self {
             source: source.chars().collect(),
+            source_text: Arc::from(source),
+            filename: None,
             position: 0,
+            byte_offset: 0,
             line: 1,
             column: 1,
         }
+    }
+
+    /// Create a new lexer with a filename for better error messages
+    pub fn with_filename(source: &str, filename: &str) -> Self {
+        Self {
+            source: source.chars().collect(),
+            source_text: Arc::from(source),
+            filename: Some(Arc::from(filename)),
+            position: 0,
+            byte_offset: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    /// Get the original source text
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
+    /// Get the filename if set
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_ref().map(|f| f.as_ref())
     }
 
     /// Tokenize the entire source code
@@ -117,6 +150,7 @@ impl Lexer {
     fn advance(&mut self) -> char {
         let ch = self.current_char();
         self.position += 1;
+        self.byte_offset += ch.len_utf8();
         if ch == '\n' {
             self.line += 1;
             self.column = 1;
@@ -135,6 +169,11 @@ impl Lexer {
             line: self.line,
             column: self.column,
         }
+    }
+
+    /// Get current byte offset (for span creation)
+    pub fn current_offset(&self) -> usize {
+        self.byte_offset
     }
 
     fn skip_whitespace_and_comments(&mut self) {
