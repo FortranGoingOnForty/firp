@@ -35,6 +35,8 @@ pub struct Repl {
     accumulated_decls: Vec<String>,
     /// Accumulated statements for persistent state
     accumulated_stmts: Vec<String>,
+    /// Accumulated procedure definitions (functions/subroutines) for CONTAINS section
+    accumulated_procs: Vec<String>,
     /// Previous output line count (to show only new output)
     prev_output_count: usize,
     /// Source map for diagnostic rendering
@@ -62,6 +64,7 @@ impl Repl {
             in_multiline: false,
             accumulated_decls: Vec::new(),
             accumulated_stmts: Vec::new(),
+            accumulated_procs: Vec::new(),
             prev_output_count: 0,
             source_map: SourceMap::new(),
             input_counter: 0,
@@ -284,6 +287,7 @@ impl Repl {
         self.vm = VM::new();
         self.accumulated_decls.clear();
         self.accumulated_stmts.clear();
+        self.accumulated_procs.clear();
         self.prev_output_count = 0;
     }
 
@@ -296,6 +300,7 @@ impl Repl {
         self.in_multiline = false;
         self.accumulated_decls.clear();
         self.accumulated_stmts.clear();
+        self.accumulated_procs.clear();
         self.prev_output_count = 0;
     }
 
@@ -354,42 +359,55 @@ impl Repl {
                 continue;
             }
 
-            // Block openers
-            if line.starts_with("PROGRAM ") || line == "PROGRAM" {
-                depth += 1;
-            } else if line.starts_with("SUBROUTINE ") {
-                depth += 1;
-            } else if line.starts_with("FUNCTION ") || line.contains(" FUNCTION ") {
-                depth += 1;
-            } else if line.starts_with("MODULE ") && !line.starts_with("MODULE PROCEDURE") {
-                depth += 1;
-            } else if line.starts_with("IF ") && line.contains(" THEN") {
-                depth += 1;
-            } else if line.starts_with("DO ") || line == "DO" {
-                depth += 1;
-            } else if line.starts_with("SELECT ") {
-                depth += 1;
-            } else if line.starts_with("TYPE ") && line.contains("::") && !line.contains("TYPE(") {
-                // TYPE definition, not TYPE(name) declaration
-                depth += 1;
+            // Block openers - must NOT start with "END" to avoid matching closers
+            if !line.starts_with("END") && !line.starts_with("END ") {
+                if line.starts_with("PROGRAM ") || line == "PROGRAM" {
+                    depth += 1;
+                } else if line.starts_with("SUBROUTINE ") || line.contains(" SUBROUTINE ") {
+                    depth += 1;
+                } else if line.starts_with("FUNCTION ") || line.contains(" FUNCTION ") {
+                    depth += 1;
+                } else if line.starts_with("MODULE ") && !line.starts_with("MODULE PROCEDURE") {
+                    depth += 1;
+                } else if line.starts_with("IF ") && line.contains(" THEN") {
+                    depth += 1;
+                } else if (line.starts_with("DO ") || line == "DO") && !line.starts_with("DO WHILE") {
+                    depth += 1;
+                } else if line.starts_with("DO WHILE") {
+                    depth += 1;
+                } else if line.starts_with("SELECT ") {
+                    depth += 1;
+                } else if line.starts_with("TYPE ") && !line.starts_with("TYPE(") && !line.starts_with("TYPE ::") {
+                    // TYPE definition block (TYPE :: name or TYPE, ... :: name), not TYPE(x) declaration
+                    if line.contains("::") {
+                        // TYPE, EXTENDS(...) :: name - not a block opener, it's a variable declaration
+                    } else {
+                        // TYPE name - block opener
+                        depth += 1;
+                    }
+                } else if line == "TYPE" {
+                    depth += 1;
+                }
             }
 
-            // Block closers
-            if line.starts_with("END PROGRAM") || line == "END" && depth == 1 {
+            // Block closers - check these AFTER openers since a line can't be both
+            // But we need to check closers even if opener matched for lines like "END FUNCTION"
+            // which don't match openers anyway
+            if line.starts_with("END PROGRAM") || (line == "END" && depth == 1) {
                 depth -= 1;
-            } else if line.starts_with("END SUBROUTINE") {
+            } else if line.starts_with("END SUBROUTINE") || line == "ENDSUBROUTINE" {
                 depth -= 1;
-            } else if line.starts_with("END FUNCTION") {
+            } else if line.starts_with("END FUNCTION") || line == "ENDFUNCTION" {
                 depth -= 1;
-            } else if line.starts_with("END MODULE") {
+            } else if line.starts_with("END MODULE") || line == "ENDMODULE" {
                 depth -= 1;
             } else if line.starts_with("END IF") || line == "ENDIF" {
                 depth -= 1;
             } else if line.starts_with("END DO") || line == "ENDDO" {
                 depth -= 1;
-            } else if line.starts_with("END SELECT") {
+            } else if line.starts_with("END SELECT") || line == "ENDSELECT" {
                 depth -= 1;
-            } else if line.starts_with("END TYPE") {
+            } else if line.starts_with("END TYPE") || line == "ENDTYPE" {
                 depth -= 1;
             }
         }
@@ -487,13 +505,37 @@ impl Repl {
         true
     }
 
-    /// Check if input is a full program unit
+    /// Check if input is a full program unit (PROGRAM or MODULE)
     fn is_program_unit(&self, input: &str) -> bool {
         let upper = input.to_uppercase();
-        upper.contains("PROGRAM ") && upper.contains("END PROGRAM")
-            || upper.contains("MODULE ") && upper.contains("END MODULE")
-            || upper.contains("SUBROUTINE ") && upper.contains("END SUBROUTINE")
-            || upper.contains("FUNCTION ") && upper.contains("END FUNCTION")
+        (upper.contains("PROGRAM ") && upper.contains("END PROGRAM"))
+            || (upper.contains("MODULE ") && upper.contains("END MODULE"))
+    }
+
+    /// Check if input is a complete procedure definition (FUNCTION or SUBROUTINE)
+    fn is_procedure_definition(&self, input: &str) -> bool {
+        let upper = input.to_uppercase();
+        let first_line = upper.lines().next().unwrap_or("").trim();
+
+        // Check if it starts with a procedure definition keyword
+        let starts_with_proc = first_line.starts_with("FUNCTION ")
+            || first_line.starts_with("SUBROUTINE ")
+            || first_line.contains(" FUNCTION ")  // RECURSIVE FUNCTION, PURE FUNCTION, etc.
+            || first_line.contains(" SUBROUTINE ") // RECURSIVE SUBROUTINE, etc.
+            || first_line.starts_with("RECURSIVE FUNCTION")
+            || first_line.starts_with("RECURSIVE SUBROUTINE")
+            || first_line.starts_with("PURE FUNCTION")
+            || first_line.starts_with("PURE SUBROUTINE")
+            || first_line.starts_with("ELEMENTAL FUNCTION")
+            || first_line.starts_with("ELEMENTAL SUBROUTINE");
+
+        if !starts_with_proc {
+            return false;
+        }
+
+        // Check if it has a matching END
+        (upper.contains("FUNCTION ") && upper.contains("END FUNCTION"))
+            || (upper.contains("SUBROUTINE ") && upper.contains("END SUBROUTINE"))
     }
 
     /// Build a complete program from accumulated state plus new input
@@ -526,6 +568,20 @@ impl Repl {
             program.push_str("  ");
             program.push_str(new_input.trim());
             program.push('\n');
+        }
+
+        // Add CONTAINS section with accumulated procedures
+        if !self.accumulated_procs.is_empty() {
+            program.push_str("\nCONTAINS\n\n");
+            for proc in &self.accumulated_procs {
+                // Indent each line of the procedure
+                for line in proc.lines() {
+                    program.push_str("  ");
+                    program.push_str(line);
+                    program.push('\n');
+                }
+                program.push('\n');
+            }
         }
 
         program.push_str("END PROGRAM _repl_\n");
@@ -597,6 +653,62 @@ impl Repl {
                 }
                 Err(_) => {
                     // Diagnostic already emitted by compile_program_source
+                }
+            }
+            return;
+        }
+
+        // Check if this is a procedure definition (FUNCTION or SUBROUTINE)
+        if self.is_procedure_definition(input) {
+            // Validate by trying to compile with this procedure
+            let mut test_procs = self.accumulated_procs.clone();
+            test_procs.push(trimmed.to_string());
+
+            // Build a test program with this procedure
+            let mut test_program = String::from("PROGRAM _repl_\n  IMPLICIT NONE\n");
+            for decl in &self.accumulated_decls {
+                test_program.push_str("  ");
+                test_program.push_str(decl);
+                test_program.push('\n');
+            }
+            test_program.push_str("\nCONTAINS\n\n");
+            for proc in &test_procs {
+                for line in proc.lines() {
+                    test_program.push_str("  ");
+                    test_program.push_str(line);
+                    test_program.push('\n');
+                }
+                test_program.push('\n');
+            }
+            test_program.push_str("END PROGRAM _repl_\n");
+
+            // Try to compile - if successful, store the procedure
+            match self.compile_program_source(&test_program) {
+                Ok(_) => {
+                    // Extract procedure name for feedback
+                    let first_line = trimmed.lines().next().unwrap_or("");
+                    let proc_type = if first_line.to_uppercase().contains("FUNCTION") {
+                        "Function"
+                    } else {
+                        "Subroutine"
+                    };
+                    // Extract name (rough heuristic)
+                    let upper = first_line.to_uppercase();
+                    let name = if let Some(pos) = upper.find("FUNCTION ") {
+                        let after = &first_line[pos + 9..];
+                        after.split(&['(', ' '][..]).next().unwrap_or("?")
+                    } else if let Some(pos) = upper.find("SUBROUTINE ") {
+                        let after = &first_line[pos + 11..];
+                        after.split(&['(', ' '][..]).next().unwrap_or("?")
+                    } else {
+                        "?"
+                    };
+
+                    self.accumulated_procs.push(trimmed.to_string());
+                    println!("{} '{}' defined.", proc_type, name.trim());
+                }
+                Err(_) => {
+                    // Diagnostic already emitted
                 }
             }
             return;
