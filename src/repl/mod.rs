@@ -1,13 +1,16 @@
 //! REPL (Read-Eval-Print-Loop) for interactive Fortran execution
 
 use crate::bytecode::{Chunk, Compiler, Value};
+use crate::diagnostic::{DiagnosticRenderer, Diagnostic, SourceMap, RenderStyle};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
+use crate::profiler::{ProfilerDebugger, ProfileReport, ProfileData};
 use crate::vm::VM;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{DefaultEditor, Editor};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HISTORY_FILE: &str = ".firp_history";
@@ -34,6 +37,14 @@ pub struct Repl {
     accumulated_stmts: Vec<String>,
     /// Previous output line count (to show only new output)
     prev_output_count: usize,
+    /// Source map for diagnostic rendering
+    source_map: SourceMap,
+    /// Input counter for unique file names
+    input_counter: usize,
+    /// Whether profiling is enabled
+    profiling_enabled: bool,
+    /// Shared profile data (persists across executions)
+    profile_data: Arc<Mutex<ProfileData>>,
 }
 
 impl Repl {
@@ -52,7 +63,26 @@ impl Repl {
             accumulated_decls: Vec::new(),
             accumulated_stmts: Vec::new(),
             prev_output_count: 0,
+            source_map: SourceMap::new(),
+            input_counter: 0,
+            profiling_enabled: false,
+            profile_data: Arc::new(Mutex::new(ProfileData::default())),
         })
+    }
+
+    /// Emit a diagnostic with rich formatting
+    fn emit_diagnostic(&mut self, diag: Diagnostic, source: &str) {
+        // Register source in the map with a unique input name
+        self.input_counter += 1;
+        let file_name = format!("<input:{}>", self.input_counter);
+        self.source_map.add_file(&file_name, source);
+
+        // Create renderer and emit diagnostic
+        let renderer = DiagnosticRenderer::new(Arc::new(self.source_map.clone()))
+            .with_color(true)
+            .with_style(RenderStyle::Rich);
+
+        let _ = renderer.emit(&diag);
     }
 
     /// Run the REPL main loop
@@ -191,6 +221,16 @@ impl Repl {
                     self.show_type(args);
                 }
             }
+            ":profile" => {
+                self.handle_profile_command(args);
+            }
+            ":bench" => {
+                if args.is_empty() {
+                    println!("Usage: :bench <expression> [count]");
+                } else {
+                    self.benchmark(args);
+                }
+            }
             _ => {
                 println!("Unknown command: {}. Type :help for available commands.", cmd);
             }
@@ -209,6 +249,13 @@ impl Repl {
         println!("  :load <file>      Load and execute a Fortran file");
         println!("  :bytecode [stmt]  Toggle bytecode display or show bytecode for statement");
         println!("  :type <expr>      Show the type of an expression");
+        println!();
+        println!("Profiling Commands:");
+        println!("  :profile on       Enable profiling");
+        println!("  :profile off      Disable profiling");
+        println!("  :profile show     Show current profile");
+        println!("  :profile clear    Clear profile data");
+        println!("  :bench <expr> [n] Run expression n times (default 100) and report timing");
         println!();
         println!("Enter Fortran statements or expressions directly.");
         println!("Multi-line input is supported - continue typing until the statement is complete.");
@@ -369,6 +416,77 @@ impl Repl {
             || upper.starts_with("PARAMETER")
     }
 
+    /// Check if input looks like a bare expression that should be auto-printed
+    /// Returns true for expressions like: 2+3, sqrt(16.0), x, arr(1)
+    /// Returns false for statements like: x=5, print *, call sub(), if/do/etc.
+    fn is_bare_expression(&self, input: &str) -> bool {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let upper = trimmed.to_uppercase();
+
+        // Not an expression if it's a declaration
+        if self.is_declaration(trimmed) {
+            return false;
+        }
+
+        // Not an expression if it's a known statement keyword
+        if upper.starts_with("PRINT ")
+            || upper.starts_with("PRINT*")
+            || upper.starts_with("WRITE ")
+            || upper.starts_with("WRITE(")
+            || upper.starts_with("READ ")
+            || upper.starts_with("READ(")
+            || upper.starts_with("CALL ")
+            || upper.starts_with("IF ")
+            || upper.starts_with("IF(")
+            || upper.starts_with("DO ")
+            || upper == "DO"
+            || upper.starts_with("SELECT ")
+            || upper.starts_with("RETURN")
+            || upper.starts_with("STOP")
+            || upper.starts_with("EXIT")
+            || upper.starts_with("CYCLE")
+            || upper.starts_with("GOTO ")
+            || upper.starts_with("GO TO ")
+            || upper.starts_with("ALLOCATE")
+            || upper.starts_with("DEALLOCATE")
+            || upper.starts_with("OPEN")
+            || upper.starts_with("CLOSE")
+            || upper.starts_with("CONTAINS")
+            || upper.starts_with("END ")
+            || upper == "END"
+        {
+            return false;
+        }
+
+        // Check if it looks like an assignment (has = but not == or /= or <= or >=)
+        // This is tricky because x=5 is assignment but x==5 is comparison expression
+        if let Some(eq_pos) = trimmed.find('=') {
+            // Check what's before and after the =
+            let before = &trimmed[..eq_pos];
+            let after = if eq_pos + 1 < trimmed.len() { &trimmed[eq_pos + 1..eq_pos + 2] } else { "" };
+            let prev_char = if eq_pos > 0 { &trimmed[eq_pos - 1..eq_pos] } else { "" };
+
+            // It's a comparison if: ==, /=, <=, >=, =>
+            let is_comparison = after == "=" || prev_char == "/" || prev_char == "<" || prev_char == ">" || after == ">";
+
+            if !is_comparison {
+                // Looks like assignment: identifier = value
+                // Check if before the = is a valid lvalue (identifier or array element)
+                let lhs = before.trim();
+                if !lhs.is_empty() && (lhs.chars().next().unwrap().is_alphabetic() || lhs.ends_with(')')) {
+                    return false; // It's an assignment
+                }
+            }
+        }
+
+        // If we get here, it's likely an expression
+        true
+    }
+
     /// Check if input is a full program unit
     fn is_program_unit(&self, input: &str) -> bool {
         let upper = input.to_uppercase();
@@ -414,20 +532,38 @@ impl Repl {
         program
     }
 
-    /// Compile input to bytecode
+    /// Compile input to bytecode with rich diagnostic display
     fn compile_program_source(&mut self, source: &str) -> Result<Chunk, String> {
         let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize().map_err(|e| format!("Lexer error: {}", e))?;
+        let tokens = match lexer.tokenize() {
+            Ok(t) => t,
+            Err(e) => {
+                self.emit_diagnostic(e.clone().into(), source);
+                return Err(format!("Lexer error: {}", e));
+            }
+        };
 
         if tokens.is_empty() {
             return Err("Empty input".to_string());
         }
 
         let mut parser = Parser::new(tokens);
-        let program = parser.parse_program().map_err(|e| format!("Parse error: {}", e))?;
+        let program = match parser.parse_program() {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit_diagnostic(e.clone().into(), source);
+                return Err(format!("Parse error: {}", e));
+            }
+        };
 
         let mut compiler = Compiler::new();
-        compiler.compile(&program).map_err(|e| format!("Compile error: {}", e))
+        match compiler.compile(&program) {
+            Ok(chunk) => Ok(chunk),
+            Err(e) => {
+                self.emit_diagnostic(e.clone().into(), source);
+                Err(format!("Compile error: {}", e))
+            }
+        }
     }
 
     /// Execute input and print results
@@ -454,19 +590,30 @@ impl Repl {
                                 println!("{}", line);
                             }
                         }
-                        Err(e) => println!("Runtime error: {}", e),
+                        Err(e) => {
+                            self.emit_diagnostic(e.into(), input);
+                        }
                     }
                 }
-                Err(e) => println!("Error: {}", e),
+                Err(_) => {
+                    // Diagnostic already emitted by compile_program_source
+                }
             }
             return;
         }
 
+        // Check if this looks like a bare expression - auto-wrap with print
+        let (actual_input, is_auto_print) = if self.is_bare_expression(trimmed) {
+            (format!("print *, {}", trimmed), true)
+        } else {
+            (trimmed.to_string(), false)
+        };
+
         // Determine if this is a declaration or statement
-        let is_decl = self.is_declaration(trimmed);
+        let is_decl = self.is_declaration(&actual_input);
 
         // Build program with accumulated state plus new input
-        let source = self.build_program(trimmed, is_decl);
+        let source = self.build_program(&actual_input, is_decl);
 
         // Try to compile
         match self.compile_program_source(&source) {
@@ -487,23 +634,142 @@ impl Repl {
                             println!("{}", line);
                         }
 
-                        // Update state on success
-                        if is_decl {
-                            self.accumulated_decls.push(trimmed.to_string());
-                        } else {
-                            self.accumulated_stmts.push(trimmed.to_string());
+                        // Update state on success (but don't accumulate auto-print expressions)
+                        if !is_auto_print {
+                            if is_decl {
+                                self.accumulated_decls.push(actual_input.clone());
+                            } else {
+                                self.accumulated_stmts.push(actual_input.clone());
+                            }
                         }
                         self.prev_output_count = output.len();
                     }
                     Err(e) => {
-                        println!("Runtime error: {}", e);
+                        self.emit_diagnostic(e.into(), &source);
                     }
                 }
             }
-            Err(e) => {
-                println!("Error: {}", e);
+            Err(_) => {
+                // Diagnostic already emitted by compile_program_source
             }
         }
+    }
+
+    /// Handle :profile command
+    fn handle_profile_command(&mut self, args: &str) {
+        match args.to_lowercase().as_str() {
+            "on" => {
+                self.profiling_enabled = true;
+                // Reset profile data when enabling
+                if let Ok(mut data) = self.profile_data.lock() {
+                    *data = ProfileData::default();
+                }
+                println!("Profiling enabled.");
+            }
+            "off" => {
+                self.profiling_enabled = false;
+                // Remove debugger from VM
+                self.vm.set_debugger(None);
+                println!("Profiling disabled.");
+            }
+            "show" => {
+                if let Ok(data) = self.profile_data.lock() {
+                    let report = ProfileReport::new(&data);
+                    print!("{}", report.to_text());
+                }
+            }
+            "clear" => {
+                if let Ok(mut data) = self.profile_data.lock() {
+                    *data = ProfileData::default();
+                }
+                println!("Profile data cleared.");
+            }
+            "" => {
+                println!("Usage: :profile on|off|show|clear");
+                println!("  on    - Enable profiling");
+                println!("  off   - Disable profiling");
+                println!("  show  - Show current profile");
+                println!("  clear - Clear profile data");
+            }
+            _ => {
+                println!("Unknown profile command: {}", args);
+                println!("Usage: :profile on|off|show|clear");
+            }
+        }
+    }
+
+    /// Benchmark an expression
+    fn benchmark(&mut self, args: &str) {
+        use std::time::Instant;
+
+        // Parse arguments: expression [count]
+        let parts: Vec<&str> = args.rsplitn(2, ' ').collect();
+        let (expr, count) = if parts.len() == 2 {
+            // Check if the last part is a number
+            if let Ok(n) = parts[0].parse::<usize>() {
+                (parts[1].trim(), n)
+            } else {
+                (args, 100) // Default count
+            }
+        } else {
+            (args, 100)
+        };
+
+        if count == 0 {
+            println!("Count must be greater than 0");
+            return;
+        }
+
+        // Wrap expression in a minimal program
+        let source = format!(
+            "PROGRAM bench\nIMPLICIT NONE\nINTEGER :: bench_i\nDO bench_i = 1, {}\n{}\nEND DO\nEND PROGRAM",
+            count, expr
+        );
+
+        // Compile
+        let mut lexer = Lexer::new(&source);
+        let tokens = match lexer.tokenize() {
+            Ok(t) => t,
+            Err(e) => {
+                println!("Parse error: {}", e);
+                return;
+            }
+        };
+
+        let mut parser = Parser::new(tokens);
+        let program = match parser.parse_program() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("Parse error: {}", e);
+                return;
+            }
+        };
+
+        let mut compiler = Compiler::new();
+        let chunk = match compiler.compile(&program) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("Compile error: {}", e);
+                return;
+            }
+        };
+
+        // Run and time
+        let mut vm = VM::new();
+        let start = Instant::now();
+
+        if let Err(e) = vm.run(chunk) {
+            println!("Runtime error: {}", e);
+            return;
+        }
+
+        let elapsed = start.elapsed();
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let avg_us = (elapsed.as_nanos() as f64 / count as f64) / 1000.0;
+
+        println!("Benchmark: {} iterations", count);
+        println!("  Total time: {:.3}ms", total_ms);
+        println!("  Average:    {:.3}us per iteration", avg_us);
     }
 }
 
