@@ -88,6 +88,8 @@ pub enum OpCode {
     // I/O operations
     /// Print values to stdout (operand = count of values)
     Print,
+    /// Print values with format (operand = format label, count on stack)
+    PrintFormatted,
     /// Read value from stdin into variable (operand = variable index)
     Read,
     /// Open a file (operand = unit number, expects filename on stack)
@@ -104,6 +106,14 @@ pub enum OpCode {
     Halt,
     /// No operation
     Nop,
+
+    // Loop profiling markers (no-op for execution, used by profiler)
+    /// Mark start of a loop (operand = source line for identification)
+    LoopStart,
+    /// Mark end of a loop iteration (operand = source line)
+    LoopIteration,
+    /// Mark end of a loop (operand = source line)
+    LoopEnd,
 
     // Subroutine/function operations
     /// Call a subroutine/function (operand = procedure index)
@@ -140,6 +150,30 @@ pub enum OpCode {
     LoadComponent,
     /// Store value to component (operand = component index, expects value and instance on stack)
     StoreComponent,
+
+    // DO CONCURRENT operations
+    /// Start of DO CONCURRENT loop (operand = loop config index)
+    /// Stack contains: [var_index, start, end, step, body_len]
+    DoConcurrentStart,
+    /// End of DO CONCURRENT loop body
+    DoConcurrentEnd,
+}
+
+/// DO CONCURRENT loop configuration for parallel execution
+#[derive(Debug, Clone)]
+pub struct DoConcurrentConfig {
+    /// Index of loop variable
+    pub var_index: usize,
+    /// Start value
+    pub start: i64,
+    /// End value
+    pub end: i64,
+    /// Step value
+    pub step: i64,
+    /// Body start offset in bytecode
+    pub body_start: usize,
+    /// Body end offset in bytecode
+    pub body_end: usize,
 }
 
 /// Intrinsic functions available in Fortran
@@ -630,6 +664,7 @@ impl fmt::Display for OpCode {
             OpCode::Pop => write!(f, "Pop"),
             OpCode::Dup => write!(f, "Dup"),
             OpCode::Print => write!(f, "Print"),
+            OpCode::PrintFormatted => write!(f, "PrintFormatted"),
             OpCode::Read => write!(f, "Read"),
             OpCode::OpenFile => write!(f, "OpenFile"),
             OpCode::CloseFile => write!(f, "CloseFile"),
@@ -637,6 +672,9 @@ impl fmt::Display for OpCode {
             OpCode::ReadFile => write!(f, "ReadFile"),
             OpCode::Halt => write!(f, "Halt"),
             OpCode::Nop => write!(f, "Nop"),
+            OpCode::LoopStart => write!(f, "LoopStart"),
+            OpCode::LoopIteration => write!(f, "LoopIteration"),
+            OpCode::LoopEnd => write!(f, "LoopEnd"),
             OpCode::Call => write!(f, "Call"),
             OpCode::Return => write!(f, "Return"),
             OpCode::MethodCall => write!(f, "MethodCall"),
@@ -649,6 +687,8 @@ impl fmt::Display for OpCode {
             OpCode::CreateInstance => write!(f, "CreateInstance"),
             OpCode::LoadComponent => write!(f, "LoadComponent"),
             OpCode::StoreComponent => write!(f, "StoreComponent"),
+            OpCode::DoConcurrentStart => write!(f, "DoConcurrentStart"),
+            OpCode::DoConcurrentEnd => write!(f, "DoConcurrentEnd"),
         }
     }
 }
@@ -679,6 +719,8 @@ pub struct RuntimeTypeDef {
     pub components: Vec<String>,
     /// Default values for each component (None if no default)
     pub defaults: Vec<Option<Value>>,
+    /// Visibility of each component (Public by default)
+    pub component_visibility: Vec<Visibility>,
     /// Index of parent type (for EXTENDS inheritance)
     pub parent_type: Option<usize>,
     /// Type-bound procedures: binding_name -> procedure_name
@@ -691,6 +733,7 @@ impl RuntimeTypeDef {
             name,
             components: Vec::new(),
             defaults: Vec::new(),
+            component_visibility: Vec::new(),
             parent_type: None,
             procedures: HashMap::new(),
         }
@@ -702,14 +745,16 @@ impl RuntimeTypeDef {
             name,
             components: Vec::new(),
             defaults: Vec::new(),
+            component_visibility: Vec::new(),
             parent_type: Some(parent_idx),
             procedures: HashMap::new(),
         }
     }
 
-    pub fn add_component(&mut self, name: String, default: Option<Value>) {
+    pub fn add_component(&mut self, name: String, default: Option<Value>, visibility: Visibility) {
         self.components.push(name);
         self.defaults.push(default);
+        self.component_visibility.push(visibility);
     }
 
     /// Add a type-bound procedure binding
@@ -983,6 +1028,17 @@ impl ConstantPool {
     }
 }
 
+/// Procedure signature for type-based generic interface resolution
+#[derive(Debug, Clone, Default)]
+pub struct ProcedureSignature {
+    /// Parameter count
+    pub param_count: usize,
+    /// Parameter types (simplified: "INTEGER", "REAL", "CHARACTER", "LOGICAL", "DERIVED:name")
+    pub param_types: Vec<String>,
+    /// Return type (for functions, None for subroutines)
+    pub return_type: Option<String>,
+}
+
 /// A chunk of bytecode with its constant pool
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
@@ -991,6 +1047,8 @@ pub struct Chunk {
     pub variables: Vec<String>, // Variable names by index
     /// Procedure entry points (name -> instruction address)
     pub procedures: HashMap<String, usize>,
+    /// Procedure signatures for type-based resolution
+    pub procedure_signatures: HashMap<String, ProcedureSignature>,
     /// Derived type definitions
     pub types: Vec<RuntimeTypeDef>,
     /// Type name to index mapping
@@ -1001,6 +1059,16 @@ pub struct Chunk {
     pub assignment_interfaces: Vec<String>,
     /// Generic interfaces (generic name -> list of procedure names)
     pub generic_interfaces: HashMap<String, Vec<String>>,
+    /// FORMAT statement definitions (label -> descriptors)
+    pub formats: HashMap<i64, Vec<FormatDescriptor>>,
+    /// Reverse mapping: instruction address -> procedure name (for profiling)
+    pub procedure_names: HashMap<usize, String>,
+    /// Procedure local variable ranges: address -> (first_local_index, local_count)
+    /// Used for proper recursive call frame management
+    pub procedure_locals: HashMap<usize, (usize, usize)>,
+    /// Procedure end addresses: entry_address -> end_address (exclusive)
+    /// Used for JIT compilation to determine bytecode range
+    pub procedure_ends: HashMap<usize, usize>,
 }
 
 impl Chunk {
@@ -1044,9 +1112,20 @@ impl Chunk {
         index
     }
 
+    /// Add a local variable (always allocates a new slot, even if name exists)
+    /// Used for procedure parameters and local variables that may shadow outer names
+    pub fn add_local_variable(&mut self, name: String) -> usize {
+        let index = self.variables.len();
+        self.variables.push(name);
+        index
+    }
+
     /// Get variable index by name
+    /// Returns the last (most recently added) matching variable for proper shadowing
     pub fn get_variable_index(&self, name: &str) -> Option<usize> {
-        self.variables.iter().position(|v| v == name)
+        // Search from the end to find the most recently added variable with this name
+        // This ensures local variables shadow outer variables with the same name
+        self.variables.iter().rposition(|v| v == name)
     }
 
     /// Check if a variable has been declared
@@ -1056,12 +1135,28 @@ impl Chunk {
 
     /// Register a procedure entry point
     pub fn add_procedure(&mut self, name: String, address: usize) {
-        self.procedures.insert(name, address);
+        self.procedures.insert(name.clone(), address);
+        self.procedure_names.insert(address, name);
     }
 
     /// Get procedure entry address by name
     pub fn get_procedure_address(&self, name: &str) -> Option<usize> {
         self.procedures.get(name).copied()
+    }
+
+    /// Get procedure name by entry address (for profiling)
+    pub fn get_procedure_name(&self, address: usize) -> Option<&str> {
+        self.procedure_names.get(&address).map(|s| s.as_str())
+    }
+
+    /// Register a procedure signature
+    pub fn register_procedure_signature(&mut self, name: String, signature: ProcedureSignature) {
+        self.procedure_signatures.insert(name, signature);
+    }
+
+    /// Get a procedure signature
+    pub fn get_procedure_signature(&self, name: &str) -> Option<&ProcedureSignature> {
+        self.procedure_signatures.get(name)
     }
 
     /// Register a derived type definition
@@ -1378,6 +1473,11 @@ pub struct Compiler {
     module_registry: ModuleRegistry,
     /// Current function parameter names (to avoid reinitializing them)
     current_function_params: HashSet<String>,
+    /// Variable type tracking for expression type inference
+    variable_types: HashMap<String, String>,
+    /// Start of local scope for current procedure (None = in global scope)
+    /// Variables at or after this index are locals; below are outer/global
+    local_scope_start: Option<usize>,
 }
 
 impl Compiler {
@@ -1387,12 +1487,37 @@ impl Compiler {
             loop_stack: Vec::new(),
             module_registry: ModuleRegistry::new(),
             current_function_params: HashSet::new(),
+            variable_types: HashMap::new(),
+            local_scope_start: None,
+        }
+    }
+
+    /// Look up a variable by name, respecting the current scope.
+    /// When inside a procedure, first checks local scope, then outer scope.
+    fn lookup_variable(&self, name: &str) -> Option<usize> {
+        if let Some(locals_start) = self.local_scope_start {
+            // Inside a procedure - first check local variables
+            for i in (locals_start..self.chunk.variables.len()).rev() {
+                if self.chunk.variables[i] == name {
+                    return Some(i);
+                }
+            }
+            // Then check outer/global variables
+            for i in (0..locals_start).rev() {
+                if self.chunk.variables[i] == name {
+                    return Some(i);
+                }
+            }
+            None
+        } else {
+            // In global scope - use standard lookup
+            self.chunk.get_variable_index(name)
         }
     }
 
     /// Compile a complete compilation unit (modules + program)
     pub fn compile_unit(&mut self, unit: &CompilationUnit) -> CompileResult<Chunk> {
-        let default_loc = SourceLocation { line: 1, column: 1 };
+        let default_loc = SourceLocation::new(1, 1);
 
         // First pass: compile module declarations (these need to run to initialize constants)
         for module in &unit.modules {
@@ -1482,12 +1607,13 @@ impl Compiler {
                     let mut runtime_type = if let Some(parent_name) = &type_def.extends {
                         if let Some(parent_idx) = self.chunk.get_type_index(parent_name) {
                             let mut rt = RuntimeTypeDef::with_parent(type_def.name.clone(), parent_idx);
-                            // Copy parent's components and procedures
+                            // Copy parent's components, defaults, visibility, and procedures
                             if let Some(parent_def) = self.chunk.get_type(parent_idx) {
-                                for (comp, default) in parent_def.components.iter()
+                                for ((comp, default), vis) in parent_def.components.iter()
                                     .zip(parent_def.defaults.iter())
+                                    .zip(parent_def.component_visibility.iter())
                                 {
-                                    rt.add_component(comp.clone(), default.clone());
+                                    rt.add_component(comp.clone(), default.clone(), vis.clone());
                                 }
                                 for (binding, proc) in &parent_def.procedures {
                                     rt.add_procedure(binding.clone(), proc.clone());
@@ -1503,7 +1629,8 @@ impl Compiler {
                     };
 
                     for component in &type_def.components {
-                        runtime_type.add_component(component.name.clone(), None);
+                        let vis = component.visibility.clone().unwrap_or(Visibility::Public);
+                        runtime_type.add_component(component.name.clone(), None, vis);
                     }
                     for proc in &type_def.procedures {
                         let actual_name = proc.procedure_name.clone()
@@ -1618,6 +1745,17 @@ impl Compiler {
                             location,
                         })?;
 
+                    // Check visibility - PRIVATE symbols cannot be imported
+                    if symbol.visibility != Visibility::Public {
+                        return Err(CompileError::InvalidOperation {
+                            message: format!(
+                                "Cannot import PRIVATE symbol '{}' from module '{}'",
+                                original_name, use_stmt.module_name
+                            ),
+                            location,
+                        });
+                    }
+
                     self.import_symbol(symbol, &item.local_name)?;
                 }
             }
@@ -1729,9 +1867,13 @@ impl Compiler {
             self.current_function_params.insert(param.name.clone());
         }
 
+        // Record the starting variable index for this procedure's locals
+        let locals_start = self.chunk.variables.len();
+
         // Allocate parameter slots and pop arguments into them (in reverse order)
+        // Use add_local_variable to always create new slots (parameters may shadow outer names)
         let param_indices: Vec<_> = sub.parameters.iter()
-            .map(|param| self.chunk.add_variable(param.name.clone()))
+            .map(|param| self.chunk.add_local_variable(param.name.clone()))
             .collect();
 
         // Pop arguments from stack into parameters (reverse order because stack is LIFO)
@@ -1745,6 +1887,36 @@ impl Compiler {
             self.compile_declaration(decl)?;
         }
 
+        // Build and register procedure signature for generic interface resolution
+        let param_types: Vec<String> = sub.parameters.iter()
+            .map(|param| {
+                // First check parameter's inline type spec
+                if let Some(ts) = &param.type_spec {
+                    Self::type_spec_to_string(ts)
+                } else {
+                    // Fall back to variable_types from declarations
+                    self.variable_types
+                        .get(&param.name.to_uppercase())
+                        .cloned()
+                        .unwrap_or_else(|| "UNKNOWN".to_string())
+                }
+            })
+            .collect();
+
+        let signature = ProcedureSignature {
+            param_count: sub.parameters.len(),
+            param_types,
+            return_type: None, // Subroutines don't return values
+        };
+        self.chunk.register_procedure_signature(sub.name.clone(), signature);
+
+        // Record the local variable range for this procedure
+        let locals_count = self.chunk.variables.len() - locals_start;
+        self.chunk.procedure_locals.insert(entry_address, (locals_start, locals_count));
+
+        // Set local scope for body compilation
+        self.local_scope_start = Some(locals_start);
+
         // Compile body statements
         for stmt in &sub.body {
             self.compile_statement(stmt)?;
@@ -1752,6 +1924,13 @@ impl Compiler {
 
         // Emit return at end
         self.chunk.emit(OpCode::Return, sub.location);
+
+        // Record procedure end address for JIT compilation
+        let end_address = self.chunk.current_offset();
+        self.chunk.procedure_ends.insert(entry_address, end_address);
+
+        // Clear local scope
+        self.local_scope_start = None;
 
         // Clear parameter tracking
         self.current_function_params.clear();
@@ -1772,9 +1951,13 @@ impl Compiler {
             self.current_function_params.insert(param.name.clone());
         }
 
+        // Record the starting variable index for this procedure's locals
+        let locals_start = self.chunk.variables.len();
+
         // Allocate parameter slots and pop arguments into them (in reverse order)
+        // Use add_local_variable to always create new slots (parameters may shadow outer names)
         let param_indices: Vec<_> = func.parameters.iter()
-            .map(|param| self.chunk.add_variable(param.name.clone()))
+            .map(|param| self.chunk.add_local_variable(param.name.clone()))
             .collect();
 
         // Pop arguments from stack into parameters (reverse order because stack is LIFO)
@@ -1784,13 +1967,46 @@ impl Compiler {
         }
 
         // Allocate result variable (function name or RESULT variable)
+        // Use add_local_variable to always create new slot
         let result_name = func.result_name.as_ref().unwrap_or(&func.name);
-        self.chunk.add_variable(result_name.clone());
+        self.chunk.add_local_variable(result_name.clone());
 
         // Compile local declarations
         for decl in &func.declarations {
             self.compile_declaration(decl)?;
         }
+
+        // Build and register procedure signature for generic interface resolution
+        let param_types: Vec<String> = func.parameters.iter()
+            .map(|param| {
+                // First check parameter's inline type spec
+                if let Some(ts) = &param.type_spec {
+                    Self::type_spec_to_string(ts)
+                } else {
+                    // Fall back to variable_types from declarations
+                    self.variable_types
+                        .get(&param.name.to_uppercase())
+                        .cloned()
+                        .unwrap_or_else(|| "UNKNOWN".to_string())
+                }
+            })
+            .collect();
+
+        let return_type = func.return_type.as_ref().map(Self::type_spec_to_string);
+
+        let signature = ProcedureSignature {
+            param_count: func.parameters.len(),
+            param_types,
+            return_type,
+        };
+        self.chunk.register_procedure_signature(func.name.clone(), signature);
+
+        // Record the local variable range for this procedure
+        let locals_count = self.chunk.variables.len() - locals_start;
+        self.chunk.procedure_locals.insert(entry_address, (locals_start, locals_count));
+
+        // Set local scope for body compilation
+        self.local_scope_start = Some(locals_start);
 
         // Compile body statements
         for stmt in &func.body {
@@ -1798,7 +2014,7 @@ impl Compiler {
         }
 
         // Load result value onto stack before return
-        let result_idx = self.chunk.get_variable_index(result_name)
+        let result_idx = self.lookup_variable(result_name)
             .ok_or(CompileError::InvalidOperation {
                 message: format!("Result variable {} not found", result_name),
                 location: func.location,
@@ -1807,6 +2023,13 @@ impl Compiler {
 
         // Emit return at end
         self.chunk.emit(OpCode::Return, func.location);
+
+        // Record procedure end address for JIT compilation
+        let end_address = self.chunk.current_offset();
+        self.chunk.procedure_ends.insert(entry_address, end_address);
+
+        // Clear local scope
+        self.local_scope_start = None;
 
         // Clear parameter tracking
         self.current_function_params.clear();
@@ -1824,6 +2047,10 @@ impl Compiler {
 
                     // Allocate variable slot (returns existing index if already declared)
                     let var_index = self.chunk.add_variable(entity.name.clone());
+
+                    // Track variable type for expression type inference
+                    let type_str = Self::type_spec_to_string(type_spec);
+                    self.variable_types.insert(entity.name.to_uppercase(), type_str);
 
                     // Check if this is an array declaration
                     if let Some(array_spec) = &entity.array_spec {
@@ -1903,12 +2130,13 @@ impl Compiler {
                     if let Some(parent_idx) = self.chunk.get_type_index(parent_name) {
                         let mut rt = RuntimeTypeDef::with_parent(type_def.name.clone(), parent_idx);
 
-                        // Copy parent's components first (inherited components come first)
+                        // Copy parent's components, defaults, visibility, and procedures first
                         if let Some(parent_def) = self.chunk.get_type(parent_idx) {
-                            for (comp, default) in parent_def.components.iter()
+                            for ((comp, default), vis) in parent_def.components.iter()
                                 .zip(parent_def.defaults.iter())
+                                .zip(parent_def.component_visibility.iter())
                             {
-                                rt.add_component(comp.clone(), default.clone());
+                                rt.add_component(comp.clone(), default.clone(), vis.clone());
                             }
                             // Copy parent's procedures (can be overridden)
                             for (binding, proc) in &parent_def.procedures {
@@ -1928,7 +2156,8 @@ impl Compiler {
 
                 // Add this type's own components
                 for component in &type_def.components {
-                    runtime_type.add_component(component.name.clone(), None);
+                    let vis = component.visibility.clone().unwrap_or(Visibility::Public);
+                    runtime_type.add_component(component.name.clone(), None, vis);
                 }
 
                 // Register type-bound procedures (may override parent's)
@@ -1992,8 +2221,9 @@ impl Compiler {
                     // Compile the value first
                     self.compile_expression(value)?;
 
-                    // Load the base object
-                    let var_index = self.chunk.add_variable(target.clone());
+                    // Load the base object (use lookup with fallback)
+                    let var_index = self.lookup_variable(target)
+                        .unwrap_or_else(|| self.chunk.add_variable(target.clone()));
                     self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
 
                     // For chained access like obj%a%b, we need to navigate to the parent
@@ -2029,8 +2259,9 @@ impl Compiler {
                     let idx_count = self.chunk.add_constant(Value::Integer(num_idx as i64));
                     self.chunk.emit_with_operand(OpCode::LoadConst, idx_count, *location);
 
-                    // Get variable index
-                    let var_index = self.chunk.add_variable(target.clone());
+                    // Get variable index (use lookup with fallback)
+                    let var_index = self.lookup_variable(target)
+                        .unwrap_or_else(|| self.chunk.add_variable(target.clone()));
 
                     // Emit StoreArrayElem
                     self.chunk.emit_with_operand(OpCode::StoreArrayElem, var_index, *location);
@@ -2039,22 +2270,55 @@ impl Compiler {
                     // Compile the value expression
                     self.compile_expression(value)?;
 
-                    // Get or create variable index
-                    let var_index = self.chunk.add_variable(target.clone());
+                    // Get or create variable index (use lookup with fallback for scope)
+                    let var_index = self.lookup_variable(target)
+                        .unwrap_or_else(|| self.chunk.add_variable(target.clone()));
                     self.chunk
                         .emit_with_operand(OpCode::StoreVar, var_index, *location);
                 }
                 Ok(())
             }
 
-            Statement::Print { values, location, .. } => {
+            Statement::Print { format, values, location } => {
                 // Compile each value expression
                 for value in values {
                     self.compile_expression(value)?;
                 }
-                // Emit print with count of values
-                self.chunk
-                    .emit_with_operand(OpCode::Print, values.len(), *location);
+
+                match format {
+                    FormatSpec::ListDirected => {
+                        // List-directed: use simple Print opcode
+                        self.chunk
+                            .emit_with_operand(OpCode::Print, values.len(), *location);
+                    }
+                    FormatSpec::String(fmt_str) => {
+                        // Inline format string: for now, parse it to descriptors
+                        // and store as a temporary label (negative to avoid conflicts)
+                        let temp_label = -(self.chunk.formats.len() as i64) - 1;
+                        if let Ok(descriptors) = parse_format_string(fmt_str) {
+                            self.chunk.formats.insert(temp_label, descriptors);
+                            // Push count onto stack
+                            let count_idx = self.chunk.add_constant(Value::Integer(values.len() as i64));
+                            self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+                            // Emit formatted print with label
+                            self.chunk
+                                .emit_with_operand(OpCode::PrintFormatted, temp_label as usize, *location);
+                        } else {
+                            // If parsing fails, fall back to list-directed
+                            self.chunk
+                                .emit_with_operand(OpCode::Print, values.len(), *location);
+                        }
+                    }
+                    FormatSpec::Label(label) => {
+                        // Label reference: emit formatted print with label
+                        // Push count onto stack
+                        let count_idx = self.chunk.add_constant(Value::Integer(values.len() as i64));
+                        self.chunk.emit_with_operand(OpCode::LoadConst, count_idx, *location);
+                        // Emit formatted print with label
+                        self.chunk
+                            .emit_with_operand(OpCode::PrintFormatted, *label as usize, *location);
+                    }
+                }
                 Ok(())
             }
 
@@ -2277,7 +2541,7 @@ impl Compiler {
                 match target {
                     Expr::Identifier(name, loc) => {
                         // Create a reference to the target variable
-                        let target_index = self.chunk.get_variable_index(name)
+                        let target_index = self.lookup_variable(name)
                             .ok_or(CompileError::InvalidOperation {
                                 message: format!("Undefined variable: {}", name),
                                 location: *loc,
@@ -2558,6 +2822,12 @@ impl Compiler {
 
                 Ok(())
             }
+
+            Statement::Format { label, descriptors, .. } => {
+                // Store the format descriptors in the chunk for later lookup
+                self.chunk.formats.insert(*label, descriptors.clone());
+                Ok(())
+            }
         }
     }
 
@@ -2568,9 +2838,6 @@ impl Compiler {
         body: &[Statement],
         location: SourceLocation,
     ) -> CompileResult<()> {
-        // For now, compile as nested sequential loops
-        // TODO: Add parallel execution via OpCode::DoConcurrentStart/End
-
         if controls.is_empty() {
             // No controls, just execute body once
             for stmt in body {
@@ -2579,7 +2846,50 @@ impl Compiler {
             return Ok(());
         }
 
-        // Compile nested loops for each control
+        // For single-control loops, emit parallelizable opcodes
+        if controls.len() == 1 {
+            let ctrl = &controls[0];
+            let var_index = self.chunk.add_variable(ctrl.variable.clone());
+
+            // Push loop configuration onto stack: var_index, start, end, step
+            let var_idx_const = self.chunk.add_constant(Value::Integer(var_index as i64));
+            self.chunk.emit_with_operand(OpCode::LoadConst, var_idx_const, location);
+
+            // Compile start expression
+            self.compile_expression(&ctrl.start)?;
+
+            // Compile end expression
+            self.compile_expression(&ctrl.end)?;
+
+            // Compile step expression (default 1)
+            if let Some(step) = &ctrl.step {
+                self.compile_expression(step)?;
+            } else {
+                let one_idx = self.chunk.add_constant(Value::Integer(1));
+                self.chunk.emit_with_operand(OpCode::LoadConst, one_idx, location);
+            }
+
+            // Emit DoConcurrentStart (body_len will be patched)
+            let start_pos = self.chunk.emit_with_operand(OpCode::DoConcurrentStart, 0, location);
+
+            // Compile body
+            let body_start = self.chunk.current_offset();
+            for stmt in body {
+                self.compile_statement(stmt)?;
+            }
+
+            // Emit DoConcurrentEnd
+            self.chunk.emit(OpCode::DoConcurrentEnd, location);
+            let body_end = self.chunk.current_offset();
+
+            // Patch DoConcurrentStart with body length
+            let body_len = body_end - body_start;
+            self.chunk.patch_jump(start_pos, body_len);
+
+            return Ok(());
+        }
+
+        // For multi-control loops, use nested sequential approach
         self.compile_concurrent_control(controls, 0, body, location)
     }
 
@@ -2714,6 +3024,9 @@ impl Compiler {
         self.compile_expression(start)?;
         self.chunk.emit_with_operand(OpCode::StoreVar, var_index, location);
 
+        // Emit loop start marker for profiling (operand = source line)
+        self.chunk.emit_with_operand(OpCode::LoopStart, location.line, location);
+
         // Loop start (condition check)
         let loop_start = self.chunk.current_offset();
 
@@ -2739,6 +3052,9 @@ impl Compiler {
 
         // Jump out if condition is false
         let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Emit loop iteration marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopIteration, location.line, location);
 
         // Push loop context
         self.loop_stack.push(LoopContext {
@@ -2775,6 +3091,9 @@ impl Compiler {
         let loop_end = self.chunk.current_offset();
         self.chunk.patch_jump(exit_jump, loop_end);
 
+        // Emit loop end marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopEnd, location.line, location);
+
         // Pop loop context and patch EXIT/CYCLE jumps
         if let Some(loop_ctx) = self.loop_stack.pop() {
             // Patch EXIT jumps to loop end
@@ -2797,11 +3116,17 @@ impl Compiler {
         body: &[Statement],
         location: SourceLocation,
     ) -> CompileResult<()> {
+        // Emit loop start marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopStart, location.line, location);
+
         let loop_start = self.chunk.current_offset();
 
         // Check condition
         self.compile_expression(condition)?;
         let exit_jump = self.chunk.emit_with_operand(OpCode::JumpIfFalse, 0, location);
+
+        // Emit loop iteration marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopIteration, location.line, location);
 
         // Push loop context
         self.loop_stack.push(LoopContext {
@@ -2822,6 +3147,9 @@ impl Compiler {
         // Loop end
         let loop_end = self.chunk.current_offset();
         self.chunk.patch_jump(exit_jump, loop_end);
+
+        // Emit loop end marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopEnd, location.line, location);
 
         // Pop loop context and patch EXIT/CYCLE jumps
         if let Some(loop_ctx) = self.loop_stack.pop() {
@@ -2844,7 +3172,13 @@ impl Compiler {
         body: &[Statement],
         location: SourceLocation,
     ) -> CompileResult<()> {
+        // Emit loop start marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopStart, location.line, location);
+
         let loop_start = self.chunk.current_offset();
+
+        // Emit loop iteration marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopIteration, location.line, location);
 
         // Push loop context
         self.loop_stack.push(LoopContext {
@@ -2864,6 +3198,9 @@ impl Compiler {
 
         // Loop end
         let loop_end = self.chunk.current_offset();
+
+        // Emit loop end marker for profiling
+        self.chunk.emit_with_operand(OpCode::LoopEnd, location.line, location);
 
         // Pop loop context and patch EXIT/CYCLE jumps
         if let Some(loop_ctx) = self.loop_stack.pop() {
@@ -2986,7 +3323,7 @@ impl Compiler {
         match arg {
             Expr::Identifier(name, location) => {
                 // Simple variable - pass by reference
-                let var_index = self.chunk.get_variable_index(name)
+                let var_index = self.lookup_variable(name)
                     .ok_or(CompileError::InvalidOperation {
                         message: format!("Undefined variable: {}", name),
                         location: *location,
@@ -3032,7 +3369,12 @@ impl Compiler {
             }
 
             Expr::Identifier(name, location) => {
-                let var_index = self.chunk.add_variable(name.clone());
+                // Look up variable with proper scope handling
+                let var_index = self.lookup_variable(name)
+                    .unwrap_or_else(|| {
+                        // Variable not found - add it (for implicit declaration)
+                        self.chunk.add_variable(name.clone())
+                    });
                 self.chunk.emit_with_operand(OpCode::LoadVar, var_index, *location);
                 Ok(())
             }
@@ -3144,17 +3486,22 @@ impl Compiler {
                     // The function will leave its return value on the stack
                     self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
                 } else if let Some(procedures) = self.chunk.generic_interfaces.get(name).cloned() {
-                    // This is a generic interface call
-                    // For now, we use the first registered procedure
-                    // (proper type-based resolution would require type inference)
-                    if let Some(proc_name) = procedures.first() {
+                    // This is a generic interface call - use type-based resolution
+                    // Infer argument types for matching
+                    let arg_types: Vec<Option<String>> = arguments
+                        .iter()
+                        .map(|arg| self.infer_expression_type(&arg.value))
+                        .collect();
+
+                    // Find the best matching procedure based on argument types
+                    if let Some(proc_name) = self.resolve_generic_procedure(&procedures, &arg_types) {
                         // Compile arguments with pass-by-reference semantics
                         for arg in arguments {
                             self.compile_call_argument(&arg.value)?;
                         }
 
                         // Look up the specific procedure address
-                        if let Some(func_address) = self.chunk.get_procedure_address(proc_name) {
+                        if let Some(func_address) = self.chunk.get_procedure_address(&proc_name) {
                             self.chunk.emit_with_operand(OpCode::Call, func_address, *location);
                         } else {
                             return Err(CompileError::InvalidOperation {
@@ -3527,11 +3874,291 @@ impl Compiler {
             _ => false,
         }
     }
+
+    /// Convert a TypeSpec to a simplified type string for signature matching
+    fn type_spec_to_string(type_spec: &TypeSpec) -> String {
+        match type_spec {
+            TypeSpec::Integer { .. } => "INTEGER".to_string(),
+            TypeSpec::Real { .. } => "REAL".to_string(),
+            TypeSpec::DoublePrecision => "REAL".to_string(),
+            TypeSpec::Complex { .. } => "COMPLEX".to_string(),
+            TypeSpec::Logical { .. } => "LOGICAL".to_string(),
+            TypeSpec::Character { .. } => "CHARACTER".to_string(),
+            TypeSpec::Derived { name, .. } => format!("DERIVED:{}", name.to_uppercase()),
+        }
+    }
+
+    /// Infer the type of an expression at compile time
+    fn infer_expression_type(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::IntegerLiteral(..) => Some("INTEGER".to_string()),
+            Expr::RealLiteral(..) => Some("REAL".to_string()),
+            Expr::LogicalLiteral(..) => Some("LOGICAL".to_string()),
+            Expr::StringLiteral(..) => Some("CHARACTER".to_string()),
+            Expr::Identifier(name, ..) => {
+                // Look up variable type from our tracking
+                self.variable_types.get(&name.to_uppercase()).cloned()
+            }
+            Expr::BinaryOp { left, right, op, .. } => {
+                // For arithmetic ops, result type depends on operand types
+                let left_type = self.infer_expression_type(left);
+                let right_type = self.infer_expression_type(right);
+                match op {
+                    BinaryOperator::Add | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply | BinaryOperator::Divide
+                    | BinaryOperator::Power => {
+                        // REAL promotion: if either is REAL, result is REAL
+                        match (&left_type, &right_type) {
+                            (Some(l), Some(r)) if l == "REAL" || r == "REAL" => Some("REAL".to_string()),
+                            (Some(l), _) if l == "INTEGER" => left_type,
+                            (_, Some(r)) if r == "INTEGER" => right_type,
+                            _ => left_type.or(right_type),
+                        }
+                    }
+                    // Comparison operators return LOGICAL
+                    BinaryOperator::Equal | BinaryOperator::NotEqual
+                    | BinaryOperator::Less | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater | BinaryOperator::GreaterEqual => {
+                        Some("LOGICAL".to_string())
+                    }
+                    // Logical operators return LOGICAL
+                    BinaryOperator::And | BinaryOperator::Or
+                    | BinaryOperator::Eqv | BinaryOperator::Neqv => {
+                        Some("LOGICAL".to_string())
+                    }
+                }
+            }
+            Expr::UnaryOp { operand, op, .. } => {
+                match op {
+                    UnaryOperator::Minus | UnaryOperator::Plus => self.infer_expression_type(operand),
+                    UnaryOperator::Not => Some("LOGICAL".to_string()),
+                }
+            }
+            Expr::ArrayAccess { name, .. } => {
+                // Array element has same type as the array variable
+                self.variable_types.get(&name.to_uppercase()).cloned()
+            }
+            Expr::TypeConstructor { type_name, .. } => {
+                Some(format!("DERIVED:{}", type_name.to_uppercase()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Find the best matching procedure for a generic interface call
+    fn resolve_generic_procedure(&self, procedures: &[String], arg_types: &[Option<String>]) -> Option<String> {
+        // Try to find exact match first
+        for proc_name in procedures {
+            if let Some(sig) = self.chunk.get_procedure_signature(proc_name) {
+                if sig.param_count == arg_types.len() {
+                    // Check if all known types match
+                    let matches = sig.param_types.iter().zip(arg_types.iter()).all(|(sig_type, arg_type)| {
+                        match arg_type {
+                            Some(at) => sig_type == at,
+                            None => true, // Unknown type is a wildcard match
+                        }
+                    });
+                    if matches {
+                        return Some(proc_name.clone());
+                    }
+                }
+            }
+        }
+
+        // Fall back to first procedure with matching param count
+        for proc_name in procedures {
+            if let Some(sig) = self.chunk.get_procedure_signature(proc_name) {
+                if sig.param_count == arg_types.len() {
+                    return Some(proc_name.clone());
+                }
+            }
+        }
+
+        // Last resort: return first procedure
+        procedures.first().cloned()
+    }
 }
 
 impl Default for Compiler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse an inline format string like "(I5, F10.2, A)" into format descriptors
+fn parse_format_string(fmt: &str) -> Result<Vec<FormatDescriptor>, String> {
+    let mut descriptors = Vec::new();
+    let trimmed = fmt.trim();
+
+    // Remove surrounding parentheses if present
+    let inner = if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        &trimmed[1..trimmed.len()-1]
+    } else {
+        trimmed
+    };
+
+    // Split by comma and parse each descriptor
+    for part in inner.split(',') {
+        let s = part.trim().to_uppercase();
+        if s.is_empty() {
+            continue;
+        }
+
+        if let Some(desc) = parse_single_descriptor(&s) {
+            descriptors.push(desc);
+        }
+    }
+
+    Ok(descriptors)
+}
+
+/// Parse a single format descriptor string like "I5", "F10.2", "A", "3X"
+fn parse_single_descriptor(s: &str) -> Option<FormatDescriptor> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Check for repeat count prefix
+    let (repeat, rest) = if s.chars().next()?.is_ascii_digit() {
+        let mut idx = 0;
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        let repeat: usize = s[..idx].parse().ok()?;
+        (Some(repeat), &s[idx..])
+    } else {
+        (None, s)
+    };
+
+    // Check for literal string (single-quoted)
+    if rest.starts_with('\'') || rest.starts_with('"') {
+        let quote = rest.chars().next()?;
+        let end = rest[1..].find(quote)?;
+        let lit = rest[1..end+1].to_string();
+        return Some(FormatDescriptor::Literal(lit));
+    }
+
+    // Parse format code
+    let code_char = rest.chars().next()?;
+    let rest_after_code = &rest[1..];
+
+    match code_char {
+        'I' => {
+            // Integer: Iw[.m]
+            let (width, min_digits) = parse_width_decimals(rest_after_code);
+            Some(FormatDescriptor::Integer {
+                width: repeat.unwrap_or(1) * width.unwrap_or(6),
+                min_digits,
+            })
+        }
+        'F' => {
+            // Real: Fw.d
+            let (width, decimals) = parse_width_decimals(rest_after_code);
+            Some(FormatDescriptor::Float {
+                width: repeat.unwrap_or(1) * width.unwrap_or(12),
+                decimals: decimals.unwrap_or(6),
+            })
+        }
+        'E' => {
+            // Exponential: Ew.d
+            let (width, decimals) = parse_width_decimals(rest_after_code);
+            Some(FormatDescriptor::Exponential {
+                width: repeat.unwrap_or(1) * width.unwrap_or(12),
+                decimals: decimals.unwrap_or(6),
+                exp_width: None,
+            })
+        }
+        'D' => {
+            // Double: Dw.d
+            let (width, decimals) = parse_width_decimals(rest_after_code);
+            Some(FormatDescriptor::Double {
+                width: repeat.unwrap_or(1) * width.unwrap_or(22),
+                decimals: decimals.unwrap_or(15),
+            })
+        }
+        'G' => {
+            // General: Gw.d
+            let (width, decimals) = parse_width_decimals(rest_after_code);
+            Some(FormatDescriptor::General {
+                width: repeat.unwrap_or(1) * width.unwrap_or(12),
+                decimals: decimals.unwrap_or(6),
+            })
+        }
+        'A' => {
+            // Character: A[w]
+            let width: Option<usize> = if rest_after_code.is_empty() {
+                None
+            } else {
+                rest_after_code.parse().ok()
+            };
+            Some(FormatDescriptor::String { width })
+        }
+        'L' => {
+            // Logical: Lw
+            let width: usize = rest_after_code.parse().unwrap_or(1);
+            Some(FormatDescriptor::Logical { width })
+        }
+        'X' => {
+            // Skip: nX
+            Some(FormatDescriptor::Skip(repeat.unwrap_or(1)))
+        }
+        'T' => {
+            // Tab: Tc or TLn or TRn
+            if rest_after_code.starts_with('L') {
+                let n: usize = rest_after_code[1..].parse().unwrap_or(1);
+                Some(FormatDescriptor::TabLeft(n))
+            } else if rest_after_code.starts_with('R') {
+                let n: usize = rest_after_code[1..].parse().unwrap_or(1);
+                Some(FormatDescriptor::TabRight(n))
+            } else {
+                let pos: usize = rest_after_code.parse().unwrap_or(1);
+                Some(FormatDescriptor::Tab(pos))
+            }
+        }
+        '/' => Some(FormatDescriptor::Newline),
+        ':' => Some(FormatDescriptor::Colon),
+        'S' => {
+            // Sign control: S, SP, SS
+            if rest_after_code.starts_with('P') {
+                Some(FormatDescriptor::Sign(SignControl::Plus))
+            } else if rest_after_code.starts_with('S') {
+                Some(FormatDescriptor::Sign(SignControl::Suppress))
+            } else {
+                Some(FormatDescriptor::Sign(SignControl::Default))
+            }
+        }
+        'B' => {
+            // Blank control: BN, BZ
+            if rest_after_code.starts_with('N') {
+                Some(FormatDescriptor::Blank(BlankControl::Null))
+            } else if rest_after_code.starts_with('Z') {
+                Some(FormatDescriptor::Blank(BlankControl::Zero))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse width and optional decimal places from strings like "10.2", "5", ""
+fn parse_width_decimals(s: &str) -> (Option<usize>, Option<usize>) {
+    if s.is_empty() {
+        return (None, None);
+    }
+
+    if let Some(dot_pos) = s.find('.') {
+        let width: Option<usize> = s[..dot_pos].parse().ok();
+        let decimals: Option<usize> = s[dot_pos+1..].parse().ok();
+        (width, decimals)
+    } else {
+        let width: Option<usize> = s.parse().ok();
+        (width, None)
     }
 }
 
@@ -3570,7 +4197,7 @@ mod tests {
     #[test]
     fn test_chunk_emit_instructions() {
         let mut chunk = Chunk::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx = chunk.add_constant(Value::Integer(42));
         chunk.emit_with_operand(OpCode::LoadConst, idx, loc);
@@ -3601,7 +4228,7 @@ mod tests {
     #[test]
     fn test_chunk_patch_jump() {
         let mut chunk = Chunk::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let jump_idx = chunk.emit_with_operand(OpCode::Jump, 0, loc);
         chunk.emit(OpCode::Nop, loc);
@@ -3615,7 +4242,7 @@ mod tests {
     #[test]
     fn test_disassemble() {
         let mut chunk = Chunk::new();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let const_idx = chunk.add_constant(Value::Integer(42));
         let var_idx = chunk.add_variable("X".to_string());

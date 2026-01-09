@@ -10,3 +10,7 @@ pub mod bytecode;
 pub mod vm;
 pub mod runtime;
 pub mod repl;
+pub mod jit;
+pub mod diagnostic;
+pub mod debugger;
+pub mod profiler;

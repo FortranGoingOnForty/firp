@@ -3,12 +3,16 @@
 //! This module implements a stack-based virtual machine that executes
 //! compiled Fortran bytecode.
 
+use crate::ast::{FormatDescriptor, SignControl, BlankControl};
 use crate::bytecode::{ArrayDim, Chunk, Instruction, Intrinsic, OpCode, Value};
+use crate::jit::{JitCompiler, JitConfig, JitError};
 use crate::lexer::SourceLocation;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Write};
+use std::sync::{Arc, Mutex};
 
 /// Maximum stack size
 const STACK_SIZE: usize = 256;
@@ -21,10 +25,27 @@ const MAX_CALL_DEPTH: usize = 64;
 pub struct CallFrame {
     /// Return address (instruction pointer to return to)
     pub return_address: usize,
-    /// Base index for local variables
+    /// Runtime base index for local variables (where we allocated new slots)
     pub locals_base: usize,
+    /// Compile-time base index for this procedure's locals (for index translation)
+    pub compile_locals_base: usize,
+    /// Number of local variables for this procedure
+    pub locals_count: usize,
     /// Number of arguments passed
     pub arg_count: usize,
+    /// Name of the procedure being called
+    pub procedure_name: Option<String>,
+    /// Location where the call was made
+    pub call_location: Option<SourceLocation>,
+}
+
+/// Entry in a stack trace
+#[derive(Debug, Clone)]
+pub struct StackTraceEntry {
+    /// Name of the procedure
+    pub procedure_name: String,
+    /// Location of the call (or current position for innermost frame)
+    pub location: Option<SourceLocation>,
 }
 
 /// Slice specification for array section extraction
@@ -284,8 +305,14 @@ pub struct VM {
     file_handles: HashMap<i64, FileHandle>,
     /// Input buffer for READ statements (for testing)
     input_buffer: Vec<String>,
+    /// Parallel execution mode for DO CONCURRENT
+    parallel_mode: bool,
     /// Input buffer position
     input_pos: usize,
+    /// Optional debugger for interactive debugging
+    debugger: Option<Box<dyn crate::debugger::Debugger>>,
+    /// JIT compiler (optional, enabled with --jit flag)
+    jit: Option<JitCompiler>,
 }
 
 impl VM {
@@ -303,12 +330,46 @@ impl VM {
             file_handles: HashMap::new(),
             input_buffer: Vec::new(),
             input_pos: 0,
+            parallel_mode: false,
+            debugger: None,
+            jit: None,
         }
+    }
+
+    /// Enable JIT compilation with the specified configuration
+    pub fn enable_jit(&mut self, config: JitConfig) -> Result<(), JitError> {
+        self.jit = Some(JitCompiler::new(config)?);
+        Ok(())
+    }
+
+    /// Check if JIT is enabled
+    pub fn jit_enabled(&self) -> bool {
+        self.jit.is_some()
+    }
+
+    /// Set the debugger for interactive debugging
+    pub fn set_debugger(&mut self, debugger: Option<Box<dyn crate::debugger::Debugger>>) {
+        self.debugger = debugger;
+    }
+
+    /// Check if a debugger is attached
+    pub fn has_debugger(&self) -> bool {
+        self.debugger.is_some()
+    }
+
+    /// Take the debugger out of the VM (for extracting profiler data)
+    pub fn take_debugger(&mut self) -> Option<Box<dyn crate::debugger::Debugger>> {
+        self.debugger.take()
     }
 
     /// Enable or disable trace mode
     pub fn set_trace(&mut self, enabled: bool) {
         self.trace = enabled;
+    }
+
+    /// Enable or disable parallel execution for DO CONCURRENT
+    pub fn set_parallel_mode(&mut self, enabled: bool) {
+        self.parallel_mode = enabled;
     }
 
     /// Set input buffer for READ statements (for testing)
@@ -332,8 +393,56 @@ impl VM {
         self.input_pos = 0;
     }
 
-    /// Run a compiled chunk
-    pub fn run(&mut self, chunk: Chunk) -> VMResult<()> {
+    /// Generate a stack trace from the current call stack.
+    /// The trace is returned with the innermost (most recent) call first.
+    pub fn stack_trace(&self) -> Vec<StackTraceEntry> {
+        let mut trace = Vec::with_capacity(self.call_stack.len() + 1);
+
+        // Walk the call stack (innermost to outermost)
+        for frame in self.call_stack.iter().rev() {
+            let name = frame.procedure_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+            trace.push(StackTraceEntry {
+                procedure_name: name,
+                location: frame.call_location,
+            });
+        }
+
+        // Add main entry if we have a chunk loaded
+        if self.chunk.is_some() && trace.is_empty() {
+            trace.push(StackTraceEntry {
+                procedure_name: "<main>".to_string(),
+                location: None,
+            });
+        }
+
+        trace
+    }
+
+    /// Format a stack trace as a string for display
+    pub fn format_stack_trace(&self) -> String {
+        let trace = self.stack_trace();
+        if trace.is_empty() {
+            return "  <no stack trace available>".to_string();
+        }
+
+        let mut output = String::new();
+        for (i, entry) in trace.iter().enumerate() {
+            let location = match &entry.location {
+                Some(loc) => format!("line {}, column {}", loc.line, loc.column),
+                None => "<unknown location>".to_string(),
+            };
+            if i == 0 {
+                output.push_str(&format!("  at {} ({})\n", entry.procedure_name, location));
+            } else {
+                output.push_str(&format!("  called from {} ({})\n", entry.procedure_name, location));
+            }
+        }
+        output
+    }
+
+    /// Initialize the VM with a chunk but don't execute.
+    /// Use `resume()` to start/continue execution.
+    pub fn init(&mut self, chunk: Chunk) {
         // Save input state before reset
         let saved_input = std::mem::take(&mut self.input_buffer);
         let saved_pos = self.input_pos;
@@ -347,8 +456,47 @@ impl VM {
         // Initialize variable storage
         self.variables = vec![None; chunk.variables.len()];
         self.chunk = Some(chunk);
+    }
 
+    /// Run a compiled chunk
+    pub fn run(&mut self, chunk: Chunk) -> VMResult<()> {
+        self.init(chunk);
         self.execute()
+    }
+
+    /// Resume execution after a debugger pause
+    pub fn resume(&mut self) -> VMResult<()> {
+        self.execute()
+    }
+
+    /// Check if execution has completed (reached Halt or end of instructions)
+    pub fn is_finished(&self) -> bool {
+        match &self.chunk {
+            Some(chunk) => {
+                if self.ip >= chunk.instructions.len() {
+                    return true;
+                }
+                // Check if current instruction is Halt
+                if let Some(instr) = chunk.instructions.get(self.ip) {
+                    instr.opcode == OpCode::Halt
+                } else {
+                    true
+                }
+            }
+            None => true,
+        }
+    }
+
+    /// Get current instruction pointer
+    pub fn ip(&self) -> usize {
+        self.ip
+    }
+
+    /// Get current source location (if available)
+    pub fn current_location(&self) -> Option<SourceLocation> {
+        self.chunk.as_ref().and_then(|chunk| {
+            chunk.instructions.get(self.ip).map(|i| i.location)
+        })
     }
 
     /// Get the output from PRINT statements
@@ -379,9 +527,42 @@ impl VM {
         }
     }
 
+    /// Set a variable value by name (for debugger)
+    pub fn set_variable(&mut self, name: &str, value: Value) -> Result<(), String> {
+        let chunk = self.chunk.as_ref()
+            .ok_or_else(|| "No chunk loaded".to_string())?;
+
+        let index = chunk.get_variable_index(name)
+            .ok_or_else(|| format!("Unknown variable: {}", name))?;
+
+        if index >= self.variables.len() {
+            return Err(format!("Variable index out of bounds: {}", index));
+        }
+
+        self.variables[index] = Some(value);
+        Ok(())
+    }
+
     /// Main execution loop
     fn execute(&mut self) -> VMResult<()> {
+        self.execute_until(None)
+    }
+
+    /// Execute a body section (for DO CONCURRENT sequential mode)
+    fn execute_body_section(&mut self, end_ip: usize) -> VMResult<()> {
+        self.execute_until(Some(end_ip))
+    }
+
+    /// Execute until Halt or until reaching stop_at IP (if specified)
+    fn execute_until(&mut self, stop_at: Option<usize>) -> VMResult<()> {
         loop {
+            // Check if we should stop at this IP
+            if let Some(stop) = stop_at {
+                if self.ip >= stop {
+                    break;
+                }
+            }
+
             // Copy instruction data to avoid borrow conflicts
             let (opcode, operand, location) = {
                 let chunk = self.chunk.as_ref().unwrap();
@@ -395,9 +576,41 @@ impl VM {
                 (instruction.opcode, instruction.operand, instruction.location)
             };
 
+            // Call debugger hook before executing instruction
+            if let Some(ref mut debugger) = self.debugger {
+                if !debugger.on_instruction(self.ip, Some(location)) {
+                    // Debugger requested pause - return control to caller
+                    // The caller (REPL/debug loop) will handle the debug commands
+                    return Ok(());
+                }
+            }
+
             match opcode {
                 OpCode::Halt => break,
                 OpCode::Nop => {
+                    self.ip += 1;
+                }
+
+                // Loop profiling markers
+                OpCode::LoopStart => {
+                    let line = operand.unwrap_or(0);
+                    if let Some(ref mut debugger) = self.debugger {
+                        debugger.on_loop_start(line);
+                    }
+                    self.ip += 1;
+                }
+                OpCode::LoopIteration => {
+                    let line = operand.unwrap_or(0);
+                    if let Some(ref mut debugger) = self.debugger {
+                        debugger.on_loop_iteration(line);
+                    }
+                    self.ip += 1;
+                }
+                OpCode::LoopEnd => {
+                    let line = operand.unwrap_or(0);
+                    if let Some(ref mut debugger) = self.debugger {
+                        debugger.on_loop_end(line);
+                    }
                     self.ip += 1;
                 }
 
@@ -432,22 +645,30 @@ impl VM {
                 }
                 OpCode::LoadRef => {
                     // Push a reference to a variable (for pass-by-reference)
-                    let index = operand.unwrap_or(0);
+                    let compile_index = operand.unwrap_or(0);
+
+                    // Translate compile-time index to runtime index
+                    let runtime_index = self.translate_var_index(compile_index);
+
                     // If this variable is itself a reference, follow it
-                    let target_index = self.resolve_reference(index, location)?;
+                    let target_index = self.resolve_reference(runtime_index, location)?;
                     self.push(Value::Reference(target_index), location)?;
                     self.ip += 1;
                 }
                 OpCode::StoreParam => {
                     // Store a parameter value (possibly a reference) without resolving
                     // This is used at function/subroutine entry to set up parameter bindings
-                    let index = operand.unwrap_or(0);
+                    let compile_index = operand.unwrap_or(0);
                     let value = self.pop(location)?;
+
+                    // Translate compile-time index to runtime index
+                    let runtime_index = self.translate_var_index(compile_index);
+
                     // Store directly without resolving references
-                    if index >= self.variables.len() {
-                        self.variables.resize(index + 1, None);
+                    if runtime_index >= self.variables.len() {
+                        self.variables.resize(runtime_index + 1, None);
                     }
-                    self.variables[index] = Some(value);
+                    self.variables[runtime_index] = Some(value);
                     self.ip += 1;
                 }
 
@@ -605,6 +826,43 @@ impl VM {
                     self.ip += 1;
                 }
 
+                OpCode::PrintFormatted => {
+                    let format_label = operand.unwrap_or(0) as i64;
+
+                    // Pop the count from stack
+                    let count = match self.pop(location)? {
+                        Value::Integer(n) => n as usize,
+                        _ => return Err(RuntimeError::TypeError {
+                            message: "Format print count must be integer".to_string(),
+                            location,
+                        }),
+                    };
+
+                    // Pop the values
+                    let mut values = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        values.push(self.pop(location)?);
+                    }
+                    values.reverse();
+
+                    // Look up the format descriptors
+                    let chunk = self.chunk.as_ref().unwrap();
+                    let descriptors = chunk.formats.get(&format_label).cloned();
+
+                    let line = if let Some(descs) = descriptors {
+                        self.format_values(&values, &descs)
+                    } else {
+                        // Fall back to list-directed if format not found
+                        values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(" ")
+                    };
+
+                    self.output.push(line.clone());
+                    if self.trace {
+                        println!("OUTPUT: {}", line);
+                    }
+                    self.ip += 1;
+                }
+
                 OpCode::Read => {
                     let var_index = operand.unwrap_or(0);
                     // Read from input buffer (for testing) or stdin
@@ -732,11 +990,62 @@ impl VM {
                         return Err(RuntimeError::CallStackOverflow { location });
                     }
 
-                    // Create call frame with return address (next instruction)
+                    // Look up procedure name for profiling/debugging
+                    let proc_name = self.chunk.as_ref()
+                        .and_then(|c| c.get_procedure_name(proc_address))
+                        .map(|s| s.to_string());
+
+                    // JIT hotspot detection and compilation
+                    if let Some(ref mut jit) = self.jit {
+                        if let Some(name) = &proc_name {
+                            // Check if we should compile this procedure
+                            if !jit.is_compiled(name) && jit.record_call(name) {
+                                // Threshold reached - try to compile
+                                if let Some(chunk) = &self.chunk {
+                                    if let Some(&end_addr) = chunk.procedure_ends.get(&proc_address) {
+                                        match jit.compile_procedure(name, proc_address, end_addr, chunk) {
+                                            Ok(_) => {
+                                                eprintln!("[JIT] Compiled procedure '{}' ({} instructions)",
+                                                    name, end_addr - proc_address);
+                                            }
+                                            Err(e) => {
+                                                // Compilation failed - fall back to interpreter
+                                                eprintln!("[JIT] Failed to compile '{}': {}", name, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Look up procedure's local variable range
+                    let (compile_locals_base, locals_count) = self.chunk.as_ref()
+                        .and_then(|c| c.procedure_locals.get(&proc_address).copied())
+                        .unwrap_or((0, 0));
+
+                    // Allocate new runtime slots for this call's locals
+                    let runtime_locals_base = self.variables.len();
+                    for _ in 0..locals_count {
+                        self.variables.push(None);
+                    }
+
+                    // Notify debugger of function call
+                    if let Some(ref mut debugger) = self.debugger {
+                        let name = proc_name.as_deref().unwrap_or("<procedure>");
+                        debugger.on_function_call(name, &[]);
+                        debugger.enter_function();
+                    }
+
+                    // Create call frame with return address and index translation info
                     let frame = CallFrame {
                         return_address: self.ip + 1,
-                        locals_base: self.variables.len(),
+                        locals_base: runtime_locals_base,
+                        compile_locals_base,
+                        locals_count,
                         arg_count: 0, // Arguments handled separately
+                        procedure_name: proc_name,
+                        call_location: Some(location),
                     };
                     self.call_stack.push(frame);
 
@@ -747,6 +1056,16 @@ impl VM {
                 OpCode::Return => {
                     // Pop call frame and return
                     if let Some(frame) = self.call_stack.pop() {
+                        // Notify debugger of function return (with actual name if available)
+                        if let Some(ref mut debugger) = self.debugger {
+                            let name = frame.procedure_name.as_deref().unwrap_or("<procedure>");
+                            debugger.on_function_return(name, None);
+                            debugger.leave_function();
+                        }
+
+                        // Clean up local variables allocated for this call
+                        self.variables.truncate(frame.locals_base);
+
                         self.ip = frame.return_address;
                     } else {
                         // Return from main program - halt
@@ -841,11 +1160,26 @@ impl VM {
                         return Err(RuntimeError::CallStackOverflow { location });
                     }
 
+                    // Look up procedure's local variable range
+                    let (compile_locals_base, locals_count) = self.chunk.as_ref()
+                        .and_then(|c| c.procedure_locals.get(&proc_address).copied())
+                        .unwrap_or((0, 0));
+
+                    // Allocate new runtime slots for this call's locals
+                    let runtime_locals_base = self.variables.len();
+                    for _ in 0..locals_count {
+                        self.variables.push(None);
+                    }
+
                     // Create call frame with return address
                     let frame = CallFrame {
                         return_address: self.ip + 1,
-                        locals_base: self.variables.len(),
+                        locals_base: runtime_locals_base,
+                        compile_locals_base,
+                        locals_count,
                         arg_count: 0,
+                        procedure_name: Some(binding_name.clone()),
+                        call_location: Some(location),
                     };
                     self.call_stack.push(frame);
 
@@ -891,6 +1225,22 @@ impl VM {
 
                     // Reverse to get correct order
                     dims.reverse();
+
+                    // Calculate array size for memory profiling
+                    let element_count: usize = dims.iter()
+                        .map(|d| (d.upper - d.lower + 1) as usize)
+                        .product();
+                    let estimated_size = element_count * 8; // 8 bytes per element (i64/f64)
+
+                    // Get variable name for profiling
+                    let var_name = self.chunk.as_ref()
+                        .and_then(|c| c.variables.get(var_index))
+                        .cloned();
+
+                    // Notify debugger of allocation
+                    if let Some(ref mut debugger) = self.debugger {
+                        debugger.on_allocation(location.line, estimated_size, var_name.as_deref());
+                    }
 
                     // Create array and store in variable
                     let array = Value::new_integer_array(dims);
@@ -1241,6 +1591,70 @@ impl VM {
                             location,
                         }),
                     }
+                    self.ip += 1;
+                }
+
+                OpCode::DoConcurrentStart => {
+                    // Pop loop configuration from stack: var_index, start, end, step
+                    let step = self.pop_as_int(location)?;
+                    let end = self.pop_as_int(location)?;
+                    let start = self.pop_as_int(location)?;
+                    let var_index = self.pop_as_int(location)? as usize;
+
+                    // operand = body length
+                    let body_len = operand.ok_or(RuntimeError::InvalidInstruction {
+                        message: "DoConcurrentStart requires body length".to_string(),
+                        location,
+                    })?;
+
+                    // Get body start (next instruction)
+                    let body_start = self.ip + 1;
+                    let body_end = body_start + body_len;
+
+                    // Generate iteration values
+                    let mut iter_values = Vec::new();
+                    let mut val = start;
+                    if step > 0 {
+                        while val <= end {
+                            iter_values.push(val);
+                            val += step;
+                        }
+                    } else if step < 0 {
+                        while val >= end {
+                            iter_values.push(val);
+                            val += step;
+                        }
+                    }
+
+                    // Execute iterations in parallel using Rayon if enabled
+                    if self.parallel_mode && iter_values.len() > 1 {
+                        self.execute_parallel_iterations(
+                            var_index, &iter_values, body_start, body_end, location
+                        )?;
+                    } else {
+                        // Sequential execution - run through all iterations
+                        let saved_ip = self.ip;
+                        for iter_val in &iter_values {
+                            // Set loop variable
+                            while self.variables.len() <= var_index {
+                                self.variables.push(None);
+                            }
+                            self.variables[var_index] = Some(Value::Integer(*iter_val));
+
+                            // Execute body by calling main execute but stopping at body_end
+                            self.ip = body_start;
+                            self.execute_body_section(body_end)?;
+                        }
+                        self.ip = saved_ip;
+                    }
+
+                    // Skip to after body
+                    self.ip = body_end;
+                }
+
+                OpCode::DoConcurrentEnd => {
+                    // This is reached at the end of each iteration
+                    // Just move to next instruction (handled by DoConcurrentStart)
                     self.ip += 1;
                 }
             }
@@ -2777,6 +3191,19 @@ impl VM {
         self.value_to_real(&val, location)
     }
 
+    /// Pop a value from the stack and convert to i64
+    fn pop_as_int(&mut self, location: SourceLocation) -> VMResult<i64> {
+        let val = self.pop(location)?;
+        match val {
+            Value::Integer(n) => Ok(n),
+            Value::Real(n) => Ok(n as i64),
+            _ => Err(RuntimeError::TypeError {
+                message: "Expected integer value".to_string(),
+                location,
+            }),
+        }
+    }
+
     /// Convert a value to f64
     fn value_to_real(&self, val: &Value, location: SourceLocation) -> VMResult<f64> {
         match val {
@@ -2841,6 +3268,24 @@ impl VM {
 
     // Variable operations
 
+    /// Translate a compile-time variable index to a runtime index.
+    /// For procedure-local variables, this maps from the compile-time slot
+    /// to the dynamically allocated runtime slot for the current call frame.
+    fn translate_var_index(&self, compile_index: usize) -> usize {
+        if let Some(frame) = self.call_stack.last() {
+            // Check if this index is within the current procedure's local range
+            if compile_index >= frame.compile_locals_base
+                && compile_index < frame.compile_locals_base + frame.locals_count
+            {
+                // Translate to runtime slot
+                let offset = compile_index - frame.compile_locals_base;
+                return frame.locals_base + offset;
+            }
+        }
+        // Not a local of current procedure, use as-is
+        compile_index
+    }
+
     /// Resolve a reference chain - if the variable at `index` contains a Reference,
     /// follow it to get the target variable index.
     fn resolve_reference(&self, index: usize, location: SourceLocation) -> VMResult<usize> {
@@ -2854,7 +3299,9 @@ impl VM {
     }
 
     fn get_variable_by_index(&self, index: usize, location: SourceLocation) -> VMResult<Value> {
-        self.get_variable_by_index_with_depth(index, location, 0)
+        // Translate compile-time index to runtime index
+        let runtime_index = self.translate_var_index(index);
+        self.get_variable_by_index_with_depth(runtime_index, location, 0)
     }
 
     fn get_variable_by_index_with_depth(&self, index: usize, location: SourceLocation, depth: usize) -> VMResult<Value> {
@@ -2866,7 +3313,7 @@ impl VM {
             });
         }
 
-        // First resolve any reference
+        // First resolve any reference (index is already translated)
         let actual_index = self.resolve_reference(index, location)?;
 
         let value = self
@@ -2889,8 +3336,11 @@ impl VM {
         value: Value,
         location: SourceLocation,
     ) -> VMResult<()> {
+        // Translate compile-time index to runtime index
+        let runtime_index = self.translate_var_index(index);
+
         // First resolve any reference
-        let actual_index = self.resolve_reference(index, location)?;
+        let actual_index = self.resolve_reference(runtime_index, location)?;
 
         if actual_index >= self.variables.len() {
             // Extend if needed
@@ -3155,6 +3605,259 @@ impl VM {
 
         // Keep as character
         Ok(Value::Character(trimmed.to_string()))
+    }
+
+    /// Format values according to format descriptors
+    fn format_values(&self, values: &[Value], descriptors: &[FormatDescriptor]) -> String {
+        let mut output = String::new();
+        let mut value_idx = 0;
+        let mut sign_plus = false;
+
+        for desc in descriptors {
+            match desc {
+                FormatDescriptor::Integer { width, min_digits } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Integer(n) => *n,
+                            Value::Real(r) => *r as i64,
+                            _ => 0,
+                        };
+                        value_idx += 1;
+
+                        let formatted = if let Some(m) = min_digits {
+                            format!("{:0>width$}", val.abs(), width = *m)
+                        } else {
+                            format!("{}", val)
+                        };
+
+                        let with_sign = if val < 0 {
+                            format!("-{}", formatted.trim_start_matches('-'))
+                        } else if sign_plus {
+                            format!("+{}", formatted)
+                        } else {
+                            formatted
+                        };
+
+                        // Right-justify to width
+                        output.push_str(&format!("{:>width$}", with_sign, width = *width));
+                    }
+                }
+                FormatDescriptor::Float { width, decimals } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Real(r) => *r,
+                            Value::Integer(n) => *n as f64,
+                            _ => 0.0,
+                        };
+                        value_idx += 1;
+
+                        let formatted = format!("{:>width$.decimals$}", val, width = *width, decimals = *decimals);
+                        output.push_str(&formatted);
+                    }
+                }
+                FormatDescriptor::Exponential { width, decimals, .. } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Real(r) => *r,
+                            Value::Integer(n) => *n as f64,
+                            _ => 0.0,
+                        };
+                        value_idx += 1;
+
+                        let formatted = format!("{:>width$.decimals$E}", val, width = *width, decimals = *decimals);
+                        output.push_str(&formatted);
+                    }
+                }
+                FormatDescriptor::Double { width, decimals } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Real(r) => *r,
+                            Value::Integer(n) => *n as f64,
+                            _ => 0.0,
+                        };
+                        value_idx += 1;
+
+                        let formatted = format!("{:>width$.decimals$E}", val, width = *width, decimals = *decimals);
+                        output.push_str(&formatted);
+                    }
+                }
+                FormatDescriptor::General { width, decimals } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Real(r) => *r,
+                            Value::Integer(n) => *n as f64,
+                            _ => 0.0,
+                        };
+                        value_idx += 1;
+
+                        // Use fixed-point if in range, otherwise scientific
+                        let formatted = if val.abs() < 1e6 && val.abs() > 1e-4 {
+                            format!("{:>width$.decimals$}", val, width = *width, decimals = *decimals)
+                        } else {
+                            format!("{:>width$.decimals$E}", val, width = *width, decimals = *decimals)
+                        };
+                        output.push_str(&formatted);
+                    }
+                }
+                FormatDescriptor::String { width } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Character(s) => s.clone(),
+                            v => format!("{}", v),
+                        };
+                        value_idx += 1;
+
+                        if let Some(w) = width {
+                            // Left-justify strings to width
+                            if val.len() > *w {
+                                output.push_str(&val[..*w]);
+                            } else {
+                                output.push_str(&format!("{:<width$}", val, width = *w));
+                            }
+                        } else {
+                            output.push_str(&val);
+                        }
+                    }
+                }
+                FormatDescriptor::Logical { width } => {
+                    if value_idx < values.len() {
+                        let val = match &values[value_idx] {
+                            Value::Logical(b) => *b,
+                            _ => false,
+                        };
+                        value_idx += 1;
+
+                        let formatted = if val { "T" } else { "F" };
+                        output.push_str(&format!("{:>width$}", formatted, width = *width));
+                    }
+                }
+                FormatDescriptor::Skip(n) => {
+                    for _ in 0..*n {
+                        output.push(' ');
+                    }
+                }
+                FormatDescriptor::Newline => {
+                    output.push('\n');
+                }
+                FormatDescriptor::Tab(pos) => {
+                    // Tab to absolute position
+                    while output.len() < *pos {
+                        output.push(' ');
+                    }
+                }
+                FormatDescriptor::TabRight(n) => {
+                    for _ in 0..*n {
+                        output.push(' ');
+                    }
+                }
+                FormatDescriptor::TabLeft(_) => {
+                    // Tab left - remove characters (limited effect in output)
+                }
+                FormatDescriptor::Literal(s) => {
+                    output.push_str(s);
+                }
+                FormatDescriptor::Group { repeat, items } => {
+                    for _ in 0..*repeat {
+                        let group_output = self.format_values_from_idx(values, items, &mut value_idx, sign_plus);
+                        output.push_str(&group_output);
+                    }
+                }
+                FormatDescriptor::Colon => {
+                    // Stop if no more values
+                    if value_idx >= values.len() {
+                        break;
+                    }
+                }
+                FormatDescriptor::Sign(ctrl) => {
+                    sign_plus = matches!(ctrl, SignControl::Plus);
+                }
+                FormatDescriptor::Blank(_) => {
+                    // Blank interpretation - affects input parsing, not output
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Helper for formatting groups - tracks value index across recursive calls
+    fn format_values_from_idx(&self, values: &[Value], descriptors: &[FormatDescriptor], value_idx: &mut usize, sign_plus: bool) -> String {
+        let mut output = String::new();
+
+        for desc in descriptors {
+            match desc {
+                FormatDescriptor::Integer { width, min_digits } => {
+                    if *value_idx < values.len() {
+                        let val = match &values[*value_idx] {
+                            Value::Integer(n) => *n,
+                            Value::Real(r) => *r as i64,
+                            _ => 0,
+                        };
+                        *value_idx += 1;
+
+                        let formatted = if let Some(m) = min_digits {
+                            format!("{:0>width$}", val.abs(), width = *m)
+                        } else {
+                            format!("{}", val)
+                        };
+
+                        let with_sign = if val < 0 {
+                            format!("-{}", formatted.trim_start_matches('-'))
+                        } else if sign_plus {
+                            format!("+{}", formatted)
+                        } else {
+                            formatted
+                        };
+
+                        output.push_str(&format!("{:>width$}", with_sign, width = *width));
+                    }
+                }
+                FormatDescriptor::Float { width, decimals } => {
+                    if *value_idx < values.len() {
+                        let val = match &values[*value_idx] {
+                            Value::Real(r) => *r,
+                            Value::Integer(n) => *n as f64,
+                            _ => 0.0,
+                        };
+                        *value_idx += 1;
+
+                        output.push_str(&format!("{:>width$.decimals$}", val, width = *width, decimals = *decimals));
+                    }
+                }
+                FormatDescriptor::String { width } => {
+                    if *value_idx < values.len() {
+                        let val = match &values[*value_idx] {
+                            Value::Character(s) => s.clone(),
+                            v => format!("{}", v),
+                        };
+                        *value_idx += 1;
+
+                        if let Some(w) = width {
+                            if val.len() > *w {
+                                output.push_str(&val[..*w]);
+                            } else {
+                                output.push_str(&format!("{:<width$}", val, width = *w));
+                            }
+                        } else {
+                            output.push_str(&val);
+                        }
+                    }
+                }
+                FormatDescriptor::Skip(n) => {
+                    for _ in 0..*n {
+                        output.push(' ');
+                    }
+                }
+                FormatDescriptor::Literal(s) => {
+                    output.push_str(s);
+                }
+                _ => {
+                    // Handle other descriptors similarly if needed
+                }
+            }
+        }
+
+        output
     }
 
     // Constant operations
@@ -3472,6 +4175,215 @@ impl VM {
         }
         output
     }
+
+    /// Execute DO CONCURRENT iterations in parallel using Rayon
+    fn execute_parallel_iterations(
+        &mut self,
+        var_index: usize,
+        iter_values: &[i64],
+        body_start: usize,
+        body_end: usize,
+        location: SourceLocation,
+    ) -> VMResult<()> {
+        // Clone chunk for thread-safe access
+        let chunk = self.chunk.clone().ok_or(RuntimeError::InvalidInstruction {
+            message: "No chunk loaded".to_string(),
+            location,
+        })?;
+
+        // Use Arc<Mutex> to collect results from all threads
+        let outputs: Arc<Mutex<Vec<(usize, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        // Track individual array element updates: (var_index, flat_index, value)
+        let array_updates: Arc<Mutex<Vec<(usize, usize, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Clone variable state (excluding the loop variable)
+        let initial_vars = self.variables.clone();
+
+        // Execute iterations in parallel
+        iter_values.par_iter().enumerate().for_each(|(order, &iter_val)| {
+            // Each thread gets its own mini-VM with a copy of variables
+            let mut local_vars = initial_vars.clone();
+
+            // Set the loop variable
+            while local_vars.len() <= var_index {
+                local_vars.push(None);
+            }
+            local_vars[var_index] = Some(Value::Integer(iter_val));
+
+            // Create a local output buffer and element updates
+            let mut local_output = Vec::new();
+            let mut local_element_updates: Vec<(usize, usize, Value)> = Vec::new();
+
+            // Execute body instructions sequentially for this iteration
+            let mut local_ip = body_start;
+            let mut local_stack: Vec<Value> = Vec::new();
+
+            while local_ip < body_end {
+                if let Some(instr) = chunk.instructions.get(local_ip) {
+                    // Simple execution for common operations
+                    match instr.opcode {
+                        OpCode::LoadConst => {
+                            if let Some(op) = instr.operand {
+                                if let Some(val) = chunk.constants.get(op) {
+                                    local_stack.push(val.clone());
+                                }
+                            }
+                        }
+                        OpCode::LoadVar => {
+                            if let Some(op) = instr.operand {
+                                if let Some(Some(val)) = local_vars.get(op) {
+                                    local_stack.push(val.clone());
+                                } else {
+                                    local_stack.push(Value::Integer(0));
+                                }
+                            }
+                        }
+                        OpCode::StoreVar => {
+                            if let Some(op) = instr.operand {
+                                if let Some(val) = local_stack.pop() {
+                                    while local_vars.len() <= op {
+                                        local_vars.push(None);
+                                    }
+                                    local_vars[op] = Some(val);
+                                }
+                            }
+                        }
+                        OpCode::StoreArrayElem => {
+                            // Collect element-level updates for later merging
+                            if let Some(var_idx) = instr.operand {
+                                let num_dims = local_stack.pop()
+                                    .and_then(|v| match v { Value::Integer(n) => Some(n as usize), _ => None })
+                                    .unwrap_or(1);
+                                let mut indices = Vec::new();
+                                for _ in 0..num_dims {
+                                    if let Some(Value::Integer(idx)) = local_stack.pop() {
+                                        indices.push(idx);
+                                    }
+                                }
+                                indices.reverse();
+                                let value = local_stack.pop().unwrap_or(Value::Integer(0));
+
+                                // Calculate flat index and collect update
+                                if let Some(Some(Value::Array { dims, .. })) = local_vars.get(var_idx) {
+                                    if let Some(flat_idx) = Self::calculate_flat_index_static(&indices, dims) {
+                                        local_element_updates.push((var_idx, flat_idx, value));
+                                    }
+                                }
+                            }
+                        }
+                        OpCode::Add => {
+                            if local_stack.len() >= 2 {
+                                let b = local_stack.pop().unwrap();
+                                let a = local_stack.pop().unwrap();
+                                let result = match (&a, &b) {
+                                    (Value::Integer(x), Value::Integer(y)) => Value::Integer(x + y),
+                                    (Value::Real(x), Value::Real(y)) => Value::Real(x + y),
+                                    (Value::Integer(x), Value::Real(y)) => Value::Real(*x as f64 + y),
+                                    (Value::Real(x), Value::Integer(y)) => Value::Real(x + *y as f64),
+                                    _ => Value::Integer(0),
+                                };
+                                local_stack.push(result);
+                            }
+                        }
+                        OpCode::Multiply => {
+                            if local_stack.len() >= 2 {
+                                let b = local_stack.pop().unwrap();
+                                let a = local_stack.pop().unwrap();
+                                let result = match (&a, &b) {
+                                    (Value::Integer(x), Value::Integer(y)) => Value::Integer(x * y),
+                                    (Value::Real(x), Value::Real(y)) => Value::Real(x * y),
+                                    (Value::Integer(x), Value::Real(y)) => Value::Real(*x as f64 * y),
+                                    (Value::Real(x), Value::Integer(y)) => Value::Real(x * *y as f64),
+                                    _ => Value::Integer(0),
+                                };
+                                local_stack.push(result);
+                            }
+                        }
+                        OpCode::Print => {
+                            if let Some(count) = instr.operand {
+                                let mut values = Vec::new();
+                                for _ in 0..count {
+                                    if let Some(val) = local_stack.pop() {
+                                        values.push(val);
+                                    }
+                                }
+                                values.reverse();
+                                let line = values.iter()
+                                    .map(|v| format!("{}", v))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                local_output.push(line);
+                            }
+                        }
+                        OpCode::DoConcurrentEnd => {
+                            // End of iteration body
+                            break;
+                        }
+                        _ => {
+                            // Skip unhandled opcodes in parallel mode
+                        }
+                    }
+                }
+                local_ip += 1;
+            }
+
+            // Collect results
+            if let Ok(mut outputs_guard) = outputs.lock() {
+                outputs_guard.push((order, local_output));
+            }
+
+            // Collect array element updates
+            if let Ok(mut updates_guard) = array_updates.lock() {
+                updates_guard.extend(local_element_updates);
+            }
+        });
+
+        // Merge outputs in order
+        if let Ok(mut outputs_guard) = outputs.lock() {
+            outputs_guard.sort_by_key(|(order, _)| *order);
+            for (_, lines) in outputs_guard.iter() {
+                for line in lines {
+                    self.output.push(line.clone());
+                }
+            }
+        }
+
+        // Apply all array element updates
+        if let Ok(updates_guard) = array_updates.lock() {
+            for (var_idx, flat_idx, value) in updates_guard.iter() {
+                if *var_idx < self.variables.len() {
+                    if let Some(Some(Value::Array { ref mut elements, .. })) = self.variables.get_mut(*var_idx) {
+                        if *flat_idx < elements.len() {
+                            elements[*flat_idx] = value.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Static helper for flat index calculation (for use in parallel contexts)
+    fn calculate_flat_index_static(indices: &[i64], dims: &[ArrayDim]) -> Option<usize> {
+        if indices.len() != dims.len() {
+            return None;
+        }
+
+        let mut flat_idx = 0usize;
+        let mut multiplier = 1usize;
+
+        for (i, (idx, dim)) in indices.iter().zip(dims.iter()).enumerate() {
+            let dim_size = dim.size();
+            let offset = (*idx - dim.lower) as usize;
+            flat_idx += offset * multiplier;
+            if i < dims.len() - 1 {
+                multiplier *= dim_size;
+            }
+        }
+
+        Some(flat_idx)
+    }
 }
 
 impl Default for VM {
@@ -3499,7 +4411,7 @@ mod tests {
     #[test]
     fn test_load_const() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx = chunk.add_constant(Value::Integer(42));
         chunk.emit_with_operand(OpCode::LoadConst, idx, loc);
@@ -3515,7 +4427,7 @@ mod tests {
     #[test]
     fn test_store_load_var() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let const_idx = chunk.add_constant(Value::Integer(100));
         let var_idx = chunk.add_variable("X".to_string());
@@ -3536,7 +4448,7 @@ mod tests {
     #[test]
     fn test_arithmetic_add() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(5));
         let idx2 = chunk.add_constant(Value::Integer(3));
@@ -3554,7 +4466,7 @@ mod tests {
     #[test]
     fn test_arithmetic_subtract() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(10));
         let idx2 = chunk.add_constant(Value::Integer(3));
@@ -3572,7 +4484,7 @@ mod tests {
     #[test]
     fn test_arithmetic_multiply() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(6));
         let idx2 = chunk.add_constant(Value::Integer(7));
@@ -3590,7 +4502,7 @@ mod tests {
     #[test]
     fn test_arithmetic_divide() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(20));
         let idx2 = chunk.add_constant(Value::Integer(4));
@@ -3608,7 +4520,7 @@ mod tests {
     #[test]
     fn test_division_by_zero() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(10));
         let idx2 = chunk.add_constant(Value::Integer(0));
@@ -3626,7 +4538,7 @@ mod tests {
     #[test]
     fn test_mixed_type_arithmetic() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         // 5 + 2.5 = 7.5
         let idx1 = chunk.add_constant(Value::Integer(5));
@@ -3645,7 +4557,7 @@ mod tests {
     #[test]
     fn test_comparison_greater() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(10));
         let idx2 = chunk.add_constant(Value::Integer(5));
@@ -3663,7 +4575,7 @@ mod tests {
     #[test]
     fn test_logical_and() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         chunk.emit(OpCode::LoadTrue, loc);
         chunk.emit(OpCode::LoadFalse, loc);
@@ -3679,7 +4591,7 @@ mod tests {
     #[test]
     fn test_jump_if_false() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         // if false, jump to end; else push 1
         let idx1 = chunk.add_constant(Value::Integer(1));
@@ -3700,7 +4612,7 @@ mod tests {
     #[test]
     fn test_print() {
         let mut chunk = make_chunk();
-        let loc = SourceLocation { line: 1, column: 1 };
+        let loc = SourceLocation::new(1, 1);
 
         let idx1 = chunk.add_constant(Value::Integer(42));
         let idx2 = chunk.add_constant(Value::Character("Hello".to_string()));
