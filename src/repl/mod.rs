@@ -1,5 +1,7 @@
 //! REPL (Read-Eval-Print-Loop) for interactive Fortran execution
 
+pub mod highlight;
+
 use crate::bytecode::{Chunk, Compiler, Value};
 use crate::diagnostic::{DiagnosticRenderer, Diagnostic, SourceMap, RenderStyle};
 use crate::lexer::Lexer;
@@ -49,6 +51,8 @@ pub struct Repl {
     profiling_enabled: bool,
     /// Shared profile data (persists across executions)
     profile_data: Arc<Mutex<ProfileData>>,
+    /// Whether syntax highlighting is enabled
+    syntax_highlight: bool,
 }
 
 impl Repl {
@@ -73,6 +77,7 @@ impl Repl {
             input_counter: 0,
             profiling_enabled: false,
             profile_data: Arc::new(Mutex::new(ProfileData::default())),
+            syntax_highlight: true,
         })
     }
 
@@ -135,7 +140,15 @@ impl Repl {
                     if is_dedent_line && self.in_multiline && self.current_depth > 0 {
                         // Calculate the correct indent (one level less)
                         let correct_indent = "  ".repeat(self.current_depth - 1);
-                        let display_line = format!("{}{}", correct_indent, line.trim());
+                        let trimmed = line.trim();
+
+                        // Apply syntax highlighting if enabled
+                        let display_text = if self.syntax_highlight {
+                            highlight::highlight_line(trimmed)
+                        } else {
+                            trimmed.to_string()
+                        };
+                        let display_line = format!("{}{}", correct_indent, display_text);
 
                         // Move cursor up, clear line, and reprint with correct indentation
                         // \x1b[A = move up, \x1b[2K = clear line, \r = carriage return
@@ -370,6 +383,10 @@ impl Repl {
                     self.benchmark(args);
                 }
             }
+            ":highlight" | ":hl" | ":color" => {
+                self.syntax_highlight = !self.syntax_highlight;
+                println!("Syntax highlighting: {}", if self.syntax_highlight { "ON" } else { "OFF" });
+            }
             _ => {
                 println!("Unknown command: {}. Type :help for available commands.", cmd);
             }
@@ -388,6 +405,8 @@ impl Repl {
         println!("  :load <file>      Load and execute a Fortran file");
         println!("  :bytecode [stmt]  Toggle bytecode display or show bytecode for statement");
         println!("  :type <expr>      Show the type of an expression");
+        println!("  :highlight, :hl   Toggle syntax highlighting (currently {})",
+                 if self.syntax_highlight { "ON" } else { "OFF" });
         println!();
         println!("Profiling Commands:");
         println!("  :profile on       Enable profiling");
