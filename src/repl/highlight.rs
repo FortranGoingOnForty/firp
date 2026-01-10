@@ -1,6 +1,12 @@
 //! Syntax highlighting for Fortran code in the REPL
 
 use crate::lexer::{Lexer, TokenType};
+use rustyline::completion::Completer;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::Helper;
+use std::borrow::Cow;
 
 /// ANSI color codes
 pub mod colors {
@@ -479,3 +485,45 @@ fn get_dot_operator_color(op: &str) -> &'static str {
         _ => colors::IDENT,
     }
 }
+
+/// Rustyline helper for Fortran syntax highlighting
+#[derive(Clone)]
+pub struct FortranHelper {
+    /// Whether syntax highlighting is enabled
+    pub highlight_enabled: bool,
+}
+
+impl FortranHelper {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            highlight_enabled: enabled,
+        }
+    }
+}
+
+impl Completer for FortranHelper {
+    type Candidate = String;
+}
+
+impl Hinter for FortranHelper {
+    type Hint = String;
+}
+
+impl Validator for FortranHelper {}
+
+impl Highlighter for FortranHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if self.highlight_enabled {
+            Cow::Owned(highlight_line(line))
+        } else {
+            Cow::Borrowed(line)
+        }
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        // Return true to force re-highlighting on each character
+        self.highlight_enabled
+    }
+}
+
+impl Helper for FortranHelper {}

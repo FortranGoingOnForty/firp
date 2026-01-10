@@ -10,7 +10,7 @@ use crate::profiler::{ProfileReport, ProfileData};
 use crate::vm::VM;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
-use rustyline::{DefaultEditor, Editor};
+use rustyline::{Config, Editor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +19,8 @@ const HISTORY_FILE: &str = ".firp_history";
 
 /// REPL state maintaining persistent context across inputs
 pub struct Repl {
-    /// Editor for line input with history
-    editor: Editor<(), DefaultHistory>,
+    /// Editor for line input with history and syntax highlighting
+    editor: Editor<highlight::FortranHelper, DefaultHistory>,
     /// Persistent VM state
     vm: VM,
     /// Persistent compiler state (for type registry, procedures, etc.)
@@ -58,7 +58,14 @@ pub struct Repl {
 impl Repl {
     /// Create a new REPL instance
     pub fn new() -> Result<Self, String> {
-        let editor = DefaultEditor::new().map_err(|e| format!("Failed to create editor: {}", e))?;
+        let config = Config::builder()
+            .build();
+        let mut editor = Editor::with_config(config)
+            .map_err(|e| format!("Failed to create editor: {}", e))?;
+
+        // Set up syntax highlighting helper
+        let helper = highlight::FortranHelper::new(true);
+        editor.set_helper(Some(helper));
 
         Ok(Repl {
             editor,
@@ -385,6 +392,10 @@ impl Repl {
             }
             ":highlight" | ":hl" | ":color" => {
                 self.syntax_highlight = !self.syntax_highlight;
+                // Update the helper's highlighting setting
+                if let Some(helper) = self.editor.helper_mut() {
+                    helper.highlight_enabled = self.syntax_highlight;
+                }
                 println!("Syntax highlighting: {}", if self.syntax_highlight { "ON" } else { "OFF" });
             }
             _ => {
