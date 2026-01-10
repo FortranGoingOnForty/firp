@@ -1,5 +1,5 @@
 Name:           firp
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        A modern Fortran interpreter built in Rust
 
@@ -41,6 +41,10 @@ install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 %license Cargo.toml
 
 %changelog
+* Fri Jan 10 2025 mfw <espadonne@outlook.com> - 0.2.0-1
+- Add real-time syntax highlighting to REPL
+- Improved user experience with colorized Fortran code
+
 * Fri Jan 10 2025 mfw <espadonne@outlook.com> - 0.1.0-1
 - Initial RPM release of firp
 - Fortran interpreter built in Rust
