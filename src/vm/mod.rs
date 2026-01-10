@@ -3,7 +3,7 @@
 //! This module implements a stack-based virtual machine that executes
 //! compiled Fortran bytecode.
 
-use crate::ast::{FormatDescriptor, SignControl, BlankControl};
+use crate::ast::{FormatDescriptor, SignControl};
 use crate::bytecode::{ArrayDim, Chunk, Instruction, Intrinsic, OpCode, Value};
 use crate::jit::{JitCompiler, JitConfig, JitError};
 use crate::lexer::SourceLocation;
@@ -3288,7 +3288,7 @@ impl VM {
 
     /// Resolve a reference chain - if the variable at `index` contains a Reference,
     /// follow it to get the target variable index.
-    fn resolve_reference(&self, index: usize, location: SourceLocation) -> VMResult<usize> {
+    fn resolve_reference(&self, index: usize, _location: SourceLocation) -> VMResult<usize> {
         if let Some(Some(Value::Reference(target))) = self.variables.get(index) {
             // This variable is a reference, follow it
             Ok(*target)

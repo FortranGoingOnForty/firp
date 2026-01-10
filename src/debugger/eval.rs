@@ -658,7 +658,7 @@ pub fn evaluate(expr: &DebugExpr, ctx: &EvalContext) -> Result<Value, String> {
         DebugExpr::Member { object, field } => {
             let obj_value = evaluate(object, ctx)?;
             match obj_value {
-                Value::Instance { components, .. } => {
+                Value::Instance { .. } => {
                     // For now, we can't easily look up component names without type registry
                     // Return error for this MVP
                     Err(format!("Member access to '{}' not yet supported in debugger", field))
@@ -721,10 +721,10 @@ fn apply_binary_op(left: &Value, op: BinaryOp, right: &Value) -> Result<Value, S
         // Comparison operators
         BinaryOp::Eq => binary_comparison(left, right, |a, b| a == b, |a, b| a == b, |a, b| a == b, |a, b| a == b),
         BinaryOp::Ne => binary_comparison(left, right, |a, b| a != b, |a, b| a != b, |a, b| a != b, |a, b| a != b),
-        BinaryOp::Lt => binary_comparison(left, right, |a, b| a < b, |a, b| a < b, |a, b| false, |a, b| a < b),
-        BinaryOp::Le => binary_comparison(left, right, |a, b| a <= b, |a, b| a <= b, |a, b| false, |a, b| a <= b),
-        BinaryOp::Gt => binary_comparison(left, right, |a, b| a > b, |a, b| a > b, |a, b| false, |a, b| a > b),
-        BinaryOp::Ge => binary_comparison(left, right, |a, b| a >= b, |a, b| a >= b, |a, b| false, |a, b| a >= b),
+        BinaryOp::Lt => binary_comparison(left, right, |a, b| a < b, |a, b| a < b, |_a, _b| false, |a, b| a < b),
+        BinaryOp::Le => binary_comparison(left, right, |a, b| a <= b, |a, b| a <= b, |_a, _b| false, |a, b| a <= b),
+        BinaryOp::Gt => binary_comparison(left, right, |a, b| a > b, |a, b| a > b, |_a, _b| false, |a, b| a > b),
+        BinaryOp::Ge => binary_comparison(left, right, |a, b| a >= b, |a, b| a >= b, |_a, _b| false, |a, b| a >= b),
 
         // Logical operators
         BinaryOp::And => {

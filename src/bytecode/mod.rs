@@ -2768,7 +2768,7 @@ impl Compiler {
                 }
 
                 // Generate loop increments and jumps (in reverse order)
-                for (i, (exit_jump, end_index, step_index)) in exit_jumps.iter().enumerate().rev() {
+                for (i, (exit_jump, _end_index, step_index)) in exit_jumps.iter().enumerate().rev() {
                     let var_index = loop_vars[i];
 
                     // Increment loop variable

@@ -4,7 +4,7 @@ use crate::bytecode::{Chunk, Compiler, Value};
 use crate::diagnostic::{DiagnosticRenderer, Diagnostic, SourceMap, RenderStyle};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::profiler::{ProfilerDebugger, ProfileReport, ProfileData};
+use crate::profiler::{ProfileReport, ProfileData};
 use crate::vm::VM;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;

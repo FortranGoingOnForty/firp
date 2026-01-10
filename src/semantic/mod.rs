@@ -1334,7 +1334,7 @@ impl SemanticAnalyzer {
 
             Statement::Where { mask, body, elsewhere, .. } => {
                 // Type check mask (should be logical array)
-                let mask_type = self.check_expression(mask)?;
+                let _mask_type = self.check_expression(mask)?;
                 // Mask should be logical or array of logical
                 // For now, just allow any expression
 

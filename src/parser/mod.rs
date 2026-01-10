@@ -495,6 +495,7 @@ impl Parser {
     }
 
     /// Parse a subroutine definition (no attributes)
+    #[allow(dead_code)]
     fn parse_subroutine(&mut self) -> ParseResult<SubroutineDef> {
         self.parse_subroutine_with_attrs(false, false)
     }
@@ -583,6 +584,7 @@ impl Parser {
     }
 
     /// Parse a function definition (backward compatibility)
+    #[allow(dead_code)]
     fn parse_function(&mut self, is_recursive: bool) -> ParseResult<FunctionDef> {
         self.parse_function_with_attrs(is_recursive, false, false)
     }

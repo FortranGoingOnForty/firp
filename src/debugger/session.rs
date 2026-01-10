@@ -64,6 +64,7 @@ pub struct DebugSession {
     /// Source display for showing code
     source_display: SourceDisplay,
     /// Whether to show output immediately
+    #[allow(dead_code)]
     show_output: bool,
     /// Last command (for repeat on empty input)
     last_command: Option<DebugCommand>,
